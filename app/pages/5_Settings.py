@@ -370,4 +370,24 @@ if log_rows:
 else:
     st.caption("No import history yet.")
 
+# ── Meta Recalculation ──
+st.divider()
+st.subheader("🔄 Recalculate Meta Scores")
+st.caption(
+    "After changing weights (manually or via auto-calibration on Game Stats), "
+    "recalculate all card meta scores without re-importing CSV files."
+)
+try:
+    from app.core.meta_scoring import get_weights_with_source
+    _, _, source = get_weights_with_source()
+    st.info(f"Current weight source: **{source}**")
+except Exception:
+    pass
+
+if st.button("🔄 Recalculate All Meta Scores", type="primary"):
+    with st.spinner("Recalculating..."):
+        from app.core.ingestion import recalculate_all_meta_scores
+        result = recalculate_all_meta_scores()
+    st.success(result['message'])
+
 conn.close()

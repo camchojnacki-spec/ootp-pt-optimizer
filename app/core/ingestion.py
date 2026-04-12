@@ -1241,3 +1241,69 @@ def ingest_pitching_stats_adv(filepath: str) -> dict:
     conn.commit()
     conn.close()
     return {"status": "success", "file_type": "pitching_stats_adv", "rows": count}
+
+
+def recalculate_all_meta_scores() -> dict:
+    """Recalculate meta scores for ALL cards using current weights.
+
+    Call this after calibrating weights so every card's meta_score_batting /
+    meta_score_pitching reflects the updated formula — without re-importing.
+    """
+    from app.core.meta_scoring import (
+        calc_batting_meta, calc_pitching_meta, calc_defense_score,
+        get_weights_with_source,
+    )
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    _, _, source = get_weights_with_source()
+
+    # Recalc batting
+    batters = cursor.execute("""
+        SELECT card_id, contact, gap_power, power, eye, avoid_ks, babip,
+               card_value, position,
+               infield_range, infield_error, infield_arm,
+               catcher_ability, catcher_frame, catcher_arm,
+               of_range, of_error, of_arm
+        FROM cards WHERE position IS NOT NULL AND pitcher_role IS NULL
+    """).fetchall()
+
+    bat_count = 0
+    for row in batters:
+        d = dict(row)
+        d['defense_score'] = calc_defense_score(d)
+        d['ovr'] = d.get('card_value', 0)
+        meta = calc_batting_meta(d)
+        if meta and meta > 0:
+            cursor.execute("UPDATE cards SET meta_score_batting = ? WHERE card_id = ?",
+                          (meta, d['card_id']))
+            bat_count += 1
+
+    # Recalc pitching
+    pitchers = cursor.execute("""
+        SELECT card_id, stuff, movement, control, p_hr, p_babip,
+               card_value, stamina, hold
+        FROM cards WHERE pitcher_role IS NOT NULL
+    """).fetchall()
+
+    pit_count = 0
+    for row in pitchers:
+        d = dict(row)
+        d['ovr'] = d.get('card_value', 0)
+        meta = calc_pitching_meta(d)
+        if meta and meta > 0:
+            cursor.execute("UPDATE cards SET meta_score_pitching = ? WHERE card_id = ?",
+                          (meta, d['card_id']))
+            pit_count += 1
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "status": "success",
+        "batters_updated": bat_count,
+        "pitchers_updated": pit_count,
+        "weight_source": source,
+        "message": f"Recalculated {bat_count} batters + {pit_count} pitchers using {source} weights",
+    }

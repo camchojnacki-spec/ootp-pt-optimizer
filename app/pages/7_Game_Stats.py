@@ -874,8 +874,13 @@ with tab_meta:
                             f"{arrow} **{ch['stat']}**: {ch['old_weight']:.2f} → {ch['new_weight']:.2f} "
                             f"({delta:+.2f}) — {ch.get('reason', '')}"
                         )
-                    st.info("✅ New weights saved. They'll be used for all meta calculations going forward. "
-                            "Re-import your market data to recalculate all card meta scores.")
+                    st.info("✅ New weights saved!")
+                    # Offer immediate recalculation
+                    if st.button("🔄 Recalculate ALL card meta scores now", type="secondary"):
+                        with st.spinner("Recalculating meta scores for all cards..."):
+                            from app.core.ingestion import recalculate_all_meta_scores
+                            recalc = recalculate_all_meta_scores()
+                        st.success(recalc['message'])
                 elif not result.get("message", "").startswith("Error"):
                     st.info("No significant weight changes needed — current weights are performing well.")
 
