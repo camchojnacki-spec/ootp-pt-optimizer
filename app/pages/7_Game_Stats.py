@@ -146,6 +146,17 @@ tab_overview, tab_batting, tab_pitching, tab_player, tab_meta = st.tabs([
 with tab_overview:
     if not bat_df.empty:
         st.markdown("### Offense: OPS vs WAR/600")
+        with st.expander("ℹ️ What am I looking at?", expanded=False):
+            st.markdown(
+                "**OPS** = On-base + Slugging. Measures how good a hitter is at getting on base AND hitting for power. "
+                "League average is ~.730. Above .800 = great, above .900 = elite.\n\n"
+                "**WAR/600** = Wins Above Replacement projected over a full 600 PA season. "
+                "It answers: *how many extra wins does this player give me vs a free replacement?* "
+                "3.0+ = All-Star level, 5.0+ = MVP.\n\n"
+                "**⭐ Stars** (top-right) = hitting well AND providing wins. "
+                "**🔮 Hidden Gems** (top-left) = high WAR despite modest OPS — probably great defense or baserunning. "
+                "**📉 Declining** (bottom-right) = good OPS but low WAR — maybe bad defense dragging them down."
+            )
         st.caption("Bigger bubble = more plate appearances. Top-right = elite producer.")
 
         fig = go.Figure()
@@ -197,6 +208,16 @@ with tab_overview:
 
         with col_luck:
             st.markdown("### Pitching: Luck Chart (ERA vs FIP)")
+            with st.expander("ℹ️ What is ERA vs FIP?", expanded=False):
+                st.markdown(
+                    "**ERA** = Earned Run Average — how many runs a pitcher gives up per 9 innings. Lower = better.\n\n"
+                    "**FIP** = Fielding Independent Pitching — what the ERA *should* be based on strikeouts, walks, and homers "
+                    "(things the pitcher controls). It strips out luck and defense.\n\n"
+                    "**If ERA < FIP**: The pitcher is getting lucky — batted balls are finding fielders, but his underlying stuff "
+                    "isn't that good. Expect his ERA to rise.\n\n"
+                    "**If ERA > FIP**: The pitcher is getting unlucky — he's better than his ERA shows. Expect improvement.\n\n"
+                    "🟢 = unlucky (ERA > FIP, buy low) | 🔴 = lucky (ERA < FIP, sell high)"
+                )
             st.caption("Above the line = lucky (ERA < FIP). Below = unlucky. Size = innings.")
 
             fig2 = go.Figure()
@@ -238,6 +259,16 @@ with tab_overview:
 
         with col_dom:
             st.markdown("### Pitching: Dominance (K% vs BB%)")
+            with st.expander("ℹ️ What is K% vs BB%?", expanded=False):
+                st.markdown(
+                    "**K%** = Strikeout rate — what % of batters does this pitcher strike out? Higher = more dominant. "
+                    "20%+ is good, 25%+ is elite.\n\n"
+                    "**BB%** = Walk rate — what % of batters does he walk? Lower = better command. "
+                    "Under 7% is good, under 5% is elite.\n\n"
+                    "**Top-left corner** = the dream: strikes everyone out and doesn't walk anyone. "
+                    "**Bottom-right** = wild and can't miss bats — trouble.\n\n"
+                    "**K-BB%** (the color) is the gap between them. 15%+ = dominant. Under 10% = concerning."
+                )
             st.caption("Top-left = elite command + stuff. Bottom-right = wild and hittable.")
 
             fig3 = go.Figure()
@@ -277,6 +308,21 @@ with tab_batting:
         st.info("No qualifying batters yet.")
     else:
         st.markdown("### Batting Leaderboard")
+        with st.expander("ℹ️ Stat glossary", expanded=False):
+            st.markdown(
+                "| Stat | What it means | Good | Elite |\n"
+                "|---|---|---|---|\n"
+                "| **AVG** | Batting average (hits ÷ at-bats) | .270+ | .300+ |\n"
+                "| **OBP** | On-base % (includes walks) | .340+ | .380+ |\n"
+                "| **SLG** | Slugging (total bases ÷ at-bats) | .430+ | .500+ |\n"
+                "| **OPS** | OBP + SLG combined | .770+ | .870+ |\n"
+                "| **wOBA** | Weighted on-base avg — best single offensive stat | .330+ | .370+ |\n"
+                "| **ISO** | Isolated power (SLG - AVG). Pure extra-base hit ability | .150+ | .220+ |\n"
+                "| **K%** | Strikeout rate — lower is better | <20% | <15% |\n"
+                "| **BB%** | Walk rate — higher is better | >8% | >12% |\n"
+                "| **BABIP** | Batting avg on balls in play. ~.300 is normal. Far from .300 = luck factor |\n"
+                "| **WAR** | Wins Above Replacement — the ultimate 'how good is this player' number | 2.0+ | 5.0+ |"
+            )
 
         # Sortable main leaderboard
         display_bat = bat_df[["player_name", "position", "pa", "avg", "obp", "slg",
@@ -301,7 +347,12 @@ with tab_batting:
 
         # Luck indicators
         st.markdown("### 🍀 BABIP Luck Detector")
-        st.caption("BABIP far from .300 often regresses. High BABIP + low meta = lucky streak.")
+        st.caption(
+            "BABIP (Batting Average on Balls In Play) averages ~.300 for most players. "
+            "If someone's BABIP is way above that, they're probably getting lucky — "
+            "their line drives are finding holes. It'll come back down. "
+            "Way below .300? They're getting unlucky — expect a bounce back."
+        )
         lucky = bat_df[bat_df["babip"] > 0.340][["player_name", "babip", "avg", "ops", "war", "meta"]].copy()
         unlucky = bat_df[bat_df["babip"] < 0.260][["player_name", "babip", "avg", "ops", "war", "meta"]].copy()
 
@@ -624,6 +675,18 @@ with tab_player:
 # ════════════════════════════════════════════════════════════════════════════════
 with tab_meta:
     st.markdown("### 🧪 Meta Score vs Actual Performance")
+    with st.expander("ℹ️ What does this tell me?", expanded=False):
+        st.markdown(
+            "The **meta score** is our formula that rates how good a card *should* be based on its ratings "
+            "(contact, power, eye, stuff, movement, etc).\n\n"
+            "This chart compares that prediction against **how the player actually performed** in your games. "
+            "If the dots cluster along the diagonal line, our formula is working — high meta = high performance.\n\n"
+            "- **🔮 Hidden Gems** (above the line) = players whose card ratings look average but they're crushing it in-game. "
+            "Maybe the meta formula is underrating something they're good at.\n"
+            "- **📉 Overrated** (below the line) = high meta score but poor results. The card looks good on paper but isn't delivering.\n"
+            "- **Correlation** measures how well meta predicts performance: 0.7+ = great, 0.4-0.7 = ok, <0.4 = weak.\n\n"
+            "If the correlation is weak, hit **Run Calibration** below to teach the formula what actually works for your team."
+        )
     st.caption("Does our meta scoring system actually predict in-game results?")
 
     if not bat_df.empty:

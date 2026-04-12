@@ -500,7 +500,7 @@ def _get_performance_outliers():
     c = get_connection()
 
     # Pitchers outperforming their meta (like Pfaadt)
-    outperforming = c.execute("""
+    outperforming = [dict(r) for r in c.execute("""
         SELECT p.player_name, p.era, p.fip, p.war, p.ip, p.era_plus, p.whip,
                r.meta_score, r.position, r.lineup_role
         FROM pitching_stats p
@@ -509,9 +509,9 @@ def _get_performance_outliers():
         WHERE p.ip > 40 AND p.war > 1.5
             AND DATE(p.snapshot_date) = (SELECT MAX(DATE(snapshot_date)) FROM pitching_stats)
         ORDER BY p.war DESC
-    """).fetchall()
+    """).fetchall()]
 
-    bat_outperforming = c.execute("""
+    bat_outperforming = [dict(r) for r in c.execute("""
         SELECT b.player_name, b.ops, b.war, b.pa, b.avg, b.obp, b.slg, b.iso,
                r.meta_score, r.position, r.lineup_role
         FROM batting_stats b
@@ -520,7 +520,7 @@ def _get_performance_outliers():
         WHERE b.pa > 80 AND b.war > 1.0
             AND DATE(b.snapshot_date) = (SELECT MAX(DATE(snapshot_date)) FROM batting_stats)
         ORDER BY b.war DESC
-    """).fetchall()
+    """).fetchall()]
 
     c.close()
     return outperforming, bat_outperforming
