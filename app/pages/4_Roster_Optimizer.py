@@ -332,34 +332,70 @@ for pos in show_positions:
         upgrade_plan.extend(rp_entries)
         continue
 
-    # For batting positions: show ALL active-roster players at this position.
-    # The game has separate vs-RHP and vs-LHP lineups (platoons), and the
-    # roster table can't tell us who's actually starting, so show everyone
-    # on the 26-man and let the user identify their lineup vs bench.
+    # For batting positions: show up to 2 players (platoon pair).
+    # A valid platoon = one L and one R (or S) batter. If you have 3+
+    # players at a position, take the best 2 that form a platoon pair.
+    # If they're all same-handed, show best 1 + flag platoon gap.
     active_players = active_by_pos.get(pos, [])
     if not active_players:
-        # No one active at this position — show empty slot
         upgrade_plan.append(_build_slot(pos, '(empty)', 0, 0,
             find_owned_upgrades(pos, 0, is_pitching, [], 5),
             find_market_upgrades(pos, 0, is_pitching, used_market_ids, 5)))
         continue
 
-    # Process WEAKEST first so best free upgrades go to worst slots
-    active_names = [p['player_name'] for p in active_players]
-    order = sorted(range(len(active_players)), key=lambda i: active_players[i]['meta_score'] or 0)
-    bat_entries = [None] * len(active_players)
-    for i in order:
-        player = active_players[i]
+    # Sort by meta descending — best player first
+    active_players = sorted(active_players, key=lambda p: p['meta_score'] or 0, reverse=True)
+
+    # Identify platoon pair: pick best player, then best OPPOSITE-HAND player
+    primary = active_players[0]
+    primary_hand = primary.get('bats_hand', '?')
+
+    platoon_partner = None
+    for candidate in active_players[1:]:
+        cand_hand = candidate.get('bats_hand', '?')
+        # Valid platoon: L+R, R+L, S+anything (switch hitter pairs with anyone)
+        if primary_hand == 'S' or cand_hand == 'S':
+            platoon_partner = candidate
+            break
+        if primary_hand != cand_hand and primary_hand in ('L', 'R') and cand_hand in ('L', 'R'):
+            platoon_partner = candidate
+            break
+
+    if platoon_partner:
+        # Show 2 slots: primary + platoon partner
+        active_names = [primary['player_name'], platoon_partner['player_name']]
+        # Process weaker one first so best upgrades go to weaker slot
+        pair = [(primary, 1), (platoon_partner, 2)]
+        pair.sort(key=lambda x: x[0]['meta_score'] or 0)
+
+        for player, idx in pair:
+            m = player['meta_score'] or 0
+            bh = player.get('bats_hand', '?')
+            label = f"{pos}{idx}"
+            ow = find_owned_upgrades(pos, m, is_pitching, active_names, 3)
+            mk = find_market_upgrades(pos, m, is_pitching, used_market_ids, 3)
+            entry = _build_slot(label, player['player_name'], player['ovr'], m, ow, mk, bats_hand=bh)
+            entry['is_platoon'] = True
+            entry['platoon_hand'] = bh
+            if entry['owned_name']:
+                active_names.append(entry['owned_name'])
+            upgrade_plan.append(entry)
+    else:
+        # Single player or same-handed group — show best player only
+        player = primary
         m = player['meta_score'] or 0
-        label = pos if len(active_players) == 1 else f"{pos}{i+1}"
+        bh = player.get('bats_hand', '?')
+        active_names = [p['player_name'] for p in active_players]
         ow = find_owned_upgrades(pos, m, is_pitching, active_names, 3)
         mk = find_market_upgrades(pos, m, is_pitching, used_market_ids, 3)
-        bh = player.get('bats_hand', '?')
-        entry = _build_slot(label, player['player_name'], player['ovr'], m, ow, mk, bats_hand=bh)
-        if entry['owned_name']:
-            active_names.append(entry['owned_name'])
-        bat_entries[i] = entry
-    upgrade_plan.extend(bat_entries)
+        entry = _build_slot(pos, player['player_name'], player['ovr'], m, ow, mk, bats_hand=bh)
+        entry['is_platoon'] = False
+        # Flag if same-handed duplicates exist (platoon gap)
+        if len(active_players) > 1 and primary_hand in ('L', 'R'):
+            same_hand_count = sum(1 for p in active_players if p.get('bats_hand') == primary_hand)
+            if same_hand_count > 1:
+                entry['platoon_warning'] = f"⚠️ {same_hand_count} {primary_hand}-batters, no platoon partner"
+        upgrade_plan.append(entry)
 
 if focus == "Weakest First":
     upgrade_plan.sort(key=lambda x: x['current_meta'])
@@ -635,12 +671,14 @@ def build_chain_rows(positions_list, show_bats=False, show_perf=False):
         else:
             row["Recommendation"] = "✅ Optimal"
 
-        # Detail column — full card name + AI reason (widen column or hover to see)
+        # Detail column — full card name + AI reason + platoon warnings
         detail_parts = []
         if ai_pick and ai_pick['action'] != 'Keep' and ai_pick.get('reason'):
             detail_parts.append(f"AI: {ai_pick['reason']}")
             if ai_pick.get('replaces'):
                 detail_parts.append(f"Replaces: {ai_pick['replaces']}")
+        if u.get('platoon_warning'):
+            detail_parts.append(u['platoon_warning'])
         if u['owned_name']:
             detail_parts.append(f"Owned: {u['owned_name']}")
         if u['market_name']:

@@ -942,7 +942,8 @@ def ai_optimize_all_positions(upgrade_plan: list, conn, perf_bat: dict = None,
         name = u['current_name']
         splits = roster_splits.get(name, {})
 
-        slot_lines = [f"\n--- {u['pos']}: {name} (OVR {u['current_ovr']}, Meta {u['current_meta']}) ---"]
+        bats_h = u.get('bats', '?')
+        slot_lines = [f"\n--- {u['pos']}: {name} (OVR {u['current_ovr']}, Meta {u['current_meta']}, Bats {bats_h}) ---"]
 
         # Add split info
         rhp = splits.get('meta_vs_rhp')
@@ -1038,10 +1039,14 @@ def ai_optimize_all_positions(upgrade_plan: list, conn, perf_bat: dict = None,
         "(splits, performance, luck, team fit). If the meta pick looks right, CONFIRM it as PROMOTE or BUY. "
         "Don't override good recommendations with KEEP just because the current player is 'decent'.\n\n"
         "Use these factors to decide between candidates:\n"
-        "1. PLATOON SPLITS: Big splits (>30 gap) = platoon candidate, not everyday starter.\n"
-        "2. IN-GAME PERFORMANCE: ERA << FIP = lucky (will regress). ERA >> FIP = unlucky (will improve).\n"
-        "3. DEFENSE & ROLE FIT: Catchers need defense. CF needs speed. Closers need stuff.\n"
-        "4. TEAM BALANCE: Mix handedness, power/contact.\n\n"
+        "1. PLATOON RULES: A valid platoon is ONE L-batter + ONE R-batter at the same position. "
+        "Two same-handed batters (L+L or R+R) is NOT a platoon — it's a weakness. "
+        "Switch hitters (S) pair with anyone. If a position has 2 same-handed batters, "
+        "recommend replacing the weaker one with an opposite-hand batter.\n"
+        "2. PLATOON SPLITS: Big splits (>30 gap between vRHP and vLHP) = platoon candidate.\n"
+        "3. IN-GAME PERFORMANCE: ERA << FIP = lucky (will regress). ERA >> FIP = unlucky (will improve).\n"
+        "4. DEFENSE & ROLE FIT: Catchers need defense. CF needs speed. Closers need stuff.\n"
+        "5. TEAM BALANCE: Mix handedness, power/contact.\n\n"
         "FORMAT your response EXACTLY like this for each position (one per line):\n\n"
         "For owned upgrades:\n"
         "**[POS]**: [EMOJI] PROMOTE [New card name] >> [Current player being replaced] | [1-sentence reason]\n\n"
