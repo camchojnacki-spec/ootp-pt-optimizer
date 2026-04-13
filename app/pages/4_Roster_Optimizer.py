@@ -959,6 +959,13 @@ with tab_bat:
     _bench_bats.sort(key=lambda p: p['meta_score'] or 0, reverse=True)
     _bench_bats = _bench_bats[:4]  # 26-man roster has ~4 bench bats
 
+    # All rostered player names — no rostered player should be recommended as an upgrade
+    _all_rostered_names = set()
+    for _pos_players in all_by_pos.values():
+        for _rp in _pos_players:
+            _all_rostered_names.add(_rp['player_name'])
+    _used_bench_upgrades = set()  # track already-recommended upgrades to avoid dupes
+
     if _bench_bats:
         bench_rows = []
         for bp in _bench_bats:
@@ -972,20 +979,30 @@ with tab_bat:
             if bperf:
                 perf_str = f".{int(bperf['ops']*1000):03d} OPS  {bperf['war600']:.1f}W"
 
-            # Find best upgrade from collection (bench players not on active roster)
-            bench_upgrade = conn.execute("""
+            # Find best upgrade from collection (not already rostered)
+            # Old query used card_title matching against roster, but roster.card_title
+            # is NULL for all entries. Instead, fetch top candidates and filter in Python
+            # against the known set of all rostered player names.
+            _bench_candidates = conn.execute("""
                 SELECT c.card_title, c.meta_score_batting as meta, c.position_name
                 FROM cards c
                 WHERE c.owned = 1 AND c.meta_score_batting > ?
                     AND c.pitcher_role IS NULL
-                    AND c.card_title NOT IN (
-                        SELECT r2.card_title FROM roster r2
-                        WHERE r2.lineup_role IN ('starter', 'rotation', 'closer', 'bullpen')
-                          AND r2.card_title IS NOT NULL
-                          AND DATE(r2.snapshot_date) = (SELECT MAX(DATE(snapshot_date)) FROM roster WHERE lineup_role != 'league')
-                    )
-                ORDER BY c.meta_score_batting DESC LIMIT 1
-            """, (bmeta + 10,)).fetchone()
+                ORDER BY c.meta_score_batting DESC LIMIT 30
+            """, (bmeta + 10,)).fetchall()
+
+            bench_upgrade = None
+            for _cand in _bench_candidates:
+                _cand_title = _cand['card_title'] or ''
+                # Skip if this player is on the active roster (name appears in card_title)
+                if any(rname in _cand_title for rname in _all_rostered_names):
+                    continue
+                # Skip if already recommended for another bench slot
+                if _cand_title in _used_bench_upgrades:
+                    continue
+                bench_upgrade = _cand
+                _used_bench_upgrades.add(_cand_title)
+                break
 
             action = ""
             if bench_upgrade:
