@@ -34,6 +34,17 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+def migrate_add_league_columns(cursor: sqlite3.Cursor) -> None:
+    """Safely add league_id column to existing tables if not already present."""
+    for table in ("batting_stats", "pitching_stats", "roster"):
+        try:
+            cols = [row[1] for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()]
+            if "league_id" not in cols:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN league_id TEXT")
+        except Exception:
+            pass  # Table may not exist yet on fresh install
+
+
 def init_db() -> None:
     """Create all tables if they do not exist."""
     db_path = get_db_path()
@@ -427,6 +438,107 @@ def init_db() -> None:
         FOREIGN KEY (card_id) REFERENCES cards(card_id)
     );
     CREATE INDEX IF NOT EXISTS idx_pitch_ratings_player ON pitch_ratings(player_name);
+
+    -- League tracking tables
+    CREATE TABLE IF NOT EXISTS leagues (
+        league_id TEXT PRIMARY KEY,
+        league_name TEXT,
+        league_tier TEXT,
+        start_date TEXT,
+        end_date TEXT,
+        final_record TEXT,
+        team_name TEXT DEFAULT 'Toronto Dark Knights',
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS meta_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        card_id INTEGER,
+        player_name TEXT NOT NULL,
+        position TEXT,
+        meta_score REAL,
+        meta_vs_rhp REAL,
+        meta_vs_lhp REAL,
+        league_id TEXT,
+        weights_version TEXT,
+        snapshot_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (league_id) REFERENCES leagues(league_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_meta_history_player ON meta_history(player_name, snapshot_date);
+    CREATE INDEX IF NOT EXISTS idx_meta_history_league ON meta_history(league_id, snapshot_date);
+
+    CREATE TABLE IF NOT EXISTS league_rosters (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        league_id TEXT,
+        team_name TEXT,
+        player_name TEXT,
+        card_id INTEGER,
+        position TEXT,
+        ovr INTEGER,
+        meta_score REAL,
+        contact INTEGER, gap_power INTEGER, power INTEGER, eye INTEGER,
+        stuff INTEGER, movement INTEGER, control INTEGER, p_hr INTEGER,
+        snapshot_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (league_id) REFERENCES leagues(league_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_league_rosters_team ON league_rosters(league_id, team_name);
+
+    -- Player card value + stats history (per-export snapshots for trending)
+    CREATE TABLE IF NOT EXISTS player_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        card_id INTEGER,
+        player_name TEXT NOT NULL,
+        position TEXT,
+        pitcher_role TEXT,
+        league_id TEXT,
+        -- card market data
+        card_value INTEGER,
+        buy_order_high INTEGER,
+        sell_order_low INTEGER,
+        last_10_price INTEGER,
+        last_10_variance INTEGER,
+        -- meta scores (at time of snapshot)
+        meta_score REAL,
+        meta_vs_rhp REAL,
+        meta_vs_lhp REAL,
+        -- key batting ratings
+        contact INTEGER, gap_power INTEGER, power INTEGER, eye INTEGER,
+        avoid_ks INTEGER, babip INTEGER, speed INTEGER, stealing INTEGER,
+        -- key pitching ratings
+        stuff INTEGER, movement INTEGER, control INTEGER, p_hr INTEGER,
+        stamina INTEGER, hold INTEGER,
+        -- in-game performance (cumulative to this point in season)
+        games INTEGER,
+        pa INTEGER,
+        avg REAL, obp REAL, slg REAL, ops REAL, ops_plus INTEGER,
+        hr INTEGER, rbi INTEGER, war REAL, sb INTEGER,
+        -- pitching performance
+        ip REAL, era REAL, whip REAL, k_per_9 REAL, bb_per_9 REAL,
+        fip REAL, era_plus INTEGER, p_war REAL,
+        -- context
+        weights_version TEXT,
+        export_number INTEGER,           -- which export within this league (1st, 2nd, 3rd...)
+        games_into_season INTEGER,       -- how many team games played at this point
+        snapshot_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (league_id) REFERENCES leagues(league_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_player_history_card ON player_history(card_id, league_id, snapshot_date);
+    CREATE INDEX IF NOT EXISTS idx_player_history_player ON player_history(player_name, snapshot_date);
+    CREATE INDEX IF NOT EXISTS idx_player_history_league ON player_history(league_id, export_number);
+
+    -- Track each data export event for sequencing
+    CREATE TABLE IF NOT EXISTS export_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        league_id TEXT,
+        export_number INTEGER,
+        games_played INTEGER,
+        team_record TEXT,
+        files_imported INTEGER,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (league_id) REFERENCES leagues(league_id)
+    );
     """)
 
     # --- Roster table migration: add split meta columns ---
@@ -450,6 +562,9 @@ def init_db() -> None:
             cursor.execute("ALTER TABLE roster ADD COLUMN bats TEXT")
     except Exception:
         pass
+
+    # --- Add league_id to batting_stats, pitching_stats, roster ---
+    migrate_add_league_columns(cursor)
 
     # --- Views for latest snapshot (preserves history while keeping queries simple) ---
     cursor.executescript("""

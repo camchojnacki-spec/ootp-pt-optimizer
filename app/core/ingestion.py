@@ -60,11 +60,30 @@ def _safe_str(value, default=''):
     return str(value)
 
 
-def ingest_file(filepath: str) -> dict:
-    """Auto-detect file type and ingest. Returns dict with status info."""
+def detect_league_id(filepath: str) -> str | None:
+    """Try to detect league_id from the filename prefix (e.g. 'lb124_...' -> 'lb124')."""
+    fname = Path(filepath).name.lower()
+    # League stats files are prefixed with league_id + '_statistics_'
+    if '_statistics_' in fname:
+        prefix = fname.split('_statistics_')[0]
+        if prefix and len(prefix) <= 10:
+            return prefix
+    return None
+
+
+def ingest_file(filepath: str, league_id: str = None) -> dict:
+    """Auto-detect file type and ingest. Returns dict with status info.
+
+    If league_id is provided, it's passed to handlers that support it
+    and stored in the ingestion log for tracking.
+    """
     file_type = identify_file_type(filepath)
     if file_type is None:
         return {"status": "skipped", "reason": "Unknown file type", "file": filepath}
+
+    # Auto-detect league from filename if not provided
+    if league_id is None:
+        league_id = detect_league_id(filepath)
 
     handlers = {
         "market": ingest_market_data,
@@ -96,7 +115,10 @@ def ingest_file(filepath: str) -> dict:
     else:
         result = handler(filepath)
 
-    # Log ingestion
+    # Store league_id in result for downstream use
+    result["league_id"] = league_id
+
+    # Log ingestion with league_id
     conn = get_connection()
     conn.execute(
         "INSERT INTO ingestion_log (file_type, file_name, row_count) VALUES (?, ?, ?)",
@@ -106,6 +128,57 @@ def ingest_file(filepath: str) -> dict:
     conn.close()
 
     return result
+
+
+def ingest_batch_with_history(filepaths: list[str], league_id: str = None,
+                              games_into_season: int = None,
+                              team_record: str = None) -> dict:
+    """Import a batch of files AND automatically take a player history snapshot.
+
+    This is the recommended way to import — it ensures every export is
+    tracked for trending. Call this instead of individual ingest_file() calls.
+    """
+    from app.core.history import snapshot_player_history, ensure_league_exists
+
+    # Auto-detect league from the first league-prefixed file
+    if league_id is None:
+        for fp in filepaths:
+            lid = detect_league_id(fp)
+            if lid:
+                league_id = lid
+                break
+
+    if league_id:
+        ensure_league_exists(league_id)
+
+    results = []
+    for fp in filepaths:
+        try:
+            r = ingest_file(fp, league_id=league_id)
+            results.append(r)
+        except Exception as e:
+            results.append({"status": "error", "file": fp, "error": str(e)})
+
+    # Take comprehensive snapshot after all files imported
+    snapshot = None
+    if league_id:
+        try:
+            snapshot = snapshot_player_history(
+                league_id=league_id,
+                games_into_season=games_into_season,
+                team_record=team_record,
+            )
+        except Exception as e:
+            snapshot = {"error": str(e)}
+
+    ok = sum(1 for r in results if r.get("status") == "success")
+    return {
+        "files_imported": ok,
+        "files_total": len(filepaths),
+        "results": results,
+        "snapshot": snapshot,
+        "league_id": league_id,
+    }
 
 
 def ingest_market_data(filepath: str) -> dict:
