@@ -159,3 +159,48 @@ def parse_league_pitching_ratings_csv(filepath: str) -> pd.DataFrame:
     df = pd.read_csv(filepath)
     df.columns = df.columns.str.strip()
     return df
+
+
+def parse_fielding_stats_csv(filepath: str) -> pd.DataFrame:
+    """Parse fielding stats CSV export.
+
+    Expected columns: POS, #, Name, Inf, B, T, G, GS, TC, A, PO, E, DP, PCT,
+    RNG, ZR, EFF, SBA, RTO, RTO%, IP, PB, CERA, FRM, ARM
+    """
+    try:
+        df = pd.read_csv(filepath, encoding='utf-8')
+    except UnicodeDecodeError:
+        df = pd.read_csv(filepath, encoding='latin-1')
+    df.columns = df.columns.str.strip()
+    # Filter out empty rows
+    df = df.dropna(subset=['Name'], how='all')
+    return df
+
+
+def parse_position_ratings_csv(filepath: str) -> pd.DataFrame:
+    """Parse position ratings CSV export.
+
+    Expected columns: POS, #, Name, Inf, Age, B, T, DEF, P, C, 1B, 2B, 3B, SS, LF, CF, RF, St
+    """
+    try:
+        df = pd.read_csv(filepath, encoding='utf-8')
+    except UnicodeDecodeError:
+        df = pd.read_csv(filepath, encoding='latin-1')
+    df.columns = df.columns.str.strip()
+    df = df.dropna(subset=['Name'], how='all')
+    return df
+
+
+def parse_pitch_ratings_csv(filepath: str) -> pd.DataFrame:
+    """Parse individual pitch ratings CSV export.
+
+    Expected columns: POS, #, Name, Inf, Age, T, FB, CH, CB, SL, SI, SP, CT, FO,
+    CC, SC, KC, KN, PIT, VELO, Slot, STM
+    """
+    try:
+        df = pd.read_csv(filepath, encoding='utf-8')
+    except UnicodeDecodeError:
+        df = pd.read_csv(filepath, encoding='latin-1')
+    df.columns = df.columns.str.strip()
+    df = df.dropna(subset=['Name'], how='all')
+    return df

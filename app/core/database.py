@@ -105,7 +105,7 @@ def init_db() -> None:
         last_10_variance INTEGER,
         FOREIGN KEY (card_id) REFERENCES cards(card_id)
     );
-    CREATE INDEX IF NOT EXISTS idx_price_card_date ON price_snapshots(card_id, snapshot_date);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_price_card_date ON price_snapshots(card_id, snapshot_date);
 
     CREATE TABLE IF NOT EXISTS my_collection (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -267,6 +267,19 @@ def init_db() -> None:
 
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_alerts_active ON price_alerts(active, triggered)")
 
+    # Migrate price_snapshots index to UNIQUE (needed for INSERT OR IGNORE dedup)
+    try:
+        idx_info = cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_price_card_date'"
+        ).fetchone()
+        if idx_info and 'UNIQUE' not in (idx_info[0] or '').upper():
+            cursor.execute("DROP INDEX IF EXISTS idx_price_card_date")
+            cursor.execute(
+                "CREATE UNIQUE INDEX idx_price_card_date ON price_snapshots(card_id, snapshot_date)"
+            )
+    except Exception:
+        pass
+
     # --- Advanced stats tables (stats_2 format) ---
     cursor.executescript("""
     CREATE TABLE IF NOT EXISTS batting_stats_adv (
@@ -355,6 +368,65 @@ def init_db() -> None:
         FOREIGN KEY (card_id) REFERENCES cards(card_id)
     );
     CREATE INDEX IF NOT EXISTS idx_lineup_type ON team_lineup(lineup_type);
+
+    CREATE TABLE IF NOT EXISTS fielding_stats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        player_name TEXT NOT NULL,
+        position TEXT,
+        bats TEXT,
+        throws TEXT,
+        games INTEGER DEFAULT 0,
+        gs INTEGER DEFAULT 0,
+        tc INTEGER DEFAULT 0,
+        assists INTEGER DEFAULT 0,
+        putouts INTEGER DEFAULT 0,
+        errors INTEGER DEFAULT 0,
+        dp INTEGER DEFAULT 0,
+        pct REAL DEFAULT 0,
+        rng REAL DEFAULT 0,
+        zr REAL DEFAULT 0,
+        eff REAL DEFAULT 0,
+        sba INTEGER DEFAULT 0,
+        rto INTEGER DEFAULT 0,
+        rto_pct REAL DEFAULT 0,
+        ip REAL DEFAULT 0,
+        pb INTEGER DEFAULT 0,
+        cera REAL DEFAULT 0,
+        frm REAL DEFAULT 0,
+        arm REAL DEFAULT 0,
+        card_id INTEGER,
+        snapshot_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (card_id) REFERENCES cards(card_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_fielding_player ON fielding_stats(player_name);
+
+    CREATE TABLE IF NOT EXISTS pitch_ratings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        player_name TEXT NOT NULL,
+        position TEXT,
+        throws TEXT,
+        age INTEGER,
+        fb INTEGER DEFAULT 0,
+        ch INTEGER DEFAULT 0,
+        cb INTEGER DEFAULT 0,
+        sl INTEGER DEFAULT 0,
+        si INTEGER DEFAULT 0,
+        sp INTEGER DEFAULT 0,
+        ct INTEGER DEFAULT 0,
+        fo INTEGER DEFAULT 0,
+        cc INTEGER DEFAULT 0,
+        sc INTEGER DEFAULT 0,
+        kc INTEGER DEFAULT 0,
+        kn INTEGER DEFAULT 0,
+        pitch_count INTEGER DEFAULT 0,
+        velocity TEXT,
+        slot TEXT,
+        stamina INTEGER DEFAULT 0,
+        card_id INTEGER,
+        snapshot_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (card_id) REFERENCES cards(card_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_pitch_ratings_player ON pitch_ratings(player_name);
     """)
 
     # --- Roster table migration: add split meta columns ---

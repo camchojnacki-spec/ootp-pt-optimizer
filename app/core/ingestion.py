@@ -12,9 +12,10 @@ from app.utils.csv_parser import (
     parse_stats_batting_adv_csv, parse_stats_pitching_adv_csv,
     parse_lineup_csv, parse_team_pitching_csv,
     parse_league_batting_ratings_csv, parse_league_pitching_ratings_csv,
+    parse_fielding_stats_csv, parse_position_ratings_csv, parse_pitch_ratings_csv,
 )
 from app.core.database import get_connection, load_config
-from app.core.meta_scoring import calc_batting_meta, calc_pitching_meta, calc_defense_score
+from app.core.meta_scoring import calc_batting_meta, calc_pitching_meta, calc_defense_score, calc_speed_score
 
 
 def _safe_int(value, default=0):
@@ -81,6 +82,9 @@ def ingest_file(filepath: str) -> dict:
         "lineup_vs_lhp": ingest_lineup,
         "lineup_overview": ingest_lineup,
         "team_pitching": ingest_team_pitching,
+        "fielding_stats": ingest_fielding_stats,
+        "pitch_ratings": ingest_pitch_ratings,
+        "position_ratings": ingest_position_ratings,
     }
 
     handler = handlers[file_type]
@@ -110,12 +114,12 @@ def ingest_market_data(filepath: str) -> dict:
     conn = get_connection()
     cursor = conn.cursor()
 
-    snapshot_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # Try to get date from the CSV data
+    snapshot_date = datetime.now().strftime("%Y-%m-%d")
+    # Try to get date from the CSV data (date-only for daily dedup)
     if 'date' in df.columns and len(df) > 0:
         csv_date = df['date'].iloc[0]
         if pd.notna(csv_date) and str(csv_date).strip():
-            snapshot_date = str(csv_date).strip()
+            snapshot_date = str(csv_date).strip()[:10]
 
     count = 0
     for _, row in df.iterrows():
@@ -260,19 +264,15 @@ def ingest_market_data(filepath: str) -> dict:
                 last_updated_at=excluded.last_updated_at
         """, values)
 
-        # Insert price snapshot (deduplicate by card_id + date)
+        # Insert price snapshot (deduplicate by card_id + date via unique index)
         cursor.execute("""
-            INSERT OR REPLACE INTO price_snapshots (card_id, snapshot_date, buy_order_high, sell_order_low, last_10_price, last_10_variance)
-            SELECT ?, ?, ?, ?, ?, ?
-            WHERE NOT EXISTS (
-                SELECT 1 FROM price_snapshots
-                WHERE card_id = ? AND snapshot_date = ?
-            )
+            INSERT OR IGNORE INTO price_snapshots
+                (card_id, snapshot_date, buy_order_high, sell_order_low, last_10_price, last_10_variance)
+            VALUES (?, ?, ?, ?, ?, ?)
         """, (
             card_id, snapshot_date,
             _safe_int(row.get('Buy Order High', 0)), _safe_int(row.get('Sell Order Low', 0)),
             _safe_int(row.get('Last 10 Price', 0)), _safe_int(row.get('Last 10 Price(VAR)', 0)),
-            card_id, snapshot_date
         ))
 
         count += 1
@@ -1251,7 +1251,7 @@ def recalculate_all_meta_scores() -> dict:
     """
     from app.core.meta_scoring import (
         calc_batting_meta, calc_pitching_meta, calc_defense_score,
-        get_weights_with_source,
+        calc_speed_score, get_weights_with_source,
     )
 
     conn = get_connection()
@@ -1259,13 +1259,14 @@ def recalculate_all_meta_scores() -> dict:
 
     _, _, source = get_weights_with_source()
 
-    # Recalc batting
+    # Recalc batting — now includes speed/stealing and position-specific defense
     batters = cursor.execute("""
         SELECT card_id, contact, gap_power, power, eye, avoid_ks, babip,
                card_value, position,
                infield_range, infield_error, infield_arm,
                catcher_ability, catcher_frame, catcher_arm,
-               of_range, of_error, of_arm
+               of_range, of_error, of_arm,
+               speed, stealing, baserunning
         FROM cards WHERE position IS NOT NULL AND pitcher_role IS NULL
     """).fetchall()
 
@@ -1273,6 +1274,7 @@ def recalculate_all_meta_scores() -> dict:
     for row in batters:
         d = dict(row)
         d['defense_score'] = calc_defense_score(d)
+        d['speed_score'] = calc_speed_score(d)
         d['ovr'] = d.get('card_value', 0)
         meta = calc_batting_meta(d)
         if meta and meta > 0:
@@ -1297,6 +1299,86 @@ def recalculate_all_meta_scores() -> dict:
                           (meta, d['card_id']))
             pit_count += 1
 
+    # ── Sync roster table metas with recalculated card metas ──
+    # The roster table stores meta_score from import time, which goes stale
+    # when weights change. Update roster metas by joining against cards.
+    # Uses card_id when available (exact match), falls back to name + OVR match.
+    roster_synced = 0
+    try:
+        # Best: match by card_id (exact)
+        cursor.execute("""
+            UPDATE roster SET meta_score = (
+                SELECT c.meta_score_batting FROM cards c
+                WHERE c.card_id = roster.card_id
+                  AND c.meta_score_batting IS NOT NULL AND c.position != 1
+                LIMIT 1
+            )
+            WHERE card_id IS NOT NULL
+              AND position NOT IN ('SP', 'RP', 'CL')
+              AND EXISTS (
+                  SELECT 1 FROM cards c WHERE c.card_id = roster.card_id
+                    AND c.meta_score_batting IS NOT NULL AND c.position != 1
+              )
+        """)
+        roster_synced += cursor.rowcount
+
+        cursor.execute("""
+            UPDATE roster SET meta_score = (
+                SELECT c.meta_score_pitching FROM cards c
+                WHERE c.card_id = roster.card_id
+                  AND c.meta_score_pitching IS NOT NULL AND c.pitcher_role IS NOT NULL
+                LIMIT 1
+            )
+            WHERE card_id IS NOT NULL
+              AND position IN ('SP', 'RP', 'CL')
+              AND EXISTS (
+                  SELECT 1 FROM cards c WHERE c.card_id = roster.card_id
+                    AND c.meta_score_pitching IS NOT NULL AND c.pitcher_role IS NOT NULL
+              )
+        """)
+        roster_synced += cursor.rowcount
+
+        # Fallback: match by name + OVR for rows without card_id
+        cursor.execute("""
+            UPDATE roster SET meta_score = (
+                SELECT c.meta_score_batting FROM cards c
+                WHERE c.card_title LIKE '%' || roster.player_name || '%'
+                  AND c.card_value = roster.ovr
+                  AND c.meta_score_batting IS NOT NULL AND c.position != 1
+                LIMIT 1
+            )
+            WHERE card_id IS NULL
+              AND position NOT IN ('SP', 'RP', 'CL')
+              AND EXISTS (
+                  SELECT 1 FROM cards c
+                  WHERE c.card_title LIKE '%' || roster.player_name || '%'
+                    AND c.card_value = roster.ovr
+                    AND c.meta_score_batting IS NOT NULL AND c.position != 1
+              )
+        """)
+        roster_synced += cursor.rowcount
+
+        cursor.execute("""
+            UPDATE roster SET meta_score = (
+                SELECT c.meta_score_pitching FROM cards c
+                WHERE c.card_title LIKE '%' || roster.player_name || '%'
+                  AND c.card_value = roster.ovr
+                  AND c.meta_score_pitching IS NOT NULL AND c.pitcher_role IS NOT NULL
+                LIMIT 1
+            )
+            WHERE card_id IS NULL
+              AND position IN ('SP', 'RP', 'CL')
+              AND EXISTS (
+                  SELECT 1 FROM cards c
+                  WHERE c.card_title LIKE '%' || roster.player_name || '%'
+                    AND c.card_value = roster.ovr
+                    AND c.meta_score_pitching IS NOT NULL AND c.pitcher_role IS NOT NULL
+              )
+        """)
+        roster_synced += cursor.rowcount
+    except Exception:
+        pass  # Non-critical — roster table may not exist on fresh installs
+
     conn.commit()
     conn.close()
 
@@ -1304,6 +1386,187 @@ def recalculate_all_meta_scores() -> dict:
         "status": "success",
         "batters_updated": bat_count,
         "pitchers_updated": pit_count,
+        "roster_synced": roster_synced,
         "weight_source": source,
-        "message": f"Recalculated {bat_count} batters + {pit_count} pitchers using {source} weights",
+        "message": f"Recalculated {bat_count} batters + {pit_count} pitchers using {source} weights. Synced {roster_synced} roster metas.",
     }
+
+
+def ingest_fielding_stats(filepath: str) -> dict:
+    """Ingest fielding stats CSV into fielding_stats table."""
+    df = parse_fielding_stats_csv(filepath)
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    snapshot_date = datetime.now().strftime("%Y-%m-%d")
+
+    # Delete any existing snapshot from today (re-import overwrites)
+    cursor.execute("DELETE FROM fielding_stats WHERE DATE(snapshot_date) = ?", (snapshot_date,))
+
+    count = 0
+    for _, row in df.iterrows():
+        name = _safe_str(row.get('Name', '')).strip()
+        if not name or name.lower() in ('total', 'totals', 'team'):
+            continue
+
+        pos = _safe_str(row.get('POS', '')).strip()
+        bats = _safe_str(row.get('B', '')).strip()
+        throws = _safe_str(row.get('T', '')).strip()
+
+        card_id = _match_card_id(cursor, name)
+
+        cursor.execute("""
+            INSERT INTO fielding_stats (
+                player_name, position, bats, throws,
+                games, gs, tc, assists, putouts, errors, dp,
+                pct, rng, zr, eff,
+                sba, rto, rto_pct, ip, pb, cera, frm, arm,
+                card_id, snapshot_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            name, pos, bats, throws,
+            _safe_int(row.get('G', 0)),
+            _safe_int(row.get('GS', 0)),
+            _safe_int(row.get('TC', 0)),
+            _safe_int(row.get('A', 0)),
+            _safe_int(row.get('PO', 0)),
+            _safe_int(row.get('E', 0)),
+            _safe_int(row.get('DP', 0)),
+            _safe_float(row.get('PCT', 0)),
+            _safe_float(row.get('RNG', 0)),
+            _safe_float(row.get('ZR', 0)),
+            _safe_float(row.get('EFF', 0)),
+            _safe_int(row.get('SBA', 0)),
+            _safe_int(row.get('RTO', 0)),
+            _safe_float(row.get('RTO%', 0)),
+            _safe_float(row.get('IP', 0)),
+            _safe_int(row.get('PB', 0)),
+            _safe_float(row.get('CERA', 0)),
+            _safe_float(row.get('FRM', 0)),
+            _safe_float(row.get('ARM', 0)),
+            card_id,
+            snapshot_date,
+        ))
+        count += 1
+
+    conn.commit()
+    conn.close()
+    return {"status": "success", "file_type": "fielding_stats", "rows": count}
+
+
+def ingest_pitch_ratings(filepath: str) -> dict:
+    """Ingest individual pitch ratings CSV into pitch_ratings table."""
+    df = parse_pitch_ratings_csv(filepath)
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    snapshot_date = datetime.now().strftime("%Y-%m-%d")
+
+    # Delete any existing snapshot from today (re-import overwrites)
+    cursor.execute("DELETE FROM pitch_ratings WHERE DATE(snapshot_date) = ?", (snapshot_date,))
+
+    count = 0
+    for _, row in df.iterrows():
+        name = _safe_str(row.get('Name', '')).strip()
+        if not name or name.lower() in ('total', 'totals', 'team'):
+            continue
+
+        pos = _safe_str(row.get('POS', '')).strip()
+        throws = _safe_str(row.get('T', '')).strip()
+        age = _safe_int(row.get('Age', 0))
+
+        card_id = _match_card_id(cursor, name)
+
+        cursor.execute("""
+            INSERT INTO pitch_ratings (
+                player_name, position, throws, age,
+                fb, ch, cb, sl, si, sp, ct, fo, cc, sc, kc, kn,
+                pitch_count, velocity, slot, stamina,
+                card_id, snapshot_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            name, pos, throws, age,
+            _safe_int(row.get('FB', 0)),
+            _safe_int(row.get('CH', 0)),
+            _safe_int(row.get('CB', 0)),
+            _safe_int(row.get('SL', 0)),
+            _safe_int(row.get('SI', 0)),
+            _safe_int(row.get('SP', 0)),
+            _safe_int(row.get('CT', 0)),
+            _safe_int(row.get('FO', 0)),
+            _safe_int(row.get('CC', 0)),
+            _safe_int(row.get('SC', 0)),
+            _safe_int(row.get('KC', 0)),
+            _safe_int(row.get('KN', 0)),
+            _safe_int(row.get('PIT', 0)),
+            _safe_str(row.get('VELO', '')).strip(),
+            _safe_str(row.get('Slot', '')).strip(),
+            _safe_int(row.get('STM', 0)),
+            card_id,
+            snapshot_date,
+        ))
+        count += 1
+
+    conn.commit()
+    conn.close()
+    return {"status": "success", "file_type": "pitch_ratings", "rows": count}
+
+
+def ingest_position_ratings(filepath: str) -> dict:
+    """Ingest position ratings CSV and update cards table with position ratings.
+
+    This does not use its own table — it updates pos_rating_* columns on the cards table.
+    Handles '-' values in position columns (they mean 0/not applicable).
+    """
+    df = parse_position_ratings_csv(filepath)
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    count = 0
+    for _, row in df.iterrows():
+        name = _safe_str(row.get('Name', '')).strip()
+        if not name or name.lower() in ('total', 'totals', 'team'):
+            continue
+
+        card_id = _match_card_id(cursor, name)
+        if card_id is None:
+            continue
+
+        # Convert position ratings, handling '-' as 0
+        def _pos_val(col):
+            val = row.get(col, '-')
+            if val == '-' or val is None:
+                return 0
+            return _safe_int(val, 0)
+
+        cursor.execute("""
+            UPDATE cards SET
+                pos_rating_p = ?,
+                pos_rating_c = ?,
+                pos_rating_1b = ?,
+                pos_rating_2b = ?,
+                pos_rating_3b = ?,
+                pos_rating_ss = ?,
+                pos_rating_lf = ?,
+                pos_rating_cf = ?,
+                pos_rating_rf = ?,
+                last_updated_at = ?
+            WHERE card_id = ?
+        """, (
+            _pos_val('P'),
+            _pos_val('C'),
+            _pos_val('1B'),
+            _pos_val('2B'),
+            _pos_val('3B'),
+            _pos_val('SS'),
+            _pos_val('LF'),
+            _pos_val('CF'),
+            _pos_val('RF'),
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            card_id,
+        ))
+        count += 1
+
+    conn.commit()
+    conn.close()
+    return {"status": "success", "file_type": "position_ratings", "rows": count}

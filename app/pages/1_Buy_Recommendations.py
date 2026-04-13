@@ -500,25 +500,30 @@ def _get_performance_outliers():
     c = get_connection()
 
     # Pitchers outperforming their meta (like Pfaadt)
+    # Deduplicate: one row per player, most recent snapshot only
     outperforming = [dict(r) for r in c.execute("""
-        SELECT p.player_name, p.era, p.fip, p.war, p.ip, p.era_plus, p.whip,
+        SELECT p.player_name,
+               p.era, p.fip, p.war, p.ip, p.era_plus, p.whip,
                r.meta_score, r.position, r.lineup_role
         FROM pitching_stats p
         JOIN roster r ON r.player_name = p.player_name
             AND DATE(r.snapshot_date) = (SELECT MAX(DATE(snapshot_date)) FROM roster WHERE lineup_role != 'league')
         WHERE p.ip > 40 AND p.war > 1.5
             AND DATE(p.snapshot_date) = (SELECT MAX(DATE(snapshot_date)) FROM pitching_stats)
+        GROUP BY p.player_name
         ORDER BY p.war DESC
     """).fetchall()]
 
     bat_outperforming = [dict(r) for r in c.execute("""
-        SELECT b.player_name, b.ops, b.war, b.pa, b.avg, b.obp, b.slg, b.iso,
+        SELECT b.player_name,
+               b.ops, b.war, b.pa, b.avg, b.obp, b.slg, b.iso,
                r.meta_score, r.position, r.lineup_role
         FROM batting_stats b
         JOIN roster r ON r.player_name = b.player_name
             AND DATE(r.snapshot_date) = (SELECT MAX(DATE(snapshot_date)) FROM roster WHERE lineup_role != 'league')
         WHERE b.pa > 80 AND b.war > 1.0
             AND DATE(b.snapshot_date) = (SELECT MAX(DATE(snapshot_date)) FROM batting_stats)
+        GROUP BY b.player_name
         ORDER BY b.war DESC
     """).fetchall()]
 
@@ -977,12 +982,20 @@ with tab_perf:
         )
 
         # Callout for benched aces
+        _ROLE_LABELS = {
+            'league': 'a league card',
+            'bullpen': 'in the bullpen',
+            'bench': 'on the bench',
+            'reserve': 'a reserve',
+            'minors': 'in the minors',
+        }
         benched_aces = [p for p in pit_data if "BENCHED" in p.get('Status', '')]
         if benched_aces:
             for ace in benched_aces:
+                role_label = _ROLE_LABELS.get(ace['Role'], f"a *{ace['Role']}*")
                 st.warning(
                     f"**{ace['Player']}** has {ace['WAR']} WAR / {ace['ERA']} ERA in {ace['IP']} IP "
-                    f"but is only a *{ace['Role']}*. Performance meta ({ace['Perf Meta']}) is "
+                    f"but is only {role_label}. Performance meta ({ace['Perf Meta']}) is "
                     f"**+{ace['Δ']}** above card meta ({ace['Meta']}). Consider starting them!"
                 )
 

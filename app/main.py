@@ -1,6 +1,7 @@
 """OOTP Perfect Team Optimizer — Streamlit entry point."""
 import streamlit as st
 import pandas as pd
+import yaml
 import sys
 from pathlib import Path
 
@@ -22,6 +23,7 @@ st.set_page_config(
 
 conn = get_connection()
 config = load_config()
+config_path = Path(__file__).parent.parent / "config.yaml"
 budget = config.get('pp_budget', 500)
 
 # Last ingestion times
@@ -35,7 +37,27 @@ logs = conn.execute("""
 # ============================================================
 with st.sidebar:
     st.markdown(f"### \u26be {config.get('team_name', 'My Team')}")
-    st.metric("PP Budget", f"{budget:,}")
+
+    # Editable PP Budget — saves to config.yaml on change
+    new_budget = st.number_input(
+        "PP Budget",
+        min_value=0,
+        max_value=999999,
+        value=budget,
+        step=100,
+        key="sidebar_pp_budget",
+        label_visibility="collapsed",
+    )
+    # Show it big like a metric
+    st.markdown(f"<div style='text-align:center;margin-top:-15px;margin-bottom:5px;'>"
+                f"<span style='font-size:0.8em;color:#888;'>PP Budget</span><br>"
+                f"<span style='font-size:1.8em;font-weight:bold;'>{new_budget:,}</span></div>",
+                unsafe_allow_html=True)
+
+    if new_budget != budget:
+        config['pp_budget'] = new_budget
+        with open(config_path, 'w', encoding='utf-8') as f:
+            yaml.dump(config, f, default_flow_style=False)
 
     if logs:
         buy_count = conn.execute("SELECT COUNT(*) FROM recommendations WHERE rec_type='buy' AND dismissed=0").fetchone()[0]
@@ -107,7 +129,7 @@ with st.expander("\U0001f4e5 Import Data from OOTP", expanded=not bool(logs)):
 12. **Lineups > Overview** > Export CSV
 13. **Pitching** (team pitching roster) > Export CSV
 
-All CSVs go to: `{config.get('watch_directory', 'your watch directory')}`
+All CSVs go to: `""" + config.get('watch_directory', 'your watch directory') + """`
     """)
 
     col_import1, col_import2 = st.columns(2)
@@ -333,7 +355,8 @@ with tab_overview:
                 st.divider()
                 st.markdown("**AI Strategic Insights**")
                 st.info(latest_insight['content'])
-                st.caption(f"Generated: {str(latest_insight['created_at'])[:19]}")
+                ts = str(latest_insight['created_at'])[:16].replace('T', ' ')
+                st.caption(f"Generated: {ts}")
     except Exception:
         pass
 
@@ -622,7 +645,7 @@ with tab_data:
     st.markdown("**Data Freshness**")
     freshness_data = []
     file_type_labels = {
-        'market': 'Card Shop (pt_card_list)',
+        'market': 'Card Shop',
         'roster_batting': 'Roster Batting Ratings',
         'roster_pitching': 'Roster Pitching Ratings',
         'collection_batting': 'Collection Batting',
@@ -631,8 +654,17 @@ with tab_data:
         'stats_pitching': 'League Pitching Stats',
         'roster_batting_stats': 'Roster Batting Stats',
         'roster_pitching_stats': 'Roster Pitching Stats',
-        'roster_batting_stats_adv': 'Roster Batting Stats (Adv)',
-        'roster_pitching_stats_adv': 'Roster Pitching Stats (Adv)',
+        'roster_batting_stats_adv': 'Batting Stats (Adv)',
+        'roster_pitching_stats_adv': 'Pitching Stats (Adv)',
+        'stats_batting_ratings': 'League Batting Ratings',
+        'stats_pitching_ratings': 'League Pitching Ratings',
+        'lineup_vs_rhp': 'Lineup vs RHP',
+        'lineup_vs_lhp': 'Lineup vs LHP',
+        'lineup_overview': 'Lineup Overview',
+        'team_pitching': 'Pitching Staff',
+        'fielding_stats': 'Fielding Stats',
+        'position_ratings': 'Position Ratings',
+        'pitch_ratings': 'Pitch Ratings',
     }
     for log in logs:
         freshness_data.append({

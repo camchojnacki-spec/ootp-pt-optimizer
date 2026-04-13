@@ -5,6 +5,7 @@ from app.core.database import load_config, get_db_path
 from app.utils.constants import (
     DEFAULT_BATTING_WEIGHTS, DEFAULT_PITCHING_WEIGHTS,
     PITCHING_STAT_FLOOR, BATTING_STAT_FLOOR,
+    POSITION_DEFENSE_MULTIPLIERS,
 )
 
 # Diminishing returns threshold — stats above this get sqrt-scaled benefit
@@ -101,8 +102,13 @@ def get_weights_with_source() -> tuple:
     return (cal_bw or DEFAULT_BATTING_WEIGHTS), (cal_pw or DEFAULT_PITCHING_WEIGHTS), 'default'
 
 
-def calc_defense_score(row: dict) -> float:
-    """Calculate defense component from card data."""
+def calc_defense_score(row: dict, apply_position_multiplier: bool = True) -> float:
+    """Calculate defense component from card data.
+
+    When apply_position_multiplier is True (default), the raw defensive average
+    is scaled by POSITION_DEFENSE_MULTIPLIERS so that SS/CF/C defense counts
+    much more than 1B/DH defense.  Pass False to get the raw average.
+    """
     # Determine position type and calc appropriate defense average
     pos = row.get('position') or row.get('Position') or 0
     if isinstance(pos, str):
@@ -115,29 +121,64 @@ def calc_defense_score(row: dict) -> float:
     except (ValueError, TypeError):
         pos = 0
 
+    raw = 0.0
     if pos in (7, 8, 9):  # OF
         vals = [row.get('of_range', 0) or 0, row.get('of_error', 0) or 0, row.get('of_arm', 0) or 0]
         # Also check alternate column names
         if not any(vals):
             vals = [row.get('OF Range', 0) or 0, row.get('OF Error', 0) or 0, row.get('OF Arm', 0) or 0]
-        return sum(vals) / max(len([v for v in vals if v]), 1)
+        raw = sum(vals) / max(len([v for v in vals if v]), 1)
     elif pos == 2:  # C
         vals = [row.get('catcher_ability', 0) or 0, row.get('catcher_frame', 0) or 0, row.get('catcher_arm', 0) or 0]
         if not any(vals):
             vals = [row.get('CatcherAbil', 0) or 0, row.get('CatcherFrame', 0) or 0, row.get('Catcher Arm', 0) or 0]
-        return sum(vals) / max(len([v for v in vals if v]), 1)
+        raw = sum(vals) / max(len([v for v in vals if v]), 1)
     elif pos in (3, 4, 5, 6):  # IF
         vals = [row.get('infield_range', 0) or 0, row.get('infield_error', 0) or 0, row.get('infield_arm', 0) or 0]
         if not any(vals):
             vals = [row.get('Infield Range', 0) or 0, row.get('Infield Error', 0) or 0, row.get('Infield Arm', 0) or 0]
-        return sum(vals) / max(len([v for v in vals if v]), 1)
-    return 0
+        raw = sum(vals) / max(len([v for v in vals if v]), 1)
+
+    if not apply_position_multiplier:
+        return raw
+
+    # Scale by position importance: SS defense is worth 1.4x, 1B is 0.5x, etc.
+    multiplier = POSITION_DEFENSE_MULTIPLIERS.get(pos, 1.0)
+    return raw * multiplier
+
+
+def calc_speed_score(row: dict) -> float:
+    """Calculate speed/baserunning component from card data.
+
+    Combines Speed, Stealing, and Baserunning ratings.
+    Speed alone is conditionally valuable — it only matters if you get on base.
+    We weight Stealing highest (directly produces SB/runs), then Baserunning
+    (extra bases taken), then Speed (raw tool).
+    """
+    speed = float(row.get('speed') or row.get('Speed') or row.get('SPD') or 0)
+    stealing = float(row.get('stealing') or row.get('Stealing') or row.get('STL') or 0)
+    baserunning = float(row.get('baserunning') or row.get('Baserunning') or row.get('BR') or 0)
+
+    if speed <= 0 and stealing <= 0 and baserunning <= 0:
+        return 0.0
+
+    # Weighted composite: Stealing 40%, Baserunning 35%, Speed 25%
+    # Stealing is most directly predictive of SB (r=+0.344)
+    composite = (stealing * 0.40 + baserunning * 0.35 + speed * 0.25)
+
+    # Only count speed bonus above average (70) — slow players shouldn't be
+    # penalized since the batting stats already capture their output
+    if composite < 70:
+        return 0.0
+
+    return composite - 70  # Excess above average baseline
 
 
 def calc_batting_meta(row: dict, weights: dict = None) -> float:
     """Calculate batter meta score.
 
-    Includes OVR anchoring so the game's own evaluation is factored in.
+    Includes OVR anchoring, speed/stealing value, and position-specific
+    defense scaling so the game's own evaluation is factored in.
     """
     if weights is None:
         weights, _ = get_weights()
@@ -151,6 +192,7 @@ def calc_batting_meta(row: dict, weights: dict = None) -> float:
     bab = float(row.get('babip') or row.get('BABIP') or 0)
     defense = float(row.get('defense_score') or calc_defense_score(row))
     ovr = float(row.get('card_value') or row.get('OVR') or row.get('ovr') or 0)
+    speed_score = float(row.get('speed_score') or calc_speed_score(row))
 
     try:
         # Core weighted sum — AvK and BABIP zeroed by default since CON is
@@ -162,6 +204,12 @@ def calc_batting_meta(row: dict, weights: dict = None) -> float:
                 _diminished(pwr) * weights.get('power', 1.40) +
                 _diminished(bab) * weights.get('babip', 0.00) +
                 defense * weights.get('defense', 1.50))
+
+        # Speed/Stealing component — conditionally valuable (amplifies OBP)
+        # Only counts above-average speed; elite speedsters get a real boost
+        spd_weight = weights.get('speed_stealing', 0.50)
+        if speed_score > 0 and spd_weight > 0:
+            meta += _diminished(speed_score + 70) * spd_weight  # re-add baseline for diminishing calc
 
         # Balance penalty — if any key batting stat is below floor
         floor = BATTING_STAT_FLOOR
@@ -269,6 +317,7 @@ def calc_batting_meta_vs_rhp(row: dict, weights: dict = None) -> float:
     bab = float(row.get('babip') or row.get('BABIP') or 0)
     defense = float(row.get('defense_score') or calc_defense_score(row))
     ovr = float(row.get('card_value') or row.get('OVR') or row.get('ovr') or 0)
+    speed_score = float(row.get('speed_score') or calc_speed_score(row))
 
     try:
         meta = (_diminished(gap) * weights.get('gap_power', 1.40) +
@@ -278,6 +327,10 @@ def calc_batting_meta_vs_rhp(row: dict, weights: dict = None) -> float:
                 _diminished(pwr) * weights.get('power', 1.40) +
                 _diminished(bab) * weights.get('babip', 0.00) +
                 defense * weights.get('defense', 1.50))
+
+        spd_weight = weights.get('speed_stealing', 0.50)
+        if speed_score > 0 and spd_weight > 0:
+            meta += _diminished(speed_score + 70) * spd_weight
 
         floor = BATTING_STAT_FLOOR
         key_stats = [con, gap]
@@ -316,6 +369,7 @@ def calc_batting_meta_vs_lhp(row: dict, weights: dict = None) -> float:
     bab = float(row.get('babip') or row.get('BABIP') or 0)
     defense = float(row.get('defense_score') or calc_defense_score(row))
     ovr = float(row.get('card_value') or row.get('OVR') or row.get('ovr') or 0)
+    speed_score = float(row.get('speed_score') or calc_speed_score(row))
 
     try:
         meta = (_diminished(gap) * weights.get('gap_power', 1.40) +
@@ -325,6 +379,10 @@ def calc_batting_meta_vs_lhp(row: dict, weights: dict = None) -> float:
                 _diminished(pwr) * weights.get('power', 1.40) +
                 _diminished(bab) * weights.get('babip', 0.00) +
                 defense * weights.get('defense', 1.50))
+
+        spd_weight = weights.get('speed_stealing', 0.50)
+        if speed_score > 0 and spd_weight > 0:
+            meta += _diminished(speed_score + 70) * spd_weight
 
         floor = BATTING_STAT_FLOOR
         key_stats = [con, gap]

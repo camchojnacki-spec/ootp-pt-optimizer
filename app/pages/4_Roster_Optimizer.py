@@ -102,8 +102,65 @@ else:
 
 
 # ── Helpers ──
-def find_owned_upgrades(pos_value, current_meta, is_pitching, exclude_names=None, limit=5):
+def find_roster_bench_upgrades(pos_value, current_meta, exclude_names=None, current_player_name=None):
+    """Find bench/reserve players at this ROSTER position who beat the starter.
+
+    This catches players whose card position differs from their roster position
+    (e.g., a CF card assigned to LF by the manager). These players wouldn't
+    appear in find_owned_upgrades which queries by card position_name.
+
+    Performance gate: if the current starter is producing well in-game (WAR/600 >= 1.5)
+    and the bench player has no performance data, don't recommend the swap.
+
+    exclude_names should contain PLAYER NAMES (not card titles).
+    """
     exclude_names = exclude_names or []
+
+    # Check if current starter is performing well
+    starter_perf = None
+    if current_player_name:
+        starter_perf = _perf_bat.get(current_player_name) or _perf_pit.get(current_player_name)
+
+    bench_upgrades = []
+    for p in all_by_pos.get(pos_value, []):
+        if p.get('lineup_role') in ('starter', 'rotation', 'closer', 'bullpen'):
+            continue  # Skip active players — we only want bench/reserve
+        pname = p['player_name']
+        if pname in exclude_names:
+            continue
+        # Also check if player name appears in any exclude entry (handles card titles in list)
+        if any(pname in ex or ex in pname for ex in exclude_names):
+            continue
+        m = p.get('meta_score') or 0
+        if m > current_meta + min_improvement:
+            # Performance gate: don't recommend benching a producing starter
+            # for someone with no game data
+            bench_perf = _perf_bat.get(pname) or _perf_pit.get(pname)
+            if starter_perf and not bench_perf:
+                war600 = starter_perf.get('war600', starter_perf.get('war200', 0))
+                if war600 >= 1.5:
+                    continue  # Starter proving their value — skip this bench player
+
+            bench_upgrades.append({
+                'card_id': p.get('card_id'),
+                'card_title': p.get('card_title') or pname,
+                'player_name': pname,
+                'card_value': p.get('ovr'),
+                'meta_score': m,
+                'last_10_price': 0,
+                'action': 'Promote',
+            })
+    bench_upgrades.sort(key=lambda x: -(x['meta_score'] or 0))
+    return bench_upgrades
+
+
+def find_owned_upgrades(pos_value, current_meta, is_pitching, exclude_names=None, limit=5, current_player_name=None):
+    exclude_names = exclude_names or []
+
+    # First: check roster bench/reserve at this position (catches position mismatches)
+    bench_ups = find_roster_bench_upgrades(pos_value, current_meta, exclude_names, current_player_name)
+
+    # Then: search cards table by card's natural position
     meta_col = "meta_score_pitching" if is_pitching else "meta_score_batting"
     pos_col = "pitcher_role_name" if is_pitching else "position_name"
     results = conn.execute(f"""
@@ -118,10 +175,15 @@ def find_owned_upgrades(pos_value, current_meta, is_pitching, exclude_names=None
     """, (pos_value, current_meta + min_improvement, limit + len(exclude_names) + 5)).fetchall()
 
     filtered = []
+    # Track names already added from bench to avoid duplicates
+    bench_names = {b['card_title'] for b in bench_ups}
+
     for r in results:
         title = r['card_title'] or ''
         if any(name in title for name in exclude_names):
             continue
+        if title in bench_names:
+            continue  # Already captured from roster bench
         d = dict(r)
         status, role = d.get('collection_status', ''), d.get('roster_role', '')
         if status == 'Inactive':
@@ -133,7 +195,11 @@ def find_owned_upgrades(pos_value, current_meta, is_pitching, exclude_names=None
         else:
             d['action'] = 'Swap In'
         filtered.append(d)
-    return filtered[:limit]
+
+    # Merge: bench players first (they're already on the team), then cards table results
+    combined = bench_ups + filtered
+    combined.sort(key=lambda x: -(x['meta_score'] or 0))
+    return combined[:limit]
 
 
 def find_market_upgrades(pos_value, current_meta, is_pitching, exclude_ids=None, limit=5):
@@ -302,11 +368,16 @@ for pos in show_positions:
         for i in order:
             sp = sp_players[i]
             m = sp['meta_score'] or 0
-            ow = find_owned_upgrades('SP', m, True, list(used_names), 3)
+            ow = find_owned_upgrades('SP', m, True, list(used_names), 3, current_player_name=sp['player_name'])
             mk = find_market_upgrades('SP', m, True, used_market_ids, 3)
             entry = _build_slot(f"SP{i+1}", sp['player_name'], sp['ovr'], m, ow, mk)
             if entry['owned_name']:
-                used_names.add(entry['owned_name'])
+                # Track PLAYER NAME to prevent same card recommended twice
+                # Extract from the upgrade dict if available, else from card title
+                bo = ow[0] if ow else None
+                pname = bo.get('player_name', entry['owned_name']) if bo else entry['owned_name']
+                used_names.add(pname)
+                used_names.add(entry['owned_name'])  # Also add card title for cards-table exclusion
             sp_entries[i] = entry
         upgrade_plan.extend(sp_entries)
         continue
@@ -322,11 +393,14 @@ for pos in show_positions:
         for i in order:
             rp = rp_players[i]
             m = rp['meta_score'] or 0
-            ow = find_owned_upgrades('RP', m, True, list(used_names), 3)
+            ow = find_owned_upgrades('RP', m, True, list(used_names), 3, current_player_name=rp['player_name'])
             mk = find_market_upgrades('RP', m, True, used_market_ids, 3)
             label = slot_names[i] if i < len(slot_names) else f"RP{i+1}"
             entry = _build_slot(label, rp['player_name'], rp['ovr'], m, ow, mk)
             if entry['owned_name']:
+                bo = ow[0] if ow else None
+                pname = bo.get('player_name', entry['owned_name']) if bo else entry['owned_name']
+                used_names.add(pname)
                 used_names.add(entry['owned_name'])
             rp_entries[i] = entry
         upgrade_plan.extend(rp_entries)
@@ -372,12 +446,15 @@ for pos in show_positions:
             m = player['meta_score'] or 0
             bh = player.get('bats_hand', '?')
             label = f"{pos}{idx}"
-            ow = find_owned_upgrades(pos, m, is_pitching, active_names, 3)
+            ow = find_owned_upgrades(pos, m, is_pitching, active_names, 3, current_player_name=player['player_name'])
             mk = find_market_upgrades(pos, m, is_pitching, used_market_ids, 3)
             entry = _build_slot(label, player['player_name'], player['ovr'], m, ow, mk, bats_hand=bh)
             entry['is_platoon'] = True
             entry['platoon_hand'] = bh
             if entry['owned_name']:
+                bo = ow[0] if ow else None
+                pname = bo.get('player_name', entry['owned_name']) if bo else entry['owned_name']
+                active_names.append(pname)
                 active_names.append(entry['owned_name'])
             upgrade_plan.append(entry)
     else:
@@ -386,10 +463,14 @@ for pos in show_positions:
         m = player['meta_score'] or 0
         bh = player.get('bats_hand', '?')
         active_names = [p['player_name'] for p in active_players]
-        ow = find_owned_upgrades(pos, m, is_pitching, active_names, 3)
+        ow = find_owned_upgrades(pos, m, is_pitching, active_names, 3, current_player_name=player['player_name'])
         mk = find_market_upgrades(pos, m, is_pitching, used_market_ids, 3)
         entry = _build_slot(pos, player['player_name'], player['ovr'], m, ow, mk, bats_hand=bh)
         entry['is_platoon'] = False
+        if entry['owned_name']:
+            bo = ow[0] if ow else None
+            pname = bo.get('player_name', entry['owned_name']) if bo else entry['owned_name']
+            used_owned_titles.add(pname)  # prevent cross-position duplicates
         # Flag if same-handed duplicates exist (platoon gap)
         if len(active_players) > 1 and primary_hand in ('L', 'R'):
             same_hand_count = sum(1 for p in active_players if p.get('bats_hand') == primary_hand)
@@ -407,6 +488,8 @@ all_upgrades = [u for u in upgrade_plan if u['owned_name'] or u['market_name']]
 top_priorities = sorted(all_upgrades, key=lambda x: -x['best_delta'])[:3]
 
 # ── Roster mismatches ──
+# Only flag when a bench player genuinely beats the starter AND the starter
+# isn't outperforming their meta in real games.
 roster_fixes = []
 for pos in bat_positions + ['CL']:
     pp = all_by_pos.get(pos, [])
@@ -417,6 +500,15 @@ for pos in bat_positions + ['CL']:
             if p.get('lineup_role') in ('starter', 'rotation', 'closer', 'bullpen'):
                 d = round((best['meta_score'] or 0) - (p['meta_score'] or 0))
                 if d >= min_improvement:
+                    # Performance gate: don't bench a player producing real WAR
+                    # for someone with no performance data
+                    starter_perf = _perf_bat.get(p['player_name']) or _perf_pit.get(p['player_name'])
+                    bench_perf = _perf_bat.get(best['player_name']) or _perf_pit.get(best['player_name'])
+                    if starter_perf and not bench_perf:
+                        # Starter has stats, bench player doesn't — skip if starter is producing
+                        war600 = starter_perf.get('war600', starter_perf.get('war200', 0))
+                        if war600 >= 1.5:  # decent+ production
+                            break  # Don't flag — starter is proving their value in-game
                     roster_fixes.append({'pos': pos, 'starter': p['player_name'],
                         'starter_meta': round(p['meta_score'] or 0),
                         'better': best['player_name'],
@@ -598,26 +690,29 @@ st.divider()
 
 
 def build_chain_rows(positions_list, show_bats=False, show_perf=False):
-    """Build compact lineup rows with a single unified Recommendation column.
+    """Build compact lineup rows for the roster optimizer table.
 
-    Cascade priority for the recommendation:
-    1. AI pick (if AI has been run) — shows promote, buy, keep, or platoon
-    2. Free promote (if you own a better card)
-    3. Market buy (if no free option and market has one)
-    4. "✅ Optimal" if no upgrades exist
+    Columns: Pos | Current | Meta | Perf | Action | Why
+    - Action: concise "what to do" (Optimal / Promote X / Buy X 2,350PP)
+    - Why: short AI or meta reason (platoon warning, AI insight)
     """
     rows = []
     for u in upgrade_plan:
         if u['pos'] not in positions_list and not any(u['pos'].startswith(p) for p in positions_list):
             continue
 
-        # Current player — compact: "Name (OVR)"
+        # Current player — compact: "Name (OVR H)"
         ovr = u['current_ovr'] or ""
         bh = f" {u.get('bats', '')}" if show_bats and u.get('bats', '?') != '?' else ""
         current_display = f"{u['current_name']} ({ovr}{bh})" if ovr else u['current_name']
 
+        # Pos column — append platoon warning inline
+        pos_display = u['pos']
+        if u.get('platoon_warning'):
+            pos_display += " \u26a0\ufe0f"
+
         row = {
-            "Pos": u['pos'],
+            "Pos": pos_display,
             "Current": current_display,
             "Meta": u['current_meta'],
         }
@@ -629,78 +724,68 @@ def build_chain_rows(positions_list, show_bats=False, show_perf=False):
             pp = _perf_pit.get(name)
             if pp:
                 era_fip = pp['era'] - pp['fip']
-                flag = "\U0001f340" if era_fip < -0.5 else ("\u26a0\ufe0f" if era_fip > 0.5 else "")
-                row["Perf"] = f"{pp['era']:.2f} ERA  {pp['war']:.1f}W {flag}"
+                flag = " \U0001f340" if era_fip < -0.5 else (" \u26a0\ufe0f" if era_fip > 0.5 else "")
+                row["Perf"] = f"{pp['era']:.2f} ERA  {pp['war']:.1f}W{flag}"
             elif pb:
-                row["Perf"] = f".{int(pb['ops']*1000):03d} OPS  {pb['war600']:.1f}W/600"
+                row["Perf"] = f".{int(pb['ops']*1000):03d} OPS  {pb['war600']:.1f}W"
             else:
                 row["Perf"] = ""
 
-        # ── Unified Recommendation column ──
-        # Priority: meta-based first (promote > buy), then AI overrides ONLY
-        # when AI suggests a DIFFERENT/BETTER card. AI "Keep" does NOT wipe
-        # out existing meta recommendations — it just means AI didn't find
-        # something better, so the meta pick stands.
+        # ── Action column — concise "what to do" ──
         ai_pick = _get_ai_pick_for_pos(u['pos'])
 
-        # Start with the meta-based recommendation
-        meta_rec = ""
-        if u['owned_name']:
-            meta_rec = f"📦 {short_name(u['owned_name'], 30)} (+{u['owned_delta']}) FREE"
-        elif u['market_name']:
-            p = u['market_price'] or 0
-            cost = f"{p:,}" if p else "?"
-            meta_rec = f"🛒 {short_name(u['market_name'], 30)} (+{u['market_delta']}) {cost}PP"
+        action = ""
+        why = ""
 
-        # AI overrides only when it has an actionable pick (not Keep)
         if ai_pick and ai_pick['action'] in ('Promote', 'Buy', 'Platoon'):
             emoji = ai_pick.get('emoji', '')
-            card = ai_pick['card_name']
+            card = short_name(ai_pick['card_name'], 25)
             if ai_pick['action'] == 'Promote':
-                delta = u['owned_delta'] or '?'
-                row["Recommendation"] = f"{emoji} 📦 {short_name(card, 30)} (+{delta}) FREE"
+                action = f"{emoji} \U0001f4e6 {card} FREE"
             elif ai_pick['action'] == 'Buy':
                 p = ai_pick.get('cost') or (u['market_price'] if u.get('market_price') else 0)
                 cost = f"{p:,}" if p else "?"
-                row["Recommendation"] = f"{emoji} 🛒 {short_name(card, 30)} {cost}PP"
+                action = f"{emoji} \U0001f6d2 {card} {cost}PP"
             elif ai_pick['action'] == 'Platoon':
                 partner = ai_pick.get('platoon_partner', '')
-                row["Recommendation"] = f"{emoji} 🤝 {short_name(card, 20)}" + (f" + {short_name(partner, 20)}" if partner else "")
-        elif meta_rec:
-            row["Recommendation"] = meta_rec
+                action = f"{emoji} \U0001f91d {card}" + (f" + {short_name(partner, 15)}" if partner else "")
+            # AI reason as the "why"
+            if ai_pick.get('reason'):
+                why = ai_pick['reason']
+        elif u['owned_name']:
+            action = f"\U0001f4e6 {short_name(u['owned_name'], 25)} +{u['owned_delta']}"
+            why = "Promote owned card"
+        elif u['market_name']:
+            p = u['market_price'] or 0
+            cost = f"{p:,}" if p else "?"
+            action = f"\U0001f6d2 {short_name(u['market_name'], 25)} {cost}PP"
+            why = f"+{u['market_delta']} meta"
         else:
-            row["Recommendation"] = "✅ Optimal"
+            action = "\u2705 Optimal"
 
-        # Detail column — full card name + AI reason + platoon warnings
-        detail_parts = []
-        if ai_pick and ai_pick['action'] != 'Keep' and ai_pick.get('reason'):
-            detail_parts.append(f"AI: {ai_pick['reason']}")
-            if ai_pick.get('replaces'):
-                detail_parts.append(f"Replaces: {ai_pick['replaces']}")
+        # Append platoon warning to why
         if u.get('platoon_warning'):
-            detail_parts.append(u['platoon_warning'])
-        if u['owned_name']:
-            detail_parts.append(f"Owned: {u['owned_name']}")
-        if u['market_name']:
-            detail_parts.append(f"Market: {u['market_name']}")
-        row["Detail"] = " | ".join(detail_parts) if detail_parts else ""
+            warn_text = u['platoon_warning'].replace('\u26a0\ufe0f ', '')
+            why = f"{warn_text}" if not why else f"{why} | {warn_text}"
+
+        row["Action"] = action
+        row["Why"] = why
 
         rows.append(row)
     return rows
 
 
 CHAIN_COL_CONFIG = {
-    "Pos": st.column_config.TextColumn(width="small"),
+    "Pos": st.column_config.TextColumn(width="small",
+        help="\u26a0\ufe0f = platoon issue (same-handed batters, no opposite-hand partner)"),
     "Current": st.column_config.TextColumn(width="medium"),
     "Meta": st.column_config.ProgressColumn(min_value=300, max_value=800, format="%d", width="small"),
     "Perf": st.column_config.TextColumn(width="small",
-        help="In-game: ERA/OPS + WAR. \U0001f340=lucky (ERA << FIP), \u26a0\ufe0f=unlucky"),
-    "Recommendation": st.column_config.TextColumn(width="large",
-        help="Best move for this slot. 📦=promote owned card (FREE), 🛒=market buy, ✅=optimal. "
-             "AI picks override meta-only recommendations when AI Optimize has been run."),
-    "Detail": st.column_config.TextColumn(width="small",
-        help="Expand column to see full card name, AI reasoning, and who gets replaced. "
-             "Drag column border to widen."),
+        help="In-game stats. \U0001f340=outperforming (lucky), \u26a0\ufe0f=underperforming (unlucky)"),
+    "Action": st.column_config.TextColumn(width="medium",
+        help="\U0001f4e6=promote owned card (FREE), \U0001f6d2=market buy, \u2705=no upgrade needed"),
+    "Why": st.column_config.TextColumn(width="medium",
+        help="AI reasoning or meta-based explanation for the recommendation"),
 }
 
 # ── TABBED LAYOUT — full width, no horizontal scrolling ──

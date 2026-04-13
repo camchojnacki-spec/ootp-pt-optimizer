@@ -32,6 +32,23 @@ DEFAULT_BATTING_WEIGHTS = {
     "babip": 0.00,           # double-counted in CON (OOTP25+ derived stat)
     "defense": 1.50,         # r=+0.296 WAR — 2nd strongest, was massively underweighted
     "ovr": 1.25,             # r=+0.529 WAR — dominant but partially redundant with ratings
+    "speed_stealing": 0.50,  # Speed→SB r=+0.337, conditional value (amplifies OBP)
+}
+
+# Position-specific defense multipliers — how much defense matters by position.
+# Based on league data: CF def→WAR r=+0.257, SS r=+0.250, 1B r=+0.258 (surprising),
+# 3B r=+0.185, LF r=+0.205, 2B r=+0.125, RF r=+0.054, C r=+0.034.
+# Blended with traditional positional scarcity (SS/C/CF premium positions).
+POSITION_DEFENSE_MULTIPLIERS = {
+    2: 1.30,   # C  — low data correlation but framing/arm hugely valuable, premium position
+    3: 0.50,   # 1B — anyone can play 1B, low defensive spectrum value
+    4: 1.10,   # 2B — middle infield, moderate value
+    5: 1.00,   # 3B — moderate, hot corner needs arm/range
+    6: 1.40,   # SS — premium position, highest defensive spectrum
+    7: 0.70,   # LF — least demanding OF spot
+    8: 1.25,   # CF — premium OF, range matters most here
+    9: 0.80,   # RF — arm matters but less demanding than CF
+    10: 0.00,  # DH — no defense
 }
 
 DEFAULT_PITCHING_WEIGHTS = {
@@ -64,4 +81,7 @@ FILE_PATTERNS = {
     "lineup_vs_lhp": "lineups_-_vs_lhp",
     "lineup_overview": "lineups_-_overview",
     "team_pitching": "_pitching_default",
+    "fielding_stats": "fielding_stats",
+    "position_ratings": "position_ratings",
+    "pitch_ratings": "individual_pitch_ratings",
 }

@@ -742,57 +742,55 @@ def auto_calibrate_weights(conn=None) -> dict:
         bat_weight_keys = ["contact", "gap_power", "power", "eye", "avoid_ks", "babip"]
         # defense handled separately (computed, not a single card column)
 
-        # Join cards with batting_stats for rostered players with enough PA
+        # Join cards with batting_stats using card_id (most reliable) or name fallback
         bat_rows = conn.execute("""
             SELECT c.card_title, c.contact, c.gap_power, c.power, c.eye,
                    c.avoid_ks, c.babip, c.card_value,
                    c.infield_range, c.infield_error, c.infield_arm,
                    c.of_range, c.of_error, c.of_arm,
                    c.catcher_ability, c.catcher_frame, c.catcher_arm,
-                   c.position,
+                   c.position, c.speed, c.stealing, c.baserunning,
                    bs.war, bs.ops, bs.pa
             FROM cards c
-            INNER JOIN batting_stats bs
-                ON LOWER(TRIM(c.card_title)) = LOWER(TRIM(bs.player_name))
+            INNER JOIN batting_stats bs ON bs.card_id = c.card_id
             INNER JOIN (
-                SELECT player_name, MAX(snapshot_date) as max_date
-                FROM batting_stats GROUP BY player_name
-            ) latest ON bs.player_name = latest.player_name
+                SELECT card_id, MAX(snapshot_date) as max_date
+                FROM batting_stats WHERE card_id IS NOT NULL
+                GROUP BY card_id
+            ) latest ON bs.card_id = latest.card_id
                     AND bs.snapshot_date = latest.max_date
-            WHERE c.owned = 1 AND bs.pa >= 100
+            WHERE c.position != 1 AND bs.pa >= 100
         """).fetchall()
 
-        # Also try roster-based matching for cards that didn't match exactly
+        # Fallback: name matching for stats without card_id
         if len(bat_rows) < 15:
             try:
+                seen_ids = {r["card_title"] for r in bat_rows}
                 extra = conn.execute("""
                     SELECT c.card_title, c.contact, c.gap_power, c.power, c.eye,
                            c.avoid_ks, c.babip, c.card_value,
                            c.infield_range, c.infield_error, c.infield_arm,
                            c.of_range, c.of_error, c.of_arm,
                            c.catcher_ability, c.catcher_frame, c.catcher_arm,
-                           c.position,
+                           c.position, c.speed, c.stealing, c.baserunning,
                            bs.war, bs.ops, bs.pa
                     FROM cards c
-                    INNER JOIN roster_current rc
-                        ON LOWER(TRIM(c.card_title)) = LOWER(TRIM(rc.player_name))
                     INNER JOIN batting_stats bs
-                        ON LOWER(TRIM(rc.player_name)) = LOWER(TRIM(bs.player_name))
+                        ON c.card_title LIKE '%' || bs.player_name || '%'
                     INNER JOIN (
                         SELECT player_name, MAX(snapshot_date) as max_date
-                        FROM batting_stats GROUP BY player_name
+                        FROM batting_stats WHERE card_id IS NULL
+                        GROUP BY player_name
                     ) latest ON bs.player_name = latest.player_name
                             AND bs.snapshot_date = latest.max_date
-                    WHERE c.owned = 1 AND bs.pa >= 100
+                    WHERE c.position != 1 AND bs.pa >= 100
                 """).fetchall()
-                # Deduplicate by card_title
-                seen = {r["card_title"] for r in bat_rows}
                 for r in extra:
-                    if r["card_title"] not in seen:
+                    if r["card_title"] not in seen_ids:
                         bat_rows.append(r)
-                        seen.add(r["card_title"])
+                        seen_ids.add(r["card_title"])
             except Exception:
-                pass  # roster_current view may not exist
+                pass
 
         bat_sample_size = len(bat_rows)
         bat_calibrated = dict(DEFAULT_BATTING_WEIGHTS)
@@ -900,42 +898,41 @@ def auto_calibrate_weights(conn=None) -> dict:
                    c.card_value, c.stamina, c.hold,
                    ps.war, ps.era, ps.ip
             FROM cards c
-            INNER JOIN pitching_stats ps
-                ON LOWER(TRIM(c.card_title)) = LOWER(TRIM(ps.player_name))
+            INNER JOIN pitching_stats ps ON ps.card_id = c.card_id
             INNER JOIN (
-                SELECT player_name, MAX(snapshot_date) as max_date
-                FROM pitching_stats GROUP BY player_name
-            ) latest ON ps.player_name = latest.player_name
+                SELECT card_id, MAX(snapshot_date) as max_date
+                FROM pitching_stats WHERE card_id IS NOT NULL
+                GROUP BY card_id
+            ) latest ON ps.card_id = latest.card_id
                     AND ps.snapshot_date = latest.max_date
-            WHERE c.owned = 1 AND ps.ip >= 30
+            WHERE c.pitcher_role IS NOT NULL AND ps.ip >= 30
         """).fetchall()
 
-        # Try roster-based matching too
+        # Fallback: name matching for stats without card_id
         if len(pitch_rows) < 10:
             try:
+                seen = {r["card_title"] for r in pitch_rows}
                 extra = conn.execute("""
                     SELECT c.card_title, c.stuff, c.movement, c.control, c.p_hr,
                            c.card_value, c.stamina, c.hold,
                            ps.war, ps.era, ps.ip
                     FROM cards c
-                    INNER JOIN roster_current rc
-                        ON LOWER(TRIM(c.card_title)) = LOWER(TRIM(rc.player_name))
                     INNER JOIN pitching_stats ps
-                        ON LOWER(TRIM(rc.player_name)) = LOWER(TRIM(ps.player_name))
+                        ON c.card_title LIKE '%' || ps.player_name || '%'
                     INNER JOIN (
                         SELECT player_name, MAX(snapshot_date) as max_date
-                        FROM pitching_stats GROUP BY player_name
+                        FROM pitching_stats WHERE card_id IS NULL
+                        GROUP BY player_name
                     ) latest ON ps.player_name = latest.player_name
                             AND ps.snapshot_date = latest.max_date
-                    WHERE c.owned = 1 AND ps.ip >= 30
+                    WHERE c.pitcher_role IS NOT NULL AND ps.ip >= 30
                 """).fetchall()
-                seen = {r["card_title"] for r in pitch_rows}
                 for r in extra:
                     if r["card_title"] not in seen:
                         pitch_rows.append(r)
                         seen.add(r["card_title"])
             except Exception:
-                pass  # roster_current view may not exist
+                pass
 
         pitch_sample_size = len(pitch_rows)
         pitch_calibrated = dict(DEFAULT_PITCHING_WEIGHTS)
