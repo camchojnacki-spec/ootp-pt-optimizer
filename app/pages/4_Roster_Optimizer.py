@@ -983,13 +983,30 @@ with tab_bat:
             # Old query used card_title matching against roster, but roster.card_title
             # is NULL for all entries. Instead, fetch top candidates and filter in Python
             # against the known set of all rostered player names.
-            _bench_candidates = conn.execute("""
-                SELECT c.card_title, c.meta_score_batting as meta, c.position_name
+            # Position-match: a bench SS upgrade should play SS (or a corner IF), not
+            # a catcher — so we score by position flexibility first.
+            _pos_match_map = {
+                'C':  ('C',),
+                '1B': ('1B', '3B', 'LF', 'RF'),
+                '2B': ('2B', 'SS', '3B'),
+                'SS': ('SS', '2B', '3B'),
+                '3B': ('3B', '1B', 'SS', '2B'),
+                'LF': ('LF', 'RF', 'CF', '1B'),
+                'CF': ('CF', 'LF', 'RF'),
+                'RF': ('RF', 'LF', 'CF', '1B'),
+                'DH': ('DH', '1B', 'LF', 'RF', '3B'),
+            }
+            _acceptable_positions = _pos_match_map.get(bpos, (bpos,))
+            _placeholders = ','.join(['?'] * len(_acceptable_positions))
+            _bench_candidates = conn.execute(f"""
+                SELECT c.card_id, c.card_title, c.team,
+                       c.meta_score_batting as meta, c.position_name, c.card_value
                 FROM cards c
                 WHERE c.owned = 1 AND c.meta_score_batting > ?
                     AND c.pitcher_role IS NULL
+                    AND c.position_name IN ({_placeholders})
                 ORDER BY c.meta_score_batting DESC LIMIT 30
-            """, (bmeta + 10,)).fetchall()
+            """, (bmeta + 10, *_acceptable_positions)).fetchall()
 
             bench_upgrade = None
             for _cand in _bench_candidates:
@@ -1006,10 +1023,24 @@ with tab_bat:
 
             action = ""
             if bench_upgrade:
-                up_name = short_name(bench_upgrade['card_title'], 25)
+                # Extract just the player name from the card_title for a compact display
+                _full_title = bench_upgrade['card_title'] or ''
                 up_meta = round(bench_upgrade['meta'])
                 delta = up_meta - bmeta
-                action = f"\U0001f4e6 {up_name} +{delta}"
+                up_pos = bench_upgrade['position_name'] or '?'
+                up_value = bench_upgrade['card_value'] or 0
+                # Cleaner short name — drop "MLB YYYY Live POS" prefix if present
+                _clean = _full_title
+                for _prefix in ['MLB 2026 Live ', 'MLB 2025 Live ', 'MLB 2024 Live ']:
+                    if _clean.startswith(_prefix):
+                        _clean = _clean[len(_prefix):]
+                        # Drop the position code that follows (e.g. "C Carlos Perez HOU")
+                        _parts = _clean.split(' ', 1)
+                        if _parts and _parts[0] in ('C','1B','2B','3B','SS','LF','CF','RF','DH','SP','RP','CP'):
+                            _clean = _parts[1] if len(_parts) > 1 else _clean
+                        break
+                _clean = short_name(_clean, 28)
+                action = f"\U0001f4e6 {_clean} • {up_pos} • {up_meta}m (+{delta}) • {up_value}pp"
 
             bench_rows.append({
                 "Pos": bpos,
@@ -1025,8 +1056,60 @@ with tab_bat:
                          "Player": st.column_config.TextColumn(width="medium"),
                          "Meta": st.column_config.ProgressColumn(min_value=300, max_value=800, format="%d", width="small"),
                          "Perf": st.column_config.TextColumn(width="small"),
-                         "Upgrade": st.column_config.TextColumn(width="medium"),
+                         "Upgrade": st.column_config.TextColumn(width="large"),
                      })
+
+        # ── Collection pool: owned batters NOT currently rostered ──
+        # This answers "do I actually have that player?" for anyone shown in Upgrade column.
+        with st.expander("\U0001f4e6 Owned batters on the bench pool (not on active roster)", expanded=False):
+            st.caption("These are batters you own but haven't assigned to your 26-man active roster. "
+                       "Any of them can be promoted — this is where bench upgrades come from.")
+            _pool_rows = conn.execute("""
+                SELECT c.card_title, c.team, c.position_name, c.bats, c.card_value,
+                       c.meta_score_batting as meta
+                FROM cards c
+                WHERE c.owned = 1 AND c.pitcher_role IS NULL
+                  AND c.meta_score_batting IS NOT NULL
+                ORDER BY c.meta_score_batting DESC
+                LIMIT 60
+            """).fetchall()
+            _bats_map = {1: 'R', 2: 'L', 3: 'S'}
+            _pool_display = []
+            for _p in _pool_rows:
+                _title = _p['card_title'] or ''
+                # Skip if actively rostered
+                if any(rname in _title for rname in _all_rostered_names):
+                    continue
+                # Clean display name
+                _clean = _title
+                for _prefix in ['MLB 2026 Live ', 'MLB 2025 Live ', 'MLB 2024 Live ']:
+                    if _clean.startswith(_prefix):
+                        _clean = _clean[len(_prefix):]
+                        _parts = _clean.split(' ', 1)
+                        if _parts and _parts[0] in ('C','1B','2B','3B','SS','LF','CF','RF','DH'):
+                            _clean = _parts[1] if len(_parts) > 1 else _clean
+                        break
+                _pool_display.append({
+                    "Player": _clean,
+                    "Pos": _p['position_name'] or '?',
+                    "Team": _p['team'] or '',
+                    "B": _bats_map.get(_p['bats'], '?'),
+                    "Meta": round(_p['meta'] or 0),
+                    "Value": _p['card_value'] or 0,
+                })
+            if _pool_display:
+                st.dataframe(pd.DataFrame(_pool_display[:25]), use_container_width=True, hide_index=True,
+                             column_config={
+                                 "Player": st.column_config.TextColumn(width="medium"),
+                                 "Pos": st.column_config.TextColumn(width="small"),
+                                 "Team": st.column_config.TextColumn(width="small"),
+                                 "B": st.column_config.TextColumn(width="small"),
+                                 "Meta": st.column_config.ProgressColumn(min_value=300, max_value=800, format="%d", width="small"),
+                                 "Value": st.column_config.NumberColumn(format="%d pp", width="small"),
+                             })
+                st.caption(f"Showing top {min(25, len(_pool_display))} of {len(_pool_display)} owned non-rostered batters by meta.")
+            else:
+                st.info("No owned batters are sitting in the pool — everyone is assigned.")
 
         # Bench composition analysis
         bench_hands = [bp.get('bats_hand', '?') for bp in _bench_bats]
