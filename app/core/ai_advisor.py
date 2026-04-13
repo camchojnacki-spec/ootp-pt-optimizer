@@ -1184,3 +1184,334 @@ def short_name_for_ai(card_title, max_len=40):
         return "?"
     t = card_title.strip()
     return t[:max_len] if len(t) <= max_len else t[:max_len] + "..."
+
+
+# ============================================================================
+# Manager's Eye — holistic roster sanity check
+# ============================================================================
+def _build_manager_review_context(conn) -> str:
+    """Build a detailed roster composition snapshot for the manager's review.
+
+    This is different from _build_portfolio_context — it focuses on ROSTER
+    CONSTRUCTION (positional coverage, handedness, platoon fits, bullpen roles)
+    rather than markets/flips/missions.
+    """
+    lines = []
+
+    # Determine the ACTIVE league.
+    # Priority: config.yaml's active_league setting > roster tagging > export_log.
+    active_league = None
+    try:
+        from app.core.database import load_config
+        cfg = load_config()
+        active_league = cfg.get("active_league")
+    except Exception:
+        pass
+    if not active_league:
+        try:
+            row = conn.execute("""
+                SELECT league_id, MAX(snapshot_date) as latest FROM roster
+                WHERE lineup_role != 'league' AND league_id IS NOT NULL
+                GROUP BY league_id ORDER BY latest DESC LIMIT 1
+            """).fetchone()
+            if row:
+                active_league = row['league_id']
+        except Exception:
+            pass
+    if not active_league:
+        try:
+            row = conn.execute(
+                "SELECT league_id FROM export_log ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                active_league = row['league_id']
+        except Exception:
+            pass
+
+    # Roster query — always use latest snapshot, regardless of league tagging.
+    # (If the user has multiple leagues tagged, they're usually from
+    # different sessions and the newest snapshot is what matters.)
+    rows = conn.execute("""
+        SELECT r.position, r.player_name, r.lineup_role, r.ovr, r.meta_score,
+               c.bats, c.throws, c.contact, c.gap_power, c.power, c.eye,
+               c.speed, c.stealing, c.baserunning,
+               c.stuff, c.movement, c.control, c.p_hr, c.stamina, c.hold,
+               c.infield_range, c.of_range, c.catcher_ability
+        FROM roster r
+        LEFT JOIN cards c ON (
+            c.card_title LIKE '%' || r.player_name || '%' AND c.owned = 1
+        )
+        WHERE r.lineup_role IN ('starter', 'rotation', 'closer', 'bullpen')
+          AND DATE(r.snapshot_date) = (
+              SELECT MAX(DATE(snapshot_date)) FROM roster WHERE lineup_role != 'league'
+          )
+        GROUP BY r.id
+        ORDER BY
+            CASE r.position
+                WHEN 'C' THEN 1 WHEN '1B' THEN 2 WHEN '2B' THEN 3 WHEN '3B' THEN 4
+                WHEN 'SS' THEN 5 WHEN 'LF' THEN 6 WHEN 'CF' THEN 7 WHEN 'RF' THEN 8
+                WHEN 'DH' THEN 9 WHEN 'SP' THEN 10 WHEN 'RP' THEN 11 WHEN 'CL' THEN 12
+                ELSE 99 END,
+            r.meta_score DESC
+    """).fetchall()
+
+    if active_league:
+        lines.append(f"ACTIVE LEAGUE: {active_league}")
+        lines.append("")
+
+    _bats_map = {1: 'R', 2: 'L', 3: 'S', '1': 'R', '2': 'L', '3': 'S'}
+    _throws_map = {1: 'R', 2: 'L', '1': 'R', '2': 'L'}
+
+    # Split into batters and pitchers
+    batters, pitchers = [], []
+    for r in rows:
+        if r['position'] in ('SP', 'RP', 'CL'):
+            pitchers.append(r)
+        else:
+            batters.append(r)
+
+    lines.append("BATTING ROSTER:")
+    for b in batters:
+        bh = _bats_map.get(b['bats'], '?')
+        meta = b['meta_score'] or 0
+        con = b['contact'] or 0
+        gap = b['gap_power'] or 0
+        pow_ = b['power'] or 0
+        eye = b['eye'] or 0
+        spd = b['speed'] or 0
+        role = b['lineup_role']
+        lines.append(
+            f"  {b['position']}: {b['player_name']} ({bh}) ovr={b['ovr']} meta={meta:.0f} "
+            f"CON={con} GAP={gap} POW={pow_} EYE={eye} SPD={spd} [{role}]"
+        )
+
+    lines.append("")
+    lines.append("PITCHING STAFF:")
+    for p in pitchers:
+        th = _throws_map.get(p['throws'], '?')
+        meta = p['meta_score'] or 0
+        stu = p['stuff'] or 0
+        mov = p['movement'] or 0
+        ctrl = p['control'] or 0
+        phr = p['p_hr'] or 0
+        sta = p['stamina'] or 0
+        hold = p['hold'] or 0
+        role = p['lineup_role']
+        lines.append(
+            f"  {p['position']}: {p['player_name']} ({th}) ovr={p['ovr']} meta={meta:.0f} "
+            f"STU={stu} MOV={mov} CTRL={ctrl} pHR={phr} STA={sta} HOLD={hold} [{role}]"
+        )
+
+    # Handedness summary
+    lines.append("")
+    bats_l = sum(1 for b in batters if _bats_map.get(b['bats']) == 'L')
+    bats_r = sum(1 for b in batters if _bats_map.get(b['bats']) == 'R')
+    bats_s = sum(1 for b in batters if _bats_map.get(b['bats']) == 'S')
+    throws_l = sum(1 for p in pitchers if _throws_map.get(p['throws']) == 'L')
+    throws_r = sum(1 for p in pitchers if _throws_map.get(p['throws']) == 'R')
+    lines.append(f"HANDEDNESS: Batters {bats_l}L / {bats_r}R / {bats_s}S | "
+                 f"Pitchers {throws_l}L / {throws_r}R")
+
+    # Team averages (hints at identity)
+    if batters:
+        avg_con = sum(b['contact'] or 0 for b in batters) / len(batters)
+        avg_pow = sum(b['power'] or 0 for b in batters) / len(batters)
+        avg_spd = sum(b['speed'] or 0 for b in batters) / len(batters)
+        avg_eye = sum(b['eye'] or 0 for b in batters) / len(batters)
+        lines.append(f"BATTING PROFILE: avg CON={avg_con:.0f} POW={avg_pow:.0f} "
+                     f"EYE={avg_eye:.0f} SPD={avg_spd:.0f}")
+
+    if pitchers:
+        avg_stu = sum(p['stuff'] or 0 for p in pitchers) / len(pitchers)
+        avg_ctrl = sum(p['control'] or 0 for p in pitchers) / len(pitchers)
+        avg_mov = sum(p['movement'] or 0 for p in pitchers) / len(pitchers)
+        lines.append(f"PITCHING PROFILE: avg STU={avg_stu:.0f} MOV={avg_mov:.0f} "
+                     f"CTRL={avg_ctrl:.0f}")
+
+    # In-game team performance if available — use latest snapshot
+    try:
+        team_perf = conn.execute("""
+            SELECT AVG(ops) as ops, AVG(war) as war_bat
+            FROM batting_stats
+            WHERE pa >= 20 AND snapshot_date = (SELECT MAX(snapshot_date) FROM batting_stats)
+        """).fetchone()
+        team_pitch = conn.execute("""
+            SELECT AVG(era) as era, AVG(whip) as whip
+            FROM pitching_stats
+            WHERE ip >= 5 AND snapshot_date = (SELECT MAX(snapshot_date) FROM pitching_stats)
+        """).fetchone()
+        if active_league:
+            record_row = conn.execute("""
+                SELECT team_record, games_played FROM export_log
+                WHERE league_id = ?
+                ORDER BY created_at DESC LIMIT 1
+            """, (active_league,)).fetchone()
+        else:
+            record_row = conn.execute("""
+                SELECT team_record, games_played FROM export_log
+                ORDER BY created_at DESC LIMIT 1
+            """).fetchone()
+        if record_row:
+            lines.append(f"CURRENT RECORD: {record_row['team_record']} ({record_row['games_played']} games)")
+        if team_perf and team_perf['ops']:
+            lines.append(f"TEAM OPS: {team_perf['ops']:.3f}")
+        if team_pitch and team_pitch['era']:
+            lines.append(f"TEAM ERA: {team_pitch['era']:.2f} WHIP: {team_pitch['whip']:.2f}")
+    except Exception:
+        pass
+
+    return "\n".join(lines)
+
+
+def get_roster_manager_review(conn=None) -> dict:
+    """Get a holistic 'manager's eye' review of the roster.
+
+    Goes beyond position-by-position upgrade scoring to identify:
+    - Critical coverage gaps (missing backup C, no utility IF, no LH bat, etc.)
+    - Composition issues (handedness imbalance, too many of one skill type)
+    - Strategic concerns (bullpen construction, platoon matchups, defense gaps)
+    - Team identity summary (contact/power/speed/pitching-oriented)
+
+    Returns dict: response, tokens_used, model, error
+    """
+    ai_config = get_ai_config()
+    if not ai_config["ready"]:
+        return {"response": None, "tokens_used": 0, "model": None, "error": ai_config["message"]}
+
+    from app.core.database import get_connection
+    close_conn = False
+    if conn is None:
+        conn = get_connection()
+        close_conn = True
+
+    try:
+        context = _build_manager_review_context(conn)
+    except Exception as e:
+        context = f"(Could not build context: {e})"
+    finally:
+        if close_conn:
+            conn.close()
+
+    system_prompt = (
+        "You are an experienced Major League Baseball manager and bench coach reviewing "
+        "your team's 26-man roster before making lineup decisions. You are NOT recommending "
+        "specific player acquisitions — you are identifying ROSTER CONSTRUCTION problems "
+        "that need to be addressed.\n\n"
+        "Baseball roster rules to evaluate against:\n"
+        "- 26-man roster: typically 13 position players + 13 pitchers\n"
+        "- Position players: 2 C (starter + backup), 4-6 IF including utility, 4-5 OF, 1 DH\n"
+        "- Pitchers: 5 SP, 7-8 RP (including a closer and 1-2 setup men)\n"
+        "- Bench should have: 1 backup C, 1 utility IF (plays SS/2B/3B), 1 4th OF, 1 platoon bat\n"
+        "- Handedness: want 2-3 LH bats minimum (vs RHP), 1+ LH reliever for matchups\n"
+        "- Pitching: balance of power (high stuff) and control (high ctrl) is needed\n\n"
+        "Your response MUST be structured with these sections:\n"
+        "1. **Team Identity** (1 line): 'This team is a ___ team' (e.g. 'contact-and-speed', "
+        "'power-heavy', 'groundball pitching')\n"
+        "2. **Critical Gaps** (bullet list, 2-4 items): The biggest roster-construction problems. "
+        "Focus on ROLES missing, not specific players.\n"
+        "3. **Composition Concerns** (bullet list, 2-3 items): Subtler issues — handedness "
+        "imbalance, overlap, platoon coverage.\n"
+        "4. **Strategic Fit** (1-2 sentences): How should this team be PLAYED given its "
+        "strengths/weaknesses?\n\n"
+        "Be blunt. If the roster is well-built, say so. Don't invent problems. Max 250 words."
+    )
+
+    user_message = f"=== ROSTER STATE ===\n{context}\n\n=== REVIEW ==="
+
+    try:
+        if ai_config["provider"] == "gemini":
+            return _call_gemini(system_prompt, user_message, ai_config, max_tokens=800)
+        else:
+            return _call_anthropic(system_prompt, user_message, ai_config, max_tokens=800)
+    except Exception as e:
+        logger.error(f"Manager review API error: {e}", exc_info=True)
+        return {"response": None, "tokens_used": 0, "model": None, "error": f"API error: {e}"}
+
+
+# ============================================================================
+# Strategy Recommendations — AI-powered OOTP strategy slider suggestions
+# ============================================================================
+def get_strategy_recommendations(conn=None) -> dict:
+    """Recommend OOTP in-game strategy slider values based on roster composition.
+
+    Analyzes the team's batting profile (speed vs power, contact vs TTO),
+    pitching profile (power vs control, starter depth, closer stuff), and
+    defensive alignment to suggest values for OOTP's strategy sliders:
+
+    Offensive: Stealing Bases, Base-Running, Hit&Run, Sac Bunt, Squeeze, Bunt for Hit
+    Pitching/Defense: Pitch Around, IBB, Hold Runners, Play Infield In,
+                      Play Corners In, Guard Lines, Infield Shifts, Outfield Shifts
+    Substitution: Hook SP, Hook RP, L/R Pitching Matchups, L/R Batting Matchups,
+                  Pinch-Hit for Position Players, Use Pinch Runners, Use of Openers
+
+    Returns dict: response (AI text with recommendations + reasoning),
+                  tokens_used, model, error
+    """
+    ai_config = get_ai_config()
+    if not ai_config["ready"]:
+        return {"response": None, "tokens_used": 0, "model": None, "error": ai_config["message"]}
+
+    from app.core.database import get_connection
+    close_conn = False
+    if conn is None:
+        conn = get_connection()
+        close_conn = True
+
+    try:
+        context = _build_manager_review_context(conn)
+    except Exception as e:
+        context = f"(Could not build context: {e})"
+    finally:
+        if close_conn:
+            conn.close()
+
+    system_prompt = (
+        "You are an OOTP 27 tactical coordinator helping set in-game strategy sliders "
+        "to MATCH the team's roster strengths. OOTP's strategy settings drive AI manager "
+        "decisions during simulated games, so wrong settings waste roster value.\n\n"
+        "Scale for each slider: 1 (Never/Conservative/Quick) through 5 (Frequently/Aggressive/Slow), "
+        "with 3 as neutral.\n\n"
+        "KEY TACTICAL PRINCIPLES:\n"
+        "- High team SPEED (avg >=55) + low POWER -> aggressive baserunning, steal more, hit&run\n"
+        "- High POWER (avg >=75) + low SPEED -> swing away, don't bunt/steal (waste of outs)\n"
+        "- High CONTACT + low POWER -> hit&run, bunt for hit, manufacture runs\n"
+        "- Weak bullpen -> quick hook on SP, aggressive L/R matchups on RP\n"
+        "- Strong closer but weak setup -> hook SP late, protect leads aggressively\n"
+        "- Weak defense (low IF/OF range) -> shift more, don't play infield in\n"
+        "- Power pitchers (high STU) -> let them work, slower hooks\n"
+        "- Control pitchers (high CTRL, low STU) -> hook quicker if struggling\n"
+        "- No LH bullpen arms -> don't bother with LR pitching matchups\n"
+        "- LH-heavy lineup vs RHP-heavy league -> prefer LR batting matchups\n\n"
+        "Your response format — use EXACTLY this structure:\n\n"
+        "**Team Identity**: (one line)\n\n"
+        "**OFFENSIVE STRATEGY**\n"
+        "- Stealing Bases: [1-5] — (one-line reason)\n"
+        "- Base-Running: [1-5] — (reason)\n"
+        "- Hit & Run: [1-5] — (reason)\n"
+        "- Sacrifice Bunt: [1-5] — (reason)\n"
+        "- Bunt for Hit: [1-5] — (reason)\n\n"
+        "**PITCHING & DEFENSE**\n"
+        "- Hook Starting Pitchers: [1-5] — (reason)\n"
+        "- Hook Relievers: [1-5] — (reason)\n"
+        "- Infield Shifts: [1-5] — (reason)\n"
+        "- Outfield Shifts: [1-5] — (reason)\n"
+        "- Play Infield In: [1-5] — (reason)\n\n"
+        "**SUBSTITUTION**\n"
+        "- L/R Pitching Matchups: [1-5] — (reason)\n"
+        "- L/R Batting Matchups: [1-5] — (reason)\n"
+        "- Pinch-Hit for Position Players: [1-5] — (reason)\n"
+        "- Use Pinch Runners: [1-5] — (reason)\n\n"
+        "**One-line summary**: (how to play this team)\n\n"
+        "Be blunt and specific. Tie recommendations to actual roster numbers. Max 450 words."
+    )
+
+    user_message = f"=== ROSTER STATE ===\n{context}\n\n=== RECOMMEND STRATEGY ==="
+
+    try:
+        if ai_config["provider"] == "gemini":
+            return _call_gemini(system_prompt, user_message, ai_config, max_tokens=1400)
+        else:
+            return _call_anthropic(system_prompt, user_message, ai_config, max_tokens=1400)
+    except Exception as e:
+        logger.error(f"Strategy recommendations API error: {e}", exc_info=True)
+        return {"response": None, "tokens_used": 0, "model": None, "error": f"API error: {e}"}

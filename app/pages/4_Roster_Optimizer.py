@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from app.core.database import get_connection, load_config
 from app.core.ai_advisor import (
     get_ai_config, get_upgrade_scouting_report, build_team_context, get_full_card_data,
-    ai_optimize_all_positions,
+    ai_optimize_all_positions, get_roster_manager_review, get_strategy_recommendations,
 )
 
 st.set_page_config(page_title="Roster Optimizer", page_icon="\U0001f4cb", layout="wide")
@@ -714,6 +714,80 @@ if roster_fixes:
             )
 
 # ════════════════════════════════════════════════════════════════
+# AI PRE-CHECK PANELS — Manager's Eye + Strategy Recommendations
+# These run BEFORE the upgrade recommendations so the user can sanity-
+# check the roster's shape and dial in OOTP strategy settings that
+# actually match what's on the field.
+# ════════════════════════════════════════════════════════════════
+st.divider()
+
+_ai_ready = ai_config["ready"]
+_mgr_col, _strat_col = st.columns(2)
+
+with _mgr_col:
+    with st.expander("\U0001f3af Manager's Eye — Roster Sanity Check (AI)", expanded=False):
+        st.caption("A holistic review of your 26-man roster from a manager's perspective — "
+                   "identifies coverage gaps, handedness imbalances, and strategic concerns "
+                   "BEFORE you act on upgrade recommendations.")
+        if not _ai_ready:
+            st.info(f"AI advisor not ready: {ai_config.get('message', 'not configured')}")
+        else:
+            _mgr_key = "roster_manager_review"
+            _btn_cols = st.columns([1, 3])
+            with _btn_cols[0]:
+                if st.button("\U0001f50d Run Review", key="btn_mgr_review",
+                             help="Calls the AI model — uses ~1500 tokens."):
+                    with st.spinner("Manager is reviewing the roster..."):
+                        st.session_state[_mgr_key] = get_roster_manager_review(conn)
+            with _btn_cols[1]:
+                if _mgr_key in st.session_state and st.button("Clear", key="btn_mgr_clear"):
+                    del st.session_state[_mgr_key]
+                    st.rerun()
+
+            result = st.session_state.get(_mgr_key)
+            if result:
+                if result.get("error"):
+                    st.error(f"Review failed: {result['error']}")
+                elif result.get("response"):
+                    st.markdown(result["response"])
+                    st.caption(f"Model: {result.get('model', '?')} • "
+                               f"Tokens: {result.get('tokens_used', 0):,}")
+            else:
+                st.caption("Click 'Run Review' to get an AI-generated assessment.")
+
+with _strat_col:
+    with st.expander("\U0001f3ae Strategy Recommendations — In-Game Sliders (AI)", expanded=False):
+        st.caption("Suggests values for OOTP's strategy sliders (stealing, bunting, shifts, "
+                   "hooks, L/R matchups) based on your roster's actual strengths. "
+                   "Apply these in-game under Strategy → Overall Strategy.")
+        if not _ai_ready:
+            st.info(f"AI advisor not ready: {ai_config.get('message', 'not configured')}")
+        else:
+            _strat_key = "strategy_recommendations"
+            _btn_cols2 = st.columns([1, 3])
+            with _btn_cols2[0]:
+                if st.button("\U0001f3af Recommend", key="btn_strat",
+                             help="Calls the AI model — uses ~2000 tokens."):
+                    with st.spinner("Analyzing roster tactical profile..."):
+                        st.session_state[_strat_key] = get_strategy_recommendations(conn)
+            with _btn_cols2[1]:
+                if _strat_key in st.session_state and st.button("Clear", key="btn_strat_clear"):
+                    del st.session_state[_strat_key]
+                    st.rerun()
+
+            result = st.session_state.get(_strat_key)
+            if result:
+                if result.get("error"):
+                    st.error(f"Strategy analysis failed: {result['error']}")
+                elif result.get("response"):
+                    st.markdown(result["response"])
+                    st.caption(f"Model: {result.get('model', '?')} • "
+                               f"Tokens: {result.get('tokens_used', 0):,}")
+            else:
+                st.caption("Click 'Recommend' for AI-generated slider values tailored to your roster.")
+
+
+# ════════════════════════════════════════════════════════════════
 # LINEUP CARD — batting + pitching side by side
 # ════════════════════════════════════════════════════════════════
 st.divider()
@@ -966,6 +1040,21 @@ with tab_bat:
             _all_rostered_names.add(_rp['player_name'])
     _used_bench_upgrades = set()  # track already-recommended upgrades to avoid dupes
 
+    # Baseball roster rules: a 4-man bench usually has 1 backup C + 3 flex bats.
+    # Figure out which positions the bench ALREADY covers so we don't recommend a
+    # duplicate catcher (or other single-slot role) into a flex slot.
+    _bench_pos_counts = {}
+    for _bp in _bench_bats:
+        _pkey = _bp['position'] or '?'
+        _bench_pos_counts[_pkey] = _bench_pos_counts.get(_pkey, 0) + 1
+    # Roles where one bench slot is enough — duplicating = waste of roster space
+    _single_slot_bench_roles = {'C'}
+    # Positions already saturated on the bench (can't recommend more of these)
+    _saturated_bench_positions = {
+        _pos for _pos, _cnt in _bench_pos_counts.items()
+        if _pos in _single_slot_bench_roles and _cnt >= 1
+    }
+
     if _bench_bats:
         bench_rows = []
         for bp in _bench_bats:
@@ -979,12 +1068,10 @@ with tab_bat:
             if bperf:
                 perf_str = f".{int(bperf['ops']*1000):03d} OPS  {bperf['war600']:.1f}W"
 
-            # Find best upgrade from collection (not already rostered)
-            # Old query used card_title matching against roster, but roster.card_title
-            # is NULL for all entries. Instead, fetch top candidates and filter in Python
-            # against the known set of all rostered player names.
-            # Position-match: a bench SS upgrade should play SS (or a corner IF), not
-            # a catcher — so we score by position flexibility first.
+            # Find best upgrade from collection (not already rostered).
+            # Position-match: a bench SS upgrade should play SS (or adjacent IF), not
+            # a catcher. Plus baseball rules: if the bench already has a backup C,
+            # don't recommend a second C for any other slot (wasted roster space).
             _pos_match_map = {
                 'C':  ('C',),
                 '1B': ('1B', '3B', 'LF', 'RF'),
@@ -996,7 +1083,16 @@ with tab_bat:
                 'RF': ('RF', 'LF', 'CF', '1B'),
                 'DH': ('DH', '1B', 'LF', 'RF', '3B'),
             }
-            _acceptable_positions = _pos_match_map.get(bpos, (bpos,))
+            _slot_compat = _pos_match_map.get(bpos, (bpos,))
+            # Remove positions already saturated elsewhere on the bench.
+            # Exception: if THIS slot IS the saturated position (e.g. the actual backup C
+            # slot), keep it — we still want a better C here.
+            _acceptable_positions = tuple(
+                p for p in _slot_compat
+                if p not in _saturated_bench_positions or p == bpos
+            )
+            if not _acceptable_positions:
+                _acceptable_positions = (bpos,)
             _placeholders = ','.join(['?'] * len(_acceptable_positions))
             _bench_candidates = conn.execute(f"""
                 SELECT c.card_id, c.card_title, c.team,
