@@ -5,7 +5,7 @@ from app.core.database import load_config, get_db_path
 from app.utils.constants import (
     DEFAULT_BATTING_WEIGHTS, DEFAULT_PITCHING_WEIGHTS,
     PITCHING_STAT_FLOOR, BATTING_STAT_FLOOR,
-    POSITION_DEFENSE_MULTIPLIERS,
+    POSITION_DEFENSE_MULTIPLIERS, POSITIONAL_VALUE_BONUS,
 )
 
 # Diminishing returns threshold — stats above this get sqrt-scaled benefit
@@ -177,8 +177,9 @@ def calc_speed_score(row: dict) -> float:
 def calc_batting_meta(row: dict, weights: dict = None) -> float:
     """Calculate batter meta score.
 
-    Includes OVR anchoring, speed/stealing value, and position-specific
-    defense scaling so the game's own evaluation is factored in.
+    v2: OVR REMOVED (causes structural multicollinearity — VIF >> 10).
+    Includes positional value bonus from fWAR ladder, speed/stealing,
+    and position-specific defense scaling.
     """
     if weights is None:
         weights, _ = get_weights()
@@ -191,25 +192,23 @@ def calc_batting_meta(row: dict, weights: dict = None) -> float:
     pwr = float(row.get('power') or row.get('Power') or row.get('POW') or 0)
     bab = float(row.get('babip') or row.get('BABIP') or 0)
     defense = float(row.get('defense_score') or calc_defense_score(row))
-    ovr = float(row.get('card_value') or row.get('OVR') or row.get('ovr') or 0)
     speed_score = float(row.get('speed_score') or calc_speed_score(row))
 
     try:
         # Core weighted sum — AvK and BABIP zeroed by default since CON is
         # a derived stat in OOTP25+ that already incorporates them.
-        meta = (_diminished(gap) * weights.get('gap_power', 1.40) +
-                _diminished(con) * weights.get('contact', 1.80) +
+        meta = (_diminished(gap) * weights.get('gap_power', 1.60) +
+                _diminished(con) * weights.get('contact', 2.00) +
                 _diminished(avk) * weights.get('avoid_ks', 0.00) +
-                _diminished(eye) * weights.get('eye', 0.60) +
-                _diminished(pwr) * weights.get('power', 1.40) +
+                _diminished(eye) * weights.get('eye', 0.80) +
+                _diminished(pwr) * weights.get('power', 1.60) +
                 _diminished(bab) * weights.get('babip', 0.00) +
                 defense * weights.get('defense', 1.50))
 
         # Speed/Stealing component — conditionally valuable (amplifies OBP)
-        # Only counts above-average speed; elite speedsters get a real boost
         spd_weight = weights.get('speed_stealing', 0.50)
         if speed_score > 0 and spd_weight > 0:
-            meta += _diminished(speed_score + 70) * spd_weight  # re-add baseline for diminishing calc
+            meta += _diminished(speed_score + 70) * spd_weight
 
         # Balance penalty — if any key batting stat is below floor
         floor = BATTING_STAT_FLOOR
@@ -219,11 +218,17 @@ def calc_batting_meta(row: dict, weights: dict = None) -> float:
                 penalty = (floor - stat) * 0.4
                 meta -= penalty
 
-        # OVR multiplier — data shows OVR->WAR r=+0.529 for batters
-        ovr_weight = weights.get('ovr', 1.25)
-        if ovr > 0 and ovr_weight > 0:
-            ovr_factor = (ovr / 80.0) ** (ovr_weight * 0.35)
-            meta *= ovr_factor
+        # Positional value bonus — fWAR ladder (SS > C > CF > ... > 1B > DH)
+        pos = row.get('position') or row.get('Position') or 0
+        if isinstance(pos, str):
+            pos_map = {"C": 2, "1B": 3, "2B": 4, "3B": 5, "SS": 6,
+                       "LF": 7, "CF": 8, "RF": 9, "DH": 10}
+            pos = pos_map.get(pos, 0)
+        try:
+            pos = int(pos)
+        except (ValueError, TypeError):
+            pos = 0
+        meta += POSITIONAL_VALUE_BONUS.get(pos, 0)
 
     except (ValueError, TypeError):
         meta = 0.0
@@ -234,8 +239,12 @@ def calc_batting_meta(row: dict, weights: dict = None) -> float:
 def calc_pitching_meta(row: dict, weights: dict = None) -> float:
     """Calculate pitcher meta score.
 
-    Includes OVR anchoring and balance penalty so that one-trick-pony
-    cards with extreme single-stat spikes don't outscore well-rounded arms.
+    v2: OVR REMOVED (structural multicollinearity).
+    Adds SIERA-inspired interaction terms:
+      Stuff x Movement  — Ks + weak contact = devastating
+      Stuff x Control   — dominant stuff + command = elite
+      Movement x Control — groundballs + fewer walks
+    Balance penalty for truly weak STU/MOV (sub-65).
     """
     if weights is None:
         _, weights = get_weights()
@@ -244,20 +253,31 @@ def calc_pitching_meta(row: dict, weights: dict = None) -> float:
     stu = float(row.get('stuff') or row.get('Stuff') or row.get('STU') or 0)
     ctrl = float(row.get('control') or row.get('Control') or row.get('CON') or 0)
     phr = float(row.get('p_hr') or row.get('pHR') or row.get('HRA') or 0)
-    ovr = float(row.get('card_value') or row.get('OVR') or row.get('ovr') or 0)
     stamina = float(row.get('stamina') or row.get('Stamina') or row.get('STA') or 0)
     hold = float(row.get('hold') or row.get('Hold') or 0)
 
     try:
         # Core ratings with diminishing returns on extreme values
-        # League data: MOV r=-0.295 ERA, STU r=-0.265, CTRL r=-0.002, HRA r=-0.266
-        meta = (_diminished(mov) * weights.get('movement', 2.40) +
-                _diminished(stu) * weights.get('stuff', 1.40) +
-                _diminished(ctrl) * weights.get('control', 0.20) +
+        meta = (_diminished(mov) * weights.get('movement', 2.20) +
+                _diminished(stu) * weights.get('stuff', 1.60) +
+                _diminished(ctrl) * weights.get('control', 0.60) +
                 _diminished(phr) * weights.get('p_hr', 1.80))
 
+        # SIERA-inspired interaction terms — pitching is non-additive.
+        # Ks + weak contact together are more valuable than the sum of parts.
+        # Use raw (not diminished) values for interactions to avoid double-sqrt.
+        sxm_w = weights.get('stuff_x_movement', 0.015)
+        sxc_w = weights.get('stuff_x_control', 0.010)
+        mxc_w = weights.get('movement_x_control', 0.008)
+        if sxm_w > 0:
+            meta += stu * mov * sxm_w
+        if sxc_w > 0:
+            meta += stu * ctrl * sxc_w
+        if mxc_w > 0:
+            meta += mov * ctrl * mxc_w
+
         # Stamina/Hold component (matters for relievers and starters alike)
-        sh_weight = weights.get('stamina_hold', 0.30)
+        sh_weight = weights.get('stamina_hold', 0.40)
         if sh_weight > 0:
             sh_avg = 0
             sh_count = 0
@@ -271,23 +291,13 @@ def calc_pitching_meta(row: dict, weights: dict = None) -> float:
                 meta += (sh_avg / sh_count) * sh_weight
 
         # Balance penalty — only penalize truly weak ratings (sub-65)
-        # Data shows CTRL below 75 doesn't hurt ERA much in practice,
-        # so we use a softer floor and lighter penalty
         floor = 65
-        key_stats = [stu, mov]  # Only penalize STU/MOV weakness, not CTRL
+        key_stats = [stu, mov]
         for stat in key_stats:
             if 0 < stat < floor:
                 shortfall = floor - stat
                 penalty = shortfall * 1.0
                 meta -= penalty
-
-        # OVR multiplier — data shows OVR->WAR r=+0.601 for pitchers
-        # Stronger than community suggested but validated by league data
-        # OVR 80 = neutral (1.0x), OVR 100 = ~1.17x at weight=1.5
-        ovr_weight = weights.get('ovr', 1.50)
-        if ovr > 0 and ovr_weight > 0:
-            ovr_factor = (ovr / 80.0) ** (ovr_weight * 0.35)
-            meta *= ovr_factor
 
     except (ValueError, TypeError):
         meta = 0.0
@@ -304,27 +314,24 @@ def calc_batting_meta_vs_rhp(row: dict, weights: dict = None) -> float:
     if weights is None:
         weights, _ = get_weights()
 
-    # Use vR splits where available, fall back to overall
     con = float(row.get('con_vr') or row.get('CON vR') or row.get('contact_vr') or
                 row.get('contact') or row.get('CON') or 0)
     pwr = float(row.get('pow_vr') or row.get('POW vR') or row.get('power_vr') or
                 row.get('power') or row.get('POW') or 0)
     eye = float(row.get('eye_vr') or row.get('EYE vR') or row.get('eye_vr') or
                 row.get('eye') or row.get('EYE') or 0)
-    # GAP and BABIP don't have splits in roster CSV, use overall
     gap = float(row.get('gap_power') or row.get('Gap') or row.get('GAP') or 0)
     avk = float(row.get('avoid_ks') or row.get('Avoid Ks') or row.get("K's") or 0)
     bab = float(row.get('babip') or row.get('BABIP') or 0)
     defense = float(row.get('defense_score') or calc_defense_score(row))
-    ovr = float(row.get('card_value') or row.get('OVR') or row.get('ovr') or 0)
     speed_score = float(row.get('speed_score') or calc_speed_score(row))
 
     try:
-        meta = (_diminished(gap) * weights.get('gap_power', 1.40) +
-                _diminished(con) * weights.get('contact', 1.80) +
+        meta = (_diminished(gap) * weights.get('gap_power', 1.60) +
+                _diminished(con) * weights.get('contact', 2.00) +
                 _diminished(avk) * weights.get('avoid_ks', 0.00) +
-                _diminished(eye) * weights.get('eye', 0.60) +
-                _diminished(pwr) * weights.get('power', 1.40) +
+                _diminished(eye) * weights.get('eye', 0.80) +
+                _diminished(pwr) * weights.get('power', 1.60) +
                 _diminished(bab) * weights.get('babip', 0.00) +
                 defense * weights.get('defense', 1.50))
 
@@ -336,13 +343,7 @@ def calc_batting_meta_vs_rhp(row: dict, weights: dict = None) -> float:
         key_stats = [con, gap]
         for stat in key_stats:
             if 0 < stat < floor:
-                penalty = (floor - stat) * 0.4
-                meta -= penalty
-
-        ovr_weight = weights.get('ovr', 1.25)
-        if ovr > 0 and ovr_weight > 0:
-            ovr_factor = (ovr / 80.0) ** (ovr_weight * 0.35)
-            meta *= ovr_factor
+                meta -= (floor - stat) * 0.4
     except (ValueError, TypeError):
         meta = 0.0
 
@@ -353,7 +354,6 @@ def calc_batting_meta_vs_lhp(row: dict, weights: dict = None) -> float:
     """Calculate batter meta score vs left-handed pitching.
 
     Uses the batter's 'vL' split ratings where available, falling back to overall.
-    When facing LHP, OOTP uses the batter's CON vL, POW vL, EYE vL ratings.
     """
     if weights is None:
         weights, _ = get_weights()
@@ -368,15 +368,14 @@ def calc_batting_meta_vs_lhp(row: dict, weights: dict = None) -> float:
     avk = float(row.get('avoid_ks') or row.get('Avoid Ks') or row.get("K's") or 0)
     bab = float(row.get('babip') or row.get('BABIP') or 0)
     defense = float(row.get('defense_score') or calc_defense_score(row))
-    ovr = float(row.get('card_value') or row.get('OVR') or row.get('ovr') or 0)
     speed_score = float(row.get('speed_score') or calc_speed_score(row))
 
     try:
-        meta = (_diminished(gap) * weights.get('gap_power', 1.40) +
-                _diminished(con) * weights.get('contact', 1.80) +
+        meta = (_diminished(gap) * weights.get('gap_power', 1.60) +
+                _diminished(con) * weights.get('contact', 2.00) +
                 _diminished(avk) * weights.get('avoid_ks', 0.00) +
-                _diminished(eye) * weights.get('eye', 0.60) +
-                _diminished(pwr) * weights.get('power', 1.40) +
+                _diminished(eye) * weights.get('eye', 0.80) +
+                _diminished(pwr) * weights.get('power', 1.60) +
                 _diminished(bab) * weights.get('babip', 0.00) +
                 defense * weights.get('defense', 1.50))
 
@@ -388,24 +387,50 @@ def calc_batting_meta_vs_lhp(row: dict, weights: dict = None) -> float:
         key_stats = [con, gap]
         for stat in key_stats:
             if 0 < stat < floor:
-                penalty = (floor - stat) * 0.4
-                meta -= penalty
-
-        ovr_weight = weights.get('ovr', 1.25)
-        if ovr > 0 and ovr_weight > 0:
-            ovr_factor = (ovr / 80.0) ** (ovr_weight * 0.35)
-            meta *= ovr_factor
+                meta -= (floor - stat) * 0.4
     except (ValueError, TypeError):
         meta = 0.0
 
     return round(meta, 2)
 
 
-def calc_pitching_meta_vs_lhb(row: dict, weights: dict = None) -> float:
-    """Calculate pitcher meta score vs left-handed batters.
+def _pitching_split_meta(stu, mov, ctrl, phr, stamina, hold, weights):
+    """Shared logic for pitching split metas (vs LHB / vs RHB)."""
+    try:
+        meta = (_diminished(mov) * weights.get('movement', 2.20) +
+                _diminished(stu) * weights.get('stuff', 1.60) +
+                _diminished(ctrl) * weights.get('control', 0.60) +
+                _diminished(phr) * weights.get('p_hr', 1.80))
 
-    Uses STU vL split where available. MOV/CON(ctrl)/HRA don't have splits in roster CSV.
-    """
+        # Interaction terms
+        sxm_w = weights.get('stuff_x_movement', 0.015)
+        sxc_w = weights.get('stuff_x_control', 0.010)
+        mxc_w = weights.get('movement_x_control', 0.008)
+        if sxm_w > 0:
+            meta += stu * mov * sxm_w
+        if sxc_w > 0:
+            meta += stu * ctrl * sxc_w
+        if mxc_w > 0:
+            meta += mov * ctrl * mxc_w
+
+        sh_weight = weights.get('stamina_hold', 0.40)
+        if sh_weight > 0:
+            sh_avg, sh_count = 0, 0
+            if stamina > 0: sh_avg += stamina; sh_count += 1
+            if hold > 0: sh_avg += hold; sh_count += 1
+            if sh_count > 0: meta += (sh_avg / sh_count) * sh_weight
+
+        floor = 65
+        for stat in [stu, mov]:
+            if 0 < stat < floor:
+                meta -= (floor - stat) * 1.0
+    except (ValueError, TypeError):
+        meta = 0.0
+    return round(meta, 2)
+
+
+def calc_pitching_meta_vs_lhb(row: dict, weights: dict = None) -> float:
+    """Calculate pitcher meta score vs left-handed batters."""
     if weights is None:
         _, weights = get_weights()
 
@@ -414,43 +439,13 @@ def calc_pitching_meta_vs_lhb(row: dict, weights: dict = None) -> float:
     mov = float(row.get('movement') or row.get('Movement') or row.get('MOV') or 0)
     ctrl = float(row.get('control') or row.get('Control') or row.get('CON') or 0)
     phr = float(row.get('p_hr') or row.get('pHR') or row.get('HRA') or 0)
-    ovr = float(row.get('card_value') or row.get('OVR') or row.get('ovr') or 0)
     stamina = float(row.get('stamina') or row.get('Stamina') or row.get('STA') or 0)
     hold = float(row.get('hold') or row.get('Hold') or 0)
-
-    try:
-        meta = (_diminished(mov) * weights.get('movement', 2.40) +
-                _diminished(stu) * weights.get('stuff', 1.40) +
-                _diminished(ctrl) * weights.get('control', 0.20) +
-                _diminished(phr) * weights.get('p_hr', 1.80))
-
-        sh_weight = weights.get('stamina_hold', 0.30)
-        if sh_weight > 0:
-            sh_avg, sh_count = 0, 0
-            if stamina > 0: sh_avg += stamina; sh_count += 1
-            if hold > 0: sh_avg += hold; sh_count += 1
-            if sh_count > 0: meta += (sh_avg / sh_count) * sh_weight
-
-        floor = 65
-        key_stats = [stu, mov]
-        for stat in key_stats:
-            if 0 < stat < floor:
-                meta -= (floor - stat) * 1.0
-
-        ovr_weight = weights.get('ovr', 1.50)
-        if ovr > 0 and ovr_weight > 0:
-            meta *= (ovr / 80.0) ** (ovr_weight * 0.35)
-    except (ValueError, TypeError):
-        meta = 0.0
-
-    return round(meta, 2)
+    return _pitching_split_meta(stu, mov, ctrl, phr, stamina, hold, weights)
 
 
 def calc_pitching_meta_vs_rhb(row: dict, weights: dict = None) -> float:
-    """Calculate pitcher meta score vs right-handed batters.
-
-    Uses STU vR split where available. MOV/CON(ctrl)/HRA don't have splits in roster CSV.
-    """
+    """Calculate pitcher meta score vs right-handed batters."""
     if weights is None:
         _, weights = get_weights()
 
@@ -459,33 +454,6 @@ def calc_pitching_meta_vs_rhb(row: dict, weights: dict = None) -> float:
     mov = float(row.get('movement') or row.get('Movement') or row.get('MOV') or 0)
     ctrl = float(row.get('control') or row.get('Control') or row.get('CON') or 0)
     phr = float(row.get('p_hr') or row.get('pHR') or row.get('HRA') or 0)
-    ovr = float(row.get('card_value') or row.get('OVR') or row.get('ovr') or 0)
     stamina = float(row.get('stamina') or row.get('Stamina') or row.get('STA') or 0)
     hold = float(row.get('hold') or row.get('Hold') or 0)
-
-    try:
-        meta = (_diminished(mov) * weights.get('movement', 2.40) +
-                _diminished(stu) * weights.get('stuff', 1.40) +
-                _diminished(ctrl) * weights.get('control', 0.20) +
-                _diminished(phr) * weights.get('p_hr', 1.80))
-
-        sh_weight = weights.get('stamina_hold', 0.30)
-        if sh_weight > 0:
-            sh_avg, sh_count = 0, 0
-            if stamina > 0: sh_avg += stamina; sh_count += 1
-            if hold > 0: sh_avg += hold; sh_count += 1
-            if sh_count > 0: meta += (sh_avg / sh_count) * sh_weight
-
-        floor = 65
-        key_stats = [stu, mov]
-        for stat in key_stats:
-            if 0 < stat < floor:
-                meta -= (floor - stat) * 1.0
-
-        ovr_weight = weights.get('ovr', 1.50)
-        if ovr > 0 and ovr_weight > 0:
-            meta *= (ovr / 80.0) ** (ovr_weight * 0.35)
-    except (ValueError, TypeError):
-        meta = 0.0
-
-    return round(meta, 2)
+    return _pitching_split_meta(stu, mov, ctrl, phr, stamina, hold, weights)

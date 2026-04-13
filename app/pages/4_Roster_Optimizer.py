@@ -91,7 +91,8 @@ if _latest_psnap and _latest_psnap['d']:
         (_latest_psnap['d'],)).fetchall():
         _perf_pit[r['player_name']] = dict(r)
 
-bat_positions = ['C', '1B', '2B', '3B', 'SS', 'LF', 'CF', 'RF']
+bat_field_positions = ['C', '1B', '2B', '3B', 'SS', 'LF', 'CF', 'RF']
+bat_positions = bat_field_positions + ['DH']
 pitch_positions = ['SP', 'RP', 'CL']
 if focus == "Batting Only":
     show_positions = bat_positions
@@ -163,16 +164,31 @@ def find_owned_upgrades(pos_value, current_meta, is_pitching, exclude_names=None
     # Then: search cards table by card's natural position
     meta_col = "meta_score_pitching" if is_pitching else "meta_score_batting"
     pos_col = "pitcher_role_name" if is_pitching else "position_name"
-    results = conn.execute(f"""
-        SELECT c.card_id, c.card_title, c.tier_name, c.card_value,
-               c.{meta_col} as meta_score, c.last_10_price,
-               mc.status as collection_status, r.lineup_role as roster_role
-        FROM cards c
-        LEFT JOIN my_collection mc ON mc.card_id = c.card_id
-        LEFT JOIN roster r ON c.card_title LIKE '%' || r.player_name || '%' AND r.position = c.{pos_col}
-        WHERE c.{pos_col} = ? AND c.owned = 1 AND c.{meta_col} > ?
-        GROUP BY c.card_id ORDER BY c.{meta_col} DESC LIMIT ?
-    """, (pos_value, current_meta + min_improvement, limit + len(exclude_names) + 5)).fetchall()
+
+    # DH special case: any non-pitcher can DH, so search ALL batting positions
+    if pos_value == 'DH' and not is_pitching:
+        results = conn.execute(f"""
+            SELECT c.card_id, c.card_title, c.tier_name, c.card_value,
+                   c.{meta_col} as meta_score, c.last_10_price,
+                   mc.status as collection_status, r.lineup_role as roster_role
+            FROM cards c
+            LEFT JOIN my_collection mc ON mc.card_id = c.card_id
+            LEFT JOIN roster r ON c.card_title LIKE '%' || r.player_name || '%'
+            WHERE c.owned = 1 AND c.{meta_col} > ?
+                AND c.pitcher_role IS NULL
+            GROUP BY c.card_id ORDER BY c.{meta_col} DESC LIMIT ?
+        """, (current_meta + min_improvement, limit + len(exclude_names) + 5)).fetchall()
+    else:
+        results = conn.execute(f"""
+            SELECT c.card_id, c.card_title, c.tier_name, c.card_value,
+                   c.{meta_col} as meta_score, c.last_10_price,
+                   mc.status as collection_status, r.lineup_role as roster_role
+            FROM cards c
+            LEFT JOIN my_collection mc ON mc.card_id = c.card_id
+            LEFT JOIN roster r ON c.card_title LIKE '%' || r.player_name || '%' AND r.position = c.{pos_col}
+            WHERE c.{pos_col} = ? AND c.owned = 1 AND c.{meta_col} > ?
+            GROUP BY c.card_id ORDER BY c.{meta_col} DESC LIMIT ?
+        """, (pos_value, current_meta + min_improvement, limit + len(exclude_names) + 5)).fetchall()
 
     filtered = []
     # Track names already added from bench to avoid duplicates
@@ -207,14 +223,26 @@ def find_market_upgrades(pos_value, current_meta, is_pitching, exclude_ids=None,
     meta_col = "meta_score_pitching" if is_pitching else "meta_score_batting"
     pos_col = "pitcher_role_name" if is_pitching else "position_name"
     max_price = max_spend if max_spend > 0 else 999999999
-    results = conn.execute(f"""
-        SELECT card_id, card_title, tier_name, card_value,
-               {meta_col} as meta_score, last_10_price
-        FROM cards
-        WHERE {pos_col} = ? AND owned = 0 AND last_10_price > 0
-            AND last_10_price <= ? AND {meta_col} > ?
-        ORDER BY {meta_col} DESC LIMIT ?
-    """, (pos_value, max_price, current_meta + min_improvement, limit + len(exclude_ids) + 5)).fetchall()
+
+    # DH: any non-pitcher on the market can DH
+    if pos_value == 'DH' and not is_pitching:
+        results = conn.execute(f"""
+            SELECT card_id, card_title, tier_name, card_value,
+                   {meta_col} as meta_score, last_10_price
+            FROM cards
+            WHERE owned = 0 AND last_10_price > 0 AND pitcher_role IS NULL
+                AND last_10_price <= ? AND {meta_col} > ?
+            ORDER BY {meta_col} DESC LIMIT ?
+        """, (max_price, current_meta + min_improvement, limit + len(exclude_ids) + 5)).fetchall()
+    else:
+        results = conn.execute(f"""
+            SELECT card_id, card_title, tier_name, card_value,
+                   {meta_col} as meta_score, last_10_price
+            FROM cards
+            WHERE {pos_col} = ? AND owned = 0 AND last_10_price > 0
+                AND last_10_price <= ? AND {meta_col} > ?
+            ORDER BY {meta_col} DESC LIMIT ?
+        """, (pos_value, max_price, current_meta + min_improvement, limit + len(exclude_ids) + 5)).fetchall()
     return [dict(r) for r in results if r['card_id'] not in exclude_ids][:limit]
 
 
@@ -305,6 +333,13 @@ used_market_ids = set()
 used_owned_titles = set()
 upgrade_plan = []
 
+# Collect ALL active roster player names up-front so no active player can be
+# recommended as an upgrade for another slot (e.g. CL shouldn't be suggested for MOP).
+_all_active_names = set()
+for _pos_key, _players in active_by_pos.items():
+    for _p in _players:
+        _all_active_names.add(_p['player_name'])
+
 
 def _build_slot(pos_label, current_name, current_ovr, current_meta, owned_ups, market_ups, bats_hand='?'):
     """Build one upgrade-plan entry with both owned and market stored separately."""
@@ -361,7 +396,7 @@ for pos in show_positions:
     if pos == 'SP':
         # Use only actual rotation pitchers as "current", not bench/reserve
         sp_players = active_by_pos.get('SP', [])[:5]
-        used_names = {sp['player_name'] for sp in sp_players}
+        used_names = _all_active_names.copy()
         # Process WEAKEST first so best free upgrades go to worst slots
         order = sorted(range(len(sp_players)), key=lambda i: sp_players[i]['meta_score'] or 0)
         sp_entries = [None] * len(sp_players)
@@ -385,7 +420,7 @@ for pos in show_positions:
     if pos == 'RP':
         # Use only actual bullpen pitchers as "current"
         rp_players = active_by_pos.get('RP', [])[:7]
-        used_names = {rp['player_name'] for rp in rp_players}
+        used_names = _all_active_names.copy()
         slot_names = ["SU1", "SU2", "MID1", "MID2", "LNG1", "LNG2", "MOP"]
         # Process WEAKEST first so best free upgrades go to worst slots
         order = sorted(range(len(rp_players)), key=lambda i: rp_players[i]['meta_score'] or 0)
@@ -406,10 +441,44 @@ for pos in show_positions:
         upgrade_plan.extend(rp_entries)
         continue
 
-    # For batting positions: show up to 2 players (platoon pair).
-    # A valid platoon = one L and one R (or S) batter. If you have 3+
-    # players at a position, take the best 2 that form a platoon pair.
-    # If they're all same-handed, show best 1 + flag platoon gap.
+    # ── DH slot: inferred from "extra" starters at other positions ──
+    if pos == 'DH':
+        # Collect all starters not already shown at a field position.
+        # The best one at each position is the fielder; extras are DH candidates.
+        _field_shown = {e['pos'] for e in upgrade_plan if e['pos'] in bat_field_positions}
+        _field_names = {e['current_name'] for e in upgrade_plan if e['pos'] in bat_field_positions}
+        dh_candidates = []
+        for fpos in bat_field_positions:
+            for p in active_by_pos.get(fpos, []):
+                if p['player_name'] not in _field_names:
+                    dh_candidates.append(p)
+        dh_candidates.sort(key=lambda p: p['meta_score'] or 0, reverse=True)
+
+        if dh_candidates:
+            player = dh_candidates[0]
+        else:
+            # No extra starters — DH is empty, suggest best available hitter
+            upgrade_plan.append(_build_slot('DH', '(empty)', 0, 0,
+                find_owned_upgrades('DH', 0, False, list(_all_active_names), 5),
+                find_market_upgrades('DH', 0, False, used_market_ids, 5)))
+            continue
+
+        m = player['meta_score'] or 0
+        bh = player.get('bats_hand', '?')
+        active_names = list(_all_active_names)
+        # DH upgrades search ALL batting positions — anyone can DH
+        ow = find_owned_upgrades('DH', m, False, active_names, 3, current_player_name=player['player_name'])
+        mk = find_market_upgrades('DH', m, False, used_market_ids, 3)
+        entry = _build_slot('DH', player['player_name'], player['ovr'], m, ow, mk, bats_hand=bh)
+        entry['is_platoon'] = False
+        if entry['owned_name']:
+            bo = ow[0] if ow else None
+            pname = bo.get('player_name', entry['owned_name']) if bo else entry['owned_name']
+            used_owned_titles.add(pname)
+        upgrade_plan.append(entry)
+        continue
+
+    # ── Standard batting positions: 1 slot per position (best starter) ──
     active_players = active_by_pos.get(pos, [])
     if not active_players:
         upgrade_plan.append(_build_slot(pos, '(empty)', 0, 0,
@@ -417,66 +486,27 @@ for pos in show_positions:
             find_market_upgrades(pos, 0, is_pitching, used_market_ids, 5)))
         continue
 
-    # Sort by meta descending — best player first
+    # Sort by meta descending — best player starts at this position
     active_players = sorted(active_players, key=lambda p: p['meta_score'] or 0, reverse=True)
-
-    # Identify platoon pair: pick best player, then best OPPOSITE-HAND player
-    primary = active_players[0]
-    primary_hand = primary.get('bats_hand', '?')
-
-    platoon_partner = None
-    for candidate in active_players[1:]:
-        cand_hand = candidate.get('bats_hand', '?')
-        # Valid platoon: L+R, R+L, S+anything (switch hitter pairs with anyone)
-        if primary_hand == 'S' or cand_hand == 'S':
-            platoon_partner = candidate
-            break
-        if primary_hand != cand_hand and primary_hand in ('L', 'R') and cand_hand in ('L', 'R'):
-            platoon_partner = candidate
-            break
-
-    if platoon_partner:
-        # Show 2 slots: primary + platoon partner
-        active_names = [primary['player_name'], platoon_partner['player_name']]
-        # Process weaker one first so best upgrades go to weaker slot
-        pair = [(primary, 1), (platoon_partner, 2)]
-        pair.sort(key=lambda x: x[0]['meta_score'] or 0)
-
-        for player, idx in pair:
-            m = player['meta_score'] or 0
-            bh = player.get('bats_hand', '?')
-            label = f"{pos}{idx}"
-            ow = find_owned_upgrades(pos, m, is_pitching, active_names, 3, current_player_name=player['player_name'])
-            mk = find_market_upgrades(pos, m, is_pitching, used_market_ids, 3)
-            entry = _build_slot(label, player['player_name'], player['ovr'], m, ow, mk, bats_hand=bh)
-            entry['is_platoon'] = True
-            entry['platoon_hand'] = bh
-            if entry['owned_name']:
-                bo = ow[0] if ow else None
-                pname = bo.get('player_name', entry['owned_name']) if bo else entry['owned_name']
-                active_names.append(pname)
-                active_names.append(entry['owned_name'])
-            upgrade_plan.append(entry)
-    else:
-        # Single player or same-handed group — show best player only
-        player = primary
-        m = player['meta_score'] or 0
-        bh = player.get('bats_hand', '?')
-        active_names = [p['player_name'] for p in active_players]
-        ow = find_owned_upgrades(pos, m, is_pitching, active_names, 3, current_player_name=player['player_name'])
-        mk = find_market_upgrades(pos, m, is_pitching, used_market_ids, 3)
-        entry = _build_slot(pos, player['player_name'], player['ovr'], m, ow, mk, bats_hand=bh)
-        entry['is_platoon'] = False
-        if entry['owned_name']:
-            bo = ow[0] if ow else None
-            pname = bo.get('player_name', entry['owned_name']) if bo else entry['owned_name']
-            used_owned_titles.add(pname)  # prevent cross-position duplicates
-        # Flag if same-handed duplicates exist (platoon gap)
-        if len(active_players) > 1 and primary_hand in ('L', 'R'):
-            same_hand_count = sum(1 for p in active_players if p.get('bats_hand') == primary_hand)
-            if same_hand_count > 1:
-                entry['platoon_warning'] = f"⚠️ {same_hand_count} {primary_hand}-batters, no platoon partner"
-        upgrade_plan.append(entry)
+    player = active_players[0]
+    m = player['meta_score'] or 0
+    bh = player.get('bats_hand', '?')
+    active_names = list(_all_active_names) + [p['player_name'] for p in active_players]
+    ow = find_owned_upgrades(pos, m, is_pitching, active_names, 3, current_player_name=player['player_name'])
+    mk = find_market_upgrades(pos, m, is_pitching, used_market_ids, 3)
+    entry = _build_slot(pos, player['player_name'], player['ovr'], m, ow, mk, bats_hand=bh)
+    entry['is_platoon'] = False
+    if entry['owned_name']:
+        bo = ow[0] if ow else None
+        pname = bo.get('player_name', entry['owned_name']) if bo else entry['owned_name']
+        used_owned_titles.add(pname)
+    # Flag same-handed starters (platoon gap warning)
+    primary_hand = bh
+    if len(active_players) > 1 and primary_hand in ('L', 'R'):
+        same_hand_count = sum(1 for p in active_players if p.get('bats_hand') == primary_hand)
+        if same_hand_count > 1:
+            entry['platoon_warning'] = f"\u26a0\ufe0f {same_hand_count} {primary_hand}-batters, no platoon partner"
+    upgrade_plan.append(entry)
 
 if focus == "Weakest First":
     upgrade_plan.sort(key=lambda x: x['current_meta'])
@@ -491,7 +521,7 @@ top_priorities = sorted(all_upgrades, key=lambda x: -x['best_delta'])[:3]
 # Only flag when a bench player genuinely beats the starter AND the starter
 # isn't outperforming their meta in real games.
 roster_fixes = []
-for pos in bat_positions + ['CL']:
+for pos in bat_field_positions + ['CL']:
     pp = all_by_pos.get(pos, [])
     if len(pp) < 2: continue
     best = pp[0]
@@ -522,7 +552,7 @@ for pos in bat_positions + ['CL']:
 st.title("Roster Optimizer")
 
 # Calculate team grade
-bat_metas = [starters[p]['meta_score'] for p in bat_positions if p in starters]
+bat_metas = [starters[p]['meta_score'] for p in bat_field_positions if p in starters]
 pit_metas = [p['meta_score'] for p in active_by_pos.get('SP', [])[:5]]
 pit_metas += [p['meta_score'] for p in active_by_pos.get('RP', [])[:7]]
 if 'CL' in starters:
@@ -698,7 +728,14 @@ def build_chain_rows(positions_list, show_bats=False, show_perf=False):
     """
     rows = []
     for u in upgrade_plan:
-        if u['pos'] not in positions_list and not any(u['pos'].startswith(p) for p in positions_list):
+        # Match exact position OR numbered slot (SP1→SP, SU2→SU) but NOT
+        # substring collisions like CL→C.  Prefix only counts when followed
+        # by a digit (e.g. SP1, MID2, C1 for platoons).
+        pos = u['pos'].rstrip(" ⚠️")  # strip inline warning emoji if present
+        if pos not in positions_list and not any(
+            pos.startswith(p) and len(pos) > len(p) and pos[len(p)].isdigit()
+            for p in positions_list
+        ):
             continue
 
         # Current player — compact: "Name (OVR H)"
@@ -797,6 +834,200 @@ with tab_bat:
         h = min(35 * len(bat_rows) + 40, 600)
         st.dataframe(pd.DataFrame(bat_rows), use_container_width=True, hide_index=True,
                      height=h, column_config=CHAIN_COL_CONFIG)
+
+    # ── Batting Order Recommendation ──
+    st.divider()
+    st.markdown("##### Suggested Batting Order")
+    st.caption("Based on ratings: OBP/speed at top, power in middle, weakest at bottom")
+
+    # Gather the 9 starters' ratings from cards table
+    _lineup_starters = []
+    _shown_field = {e['current_name'] for e in upgrade_plan if e['pos'] in bat_field_positions}
+    _shown_dh = [e for e in upgrade_plan if e['pos'] == 'DH']
+    _dh_name = _shown_dh[0]['current_name'] if _shown_dh else None
+    _all_lineup_names = list(_shown_field)
+    if _dh_name and _dh_name != '(empty)':
+        _all_lineup_names.append(_dh_name)
+
+    for _name in _all_lineup_names:
+        # Get position from upgrade_plan
+        _pos = '?'
+        for e in upgrade_plan:
+            if e['current_name'] == _name and e['pos'] in bat_positions:
+                _pos = e['pos']
+                break
+        _card = conn.execute("""
+            SELECT contact, gap_power, power, eye, avoid_ks, speed, stealing, baserunning, babip
+            FROM cards WHERE card_title LIKE ? AND owned = 1 LIMIT 1
+        """, (f'%{_name}%',)).fetchone()
+        _perf = _perf_bat.get(_name)
+        _meta = 0
+        for e in upgrade_plan:
+            if e['current_name'] == _name:
+                _meta = e['current_meta']
+                break
+        if _card:
+            d = dict(_card)
+            d['player_name'] = _name
+            d['pos'] = _pos
+            d['meta'] = _meta
+            d['perf'] = _perf
+            # Compute slot fitness scores
+            con = d.get('contact') or 0
+            gap = d.get('gap_power') or 0
+            pwr = d.get('power') or 0
+            eye_r = d.get('eye') or 0
+            avk = d.get('avoid_ks') or 0
+            spd = d.get('speed') or 0
+            stl = d.get('stealing') or 0
+            # Leadoff score: OBP + speed (get on base, steal)
+            d['leadoff'] = con * 1.2 + eye_r * 1.5 + avk * 0.8 + spd * 0.6 + stl * 0.3
+            # 2-hole: contact + OBP + some gap (move runners, avoid DP)
+            d['two_hole'] = con * 1.3 + eye_r * 1.2 + gap * 0.8 + avk * 0.7
+            # 3-hole: best overall hitter (everything matters)
+            d['three_hole'] = con * 1.0 + gap * 1.2 + pwr * 1.0 + eye_r * 1.0 + avk * 0.5
+            # Cleanup (4): power focus (drive in runs)
+            d['cleanup'] = pwr * 1.5 + gap * 1.3 + con * 0.6 + eye_r * 0.5
+            # 5-hole: power/RBI secondary
+            d['five_hole'] = pwr * 1.2 + gap * 1.1 + con * 0.7 + eye_r * 0.6
+            _lineup_starters.append(d)
+
+    if _lineup_starters:
+        # Greedy assignment: assign best-fit player to each slot
+        _available = list(_lineup_starters)
+        _order = []
+        _slot_keys = [
+            ('leadoff', '1 (Leadoff)'),
+            ('two_hole', '2'),
+            ('three_hole', '3'),
+            ('cleanup', '4 (Cleanup)'),
+            ('five_hole', '5'),
+        ]
+        # Top 5 by slot-specific scores
+        for key, label in _slot_keys:
+            if not _available:
+                break
+            best = max(_available, key=lambda p: p.get(key, 0))
+            _order.append((label, best))
+            _available.remove(best)
+        # Remaining: sort by meta descending for slots 6-9
+        _available.sort(key=lambda p: p['meta'] or 0, reverse=True)
+        for i, p in enumerate(_available):
+            _order.append((str(6 + i), p))
+
+        order_rows = []
+        for slot, p in _order:
+            perf_str = ""
+            if p.get('perf'):
+                perf_str = f".{int(p['perf']['ops']*1000):03d} OPS  {p['perf']['war600']:.1f}W"
+            order_rows.append({
+                "#": slot,
+                "Player": f"{p['player_name']} ({p['pos']})",
+                "CON": p.get('contact', 0),
+                "POW": p.get('power', 0),
+                "GAP": p.get('gap_power', 0),
+                "EYE": p.get('eye', 0),
+                "SPD": p.get('speed', 0),
+                "Meta": p['meta'],
+                "Perf": perf_str,
+            })
+        st.dataframe(pd.DataFrame(order_rows), use_container_width=True, hide_index=True,
+                     height=min(35 * len(order_rows) + 40, 400),
+                     column_config={
+                         "#": st.column_config.TextColumn(width="small"),
+                         "Player": st.column_config.TextColumn(width="medium"),
+                         "CON": st.column_config.NumberColumn(width="small"),
+                         "POW": st.column_config.NumberColumn(width="small"),
+                         "GAP": st.column_config.NumberColumn(width="small"),
+                         "EYE": st.column_config.NumberColumn(width="small"),
+                         "SPD": st.column_config.NumberColumn(width="small"),
+                         "Meta": st.column_config.ProgressColumn(min_value=300, max_value=800, format="%d", width="small"),
+                         "Perf": st.column_config.TextColumn(width="small"),
+                     })
+
+    # ── Bench Bats ──
+    st.divider()
+    st.markdown("##### Bench Bats")
+    st.caption("Your 4 reserve batters — pinch hitters, platoon partners, defensive subs")
+
+    # Bench bats = starters NOT in the 9-man lineup
+    _bench_bats = []
+    for fpos in bat_field_positions:
+        for p in active_by_pos.get(fpos, []):
+            if p['player_name'] not in _all_lineup_names:
+                _bench_bats.append(p)
+    _bench_bats.sort(key=lambda p: p['meta_score'] or 0, reverse=True)
+    _bench_bats = _bench_bats[:4]  # 26-man roster has ~4 bench bats
+
+    if _bench_bats:
+        bench_rows = []
+        for bp in _bench_bats:
+            pname = bp['player_name']
+            bpos = bp['position'] or '?'
+            bmeta = round(bp['meta_score'] or 0)
+            bh = bp.get('bats_hand', '?')
+            bperf = _perf_bat.get(pname)
+
+            perf_str = ""
+            if bperf:
+                perf_str = f".{int(bperf['ops']*1000):03d} OPS  {bperf['war600']:.1f}W"
+
+            # Find best upgrade from collection (bench players not on active roster)
+            bench_upgrade = conn.execute("""
+                SELECT c.card_title, c.meta_score_batting as meta, c.position_name
+                FROM cards c
+                WHERE c.owned = 1 AND c.meta_score_batting > ?
+                    AND c.pitcher_role IS NULL
+                    AND c.card_title NOT IN (
+                        SELECT r2.card_title FROM roster r2
+                        WHERE r2.lineup_role IN ('starter', 'rotation', 'closer', 'bullpen')
+                          AND r2.card_title IS NOT NULL
+                          AND DATE(r2.snapshot_date) = (SELECT MAX(DATE(snapshot_date)) FROM roster WHERE lineup_role != 'league')
+                    )
+                ORDER BY c.meta_score_batting DESC LIMIT 1
+            """, (bmeta + 10,)).fetchone()
+
+            action = ""
+            if bench_upgrade:
+                up_name = short_name(bench_upgrade['card_title'], 25)
+                up_meta = round(bench_upgrade['meta'])
+                delta = up_meta - bmeta
+                action = f"\U0001f4e6 {up_name} +{delta}"
+
+            bench_rows.append({
+                "Pos": bpos,
+                "Player": f"{pname} ({bp.get('ovr', '?')} {bh})",
+                "Meta": bmeta,
+                "Perf": perf_str,
+                "Upgrade": action if action else "\u2705 Best available",
+            })
+
+        st.dataframe(pd.DataFrame(bench_rows), use_container_width=True, hide_index=True,
+                     column_config={
+                         "Pos": st.column_config.TextColumn(width="small"),
+                         "Player": st.column_config.TextColumn(width="medium"),
+                         "Meta": st.column_config.ProgressColumn(min_value=300, max_value=800, format="%d", width="small"),
+                         "Perf": st.column_config.TextColumn(width="small"),
+                         "Upgrade": st.column_config.TextColumn(width="medium"),
+                     })
+
+        # Bench composition analysis
+        bench_hands = [bp.get('bats_hand', '?') for bp in _bench_bats]
+        l_count = bench_hands.count('L')
+        r_count = bench_hands.count('R')
+        s_count = bench_hands.count('S')
+        bench_positions = set(bp['position'] for bp in _bench_bats)
+        if l_count == 0:
+            st.warning("No left-handed bench bat. Consider adding one for pinch-hitting vs RHP.")
+        elif r_count == 0:
+            st.warning("No right-handed bench bat. Consider adding one for pinch-hitting vs LHP.")
+        if 'C' not in bench_positions:
+            # Check if there's a backup catcher at all
+            backup_c = [p for p in all_by_pos.get('C', []) if p['player_name'] not in _all_lineup_names]
+            if not backup_c:
+                st.warning("No backup catcher on the bench.")
+    else:
+        st.info("No bench bats identified. Check roster data.")
 
 with tab_pit:
     st.markdown("##### Rotation")

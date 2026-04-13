@@ -800,66 +800,64 @@ def auto_calibrate_weights(conn=None) -> dict:
         if bat_sample_size >= 15:
             bat_confidence = min(1.0, bat_sample_size / 100.0)
 
-            # Compute defense score for each row
-            from app.core.meta_scoring import calc_defense_score
+            from app.core.meta_scoring import calc_defense_score, calc_speed_score
+            import numpy as np
+            from sklearn.linear_model import ElasticNetCV
+            from sklearn.preprocessing import StandardScaler
 
-            # Build parallel arrays for each stat and performance metrics
-            stat_arrays = {k: [] for k in bat_stat_cols + ["defense"]}
-            war_vals = []
-            ops_vals = []
+            # Build feature matrix: each row is a player, each column is a stat
+            all_bat_keys = bat_weight_keys + ["defense", "speed_stealing"]
+            X_raw = []
+            y_war = []
 
             for row in bat_rows:
-                war_vals.append(_safe_float(row["war"]))
-                ops_vals.append(_safe_float(row["ops"]))
-                for col in bat_stat_cols:
-                    stat_arrays[col].append(_safe_float(row[col]))
-                stat_arrays["defense"].append(calc_defense_score(dict(row)))
+                d = dict(row)
+                features = [_safe_float(d[col]) for col in bat_stat_cols]
+                features.append(calc_defense_score(d))
+                features.append(calc_speed_score(d))
+                X_raw.append(features)
+                y_war.append(_safe_float(d["war"]))
 
-            # Compute correlations with WAR and OPS for each stat
-            all_bat_keys = bat_weight_keys + ["defense"]
-            corr_war = {}
-            corr_ops = {}
-            for key in all_bat_keys:
-                corr_war[key] = _pearson_correlation(stat_arrays[key], war_vals)
-                corr_ops[key] = _pearson_correlation(stat_arrays[key], ops_vals)
+            X = np.array(X_raw, dtype=np.float64)
+            y = np.array(y_war, dtype=np.float64)
 
-            # Combined correlation: average of WAR corr and OPS corr
-            combined_corr = {}
-            for key in all_bat_keys:
-                combined_corr[key] = (corr_war[key] + corr_ops[key]) / 2.0
+            # Elastic Net with 10-fold CV — handles correlated predictors
+            # (the paper's recommended approach for 7-8 features, n=400+)
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X)
 
-            # Convert to proportional weights: use max(0, corr) so negative
-            # correlations get zeroed out
-            positive_corrs = {k: max(0.0, v) for k, v in combined_corr.items()}
-            corr_sum = sum(positive_corrs.values())
+            enet = ElasticNetCV(
+                l1_ratio=[0.1, 0.3, 0.5, 0.7, 0.9],
+                cv=min(10, bat_sample_size),
+                max_iter=5000,
+                positive=True,  # Force non-negative weights
+                n_jobs=-1,
+            )
+            enet.fit(X_scaled, y)
+            bat_r2 = enet.score(X_scaled, y)
 
-            if corr_sum > 0:
-                # Scale to match the total weight of the defaults (excluding ovr
-                # and stamina_hold which are handled differently)
-                default_total = sum(
-                    DEFAULT_BATTING_WEIGHTS.get(k, 0.0) for k in all_bat_keys
-                )
-                empirical = {}
-                for key in all_bat_keys:
-                    empirical[key] = (positive_corrs[key] / corr_sum) * default_total
+            # Convert standardized coefficients back to original scale
+            raw_coefs = enet.coef_ / scaler.scale_
 
-                # Blend: final = default*(1-conf*0.6) + empirical*(conf*0.6)
-                blend = bat_confidence * 0.6
+            # Scale coefficients to match total weight of defaults
+            default_total = sum(
+                DEFAULT_BATTING_WEIGHTS.get(k, 0.0) for k in all_bat_keys
+            )
+            coef_sum = raw_coefs.sum()
+            if coef_sum > 0:
+                scale_factor = default_total / coef_sum
+                empirical = {k: round(float(raw_coefs[i]) * scale_factor, 2)
+                             for i, k in enumerate(all_bat_keys)}
+
+                # Bayesian blend: n/(n+k) observed + k/(n+k) prior
+                # k=100 = moderate prior strength
+                k_prior = 100
+                blend_ratio = bat_sample_size / (bat_sample_size + k_prior)
                 for key in all_bat_keys:
                     default_w = DEFAULT_BATTING_WEIGHTS.get(key, 0.0)
-                    emp_w = empirical[key]
-                    new_w = round(default_w * (1.0 - blend) + emp_w * blend, 2)
+                    emp_w = empirical.get(key, 0.0)
+                    new_w = round(default_w * (1.0 - blend_ratio) + emp_w * blend_ratio, 2)
                     bat_calibrated[key] = new_w
-
-                # Compute R-squared using calibrated weights to predict WAR
-                predicted_war = []
-                for i in range(bat_sample_size):
-                    pred = sum(
-                        stat_arrays[key][i] * bat_calibrated.get(key, 0.0)
-                        for key in all_bat_keys
-                    )
-                    predicted_war.append(pred)
-                bat_r2 = _r_squared(war_vals, predicted_war)
 
                 # Record changes
                 for key in all_bat_keys:
@@ -867,6 +865,7 @@ def auto_calibrate_weights(conn=None) -> dict:
                     new_w = bat_calibrated[key]
                     if abs(new_w - old_w) >= 0.05:
                         direction = "increased" if new_w > old_w else "decreased"
+                        coef_idx = all_bat_keys.index(key)
                         result["changes"].append({
                             "stat": key,
                             "type": "batting",
@@ -874,8 +873,8 @@ def auto_calibrate_weights(conn=None) -> dict:
                             "new_weight": new_w,
                             "reason": (
                                 f"{key} {direction} from {old_w:.2f} to {new_w:.2f} "
-                                f"(WAR r={corr_war[key]:.3f}, OPS r={corr_ops[key]:.3f}, "
-                                f"n={bat_sample_size})"
+                                f"(ElasticNet coef={raw_coefs[coef_idx]:.4f}, "
+                                f"n={bat_sample_size}, R2={bat_r2:.3f})"
                             ),
                         })
         else:
@@ -942,58 +941,80 @@ def auto_calibrate_weights(conn=None) -> dict:
         if pitch_sample_size >= 10:
             pitch_confidence = min(1.0, pitch_sample_size / 100.0)
 
-            stat_arrays_p = {k: [] for k in pitch_stat_cols}
-            war_vals_p = []
-            neg_era_vals = []  # Negated so higher = better
+            import numpy as np
+            from sklearn.linear_model import ElasticNetCV
+            from sklearn.preprocessing import StandardScaler
+
+            # Feature columns: core stats + interaction terms (SIERA precedent)
+            all_pitch_keys = pitch_weight_keys + [
+                "stuff_x_movement", "stuff_x_control", "movement_x_control"
+            ]
+            X_raw_p = []
+            y_war_p = []
 
             for row in pitch_rows:
-                war_vals_p.append(_safe_float(row["war"]))
-                neg_era_vals.append(-_safe_float(row["era"]))
-                for col in pitch_stat_cols:
-                    stat_arrays_p[col].append(_safe_float(row[col]))
+                d = dict(row)
+                stu = _safe_float(d["stuff"])
+                mov = _safe_float(d["movement"])
+                ctrl = _safe_float(d["control"])
+                phr = _safe_float(d["p_hr"])
+                features = [stu, mov, ctrl, phr,
+                            stu * mov, stu * ctrl, mov * ctrl]
+                X_raw_p.append(features)
+                y_war_p.append(_safe_float(d["war"]))
 
-            corr_war_p = {}
-            corr_era_p = {}
-            for key in pitch_weight_keys:
-                corr_war_p[key] = _pearson_correlation(stat_arrays_p[key], war_vals_p)
-                corr_era_p[key] = _pearson_correlation(stat_arrays_p[key], neg_era_vals)
+            X_p = np.array(X_raw_p, dtype=np.float64)
+            y_p = np.array(y_war_p, dtype=np.float64)
 
-            combined_corr_p = {}
-            for key in pitch_weight_keys:
-                combined_corr_p[key] = (corr_war_p[key] + corr_era_p[key]) / 2.0
+            scaler_p = StandardScaler()
+            X_p_scaled = scaler_p.fit_transform(X_p)
 
-            positive_corrs_p = {k: max(0.0, v) for k, v in combined_corr_p.items()}
-            corr_sum_p = sum(positive_corrs_p.values())
+            enet_p = ElasticNetCV(
+                l1_ratio=[0.1, 0.3, 0.5, 0.7, 0.9],
+                cv=min(10, pitch_sample_size),
+                max_iter=5000,
+                positive=True,
+                n_jobs=-1,
+            )
+            enet_p.fit(X_p_scaled, y_p)
+            pitch_r2 = enet_p.score(X_p_scaled, y_p)
 
-            if corr_sum_p > 0:
-                default_total_p = sum(
-                    DEFAULT_PITCHING_WEIGHTS.get(k, 0.0) for k in pitch_weight_keys
-                )
-                empirical_p = {}
-                for key in pitch_weight_keys:
-                    empirical_p[key] = (positive_corrs_p[key] / corr_sum_p) * default_total_p
+            raw_coefs_p = enet_p.coef_ / scaler_p.scale_
 
-                blend_p = pitch_confidence * 0.6
-                for key in pitch_weight_keys:
+            # Scale main stats (first 4) to match default total, interactions separately
+            main_keys = pitch_weight_keys
+            interaction_keys = ["stuff_x_movement", "stuff_x_control", "movement_x_control"]
+            main_coefs = raw_coefs_p[:len(main_keys)]
+            interaction_coefs = raw_coefs_p[len(main_keys):]
+
+            default_total_p = sum(
+                DEFAULT_PITCHING_WEIGHTS.get(k, 0.0) for k in main_keys
+            )
+            main_sum = main_coefs.sum()
+            if main_sum > 0:
+                scale_p = default_total_p / main_sum
+                for i, key in enumerate(main_keys):
+                    empirical_w = float(main_coefs[i]) * scale_p
+                    k_prior = 100
+                    blend_ratio = pitch_sample_size / (pitch_sample_size + k_prior)
                     default_w = DEFAULT_PITCHING_WEIGHTS.get(key, 0.0)
-                    emp_w = empirical_p[key]
-                    new_w = round(default_w * (1.0 - blend_p) + emp_w * blend_p, 2)
-                    pitch_calibrated[key] = new_w
-
-                # R-squared for pitching (predict WAR)
-                predicted_war_p = []
-                for i in range(pitch_sample_size):
-                    pred = sum(
-                        stat_arrays_p[key][i] * pitch_calibrated.get(key, 0.0)
-                        for key in pitch_weight_keys
+                    pitch_calibrated[key] = round(
+                        default_w * (1.0 - blend_ratio) + empirical_w * blend_ratio, 2
                     )
-                    predicted_war_p.append(pred)
-                pitch_r2 = _r_squared(war_vals_p, predicted_war_p)
 
-                for key in pitch_weight_keys:
+                # Interaction weights: use raw scaled coefficients (small values)
+                for i, key in enumerate(interaction_keys):
+                    raw_val = float(interaction_coefs[i])
+                    default_w = DEFAULT_PITCHING_WEIGHTS.get(key, 0.01)
+                    pitch_calibrated[key] = round(
+                        default_w * 0.3 + raw_val * 0.7, 4
+                    )
+
+                # Record changes
+                for i, key in enumerate(all_pitch_keys):
                     old_w = DEFAULT_PITCHING_WEIGHTS.get(key, 0.0)
-                    new_w = pitch_calibrated[key]
-                    if abs(new_w - old_w) >= 0.05:
+                    new_w = pitch_calibrated.get(key, old_w)
+                    if abs(new_w - old_w) >= 0.01:
                         direction = "increased" if new_w > old_w else "decreased"
                         result["changes"].append({
                             "stat": key,
@@ -1001,10 +1022,9 @@ def auto_calibrate_weights(conn=None) -> dict:
                             "old_weight": old_w,
                             "new_weight": new_w,
                             "reason": (
-                                f"{key} {direction} from {old_w:.2f} to {new_w:.2f} "
-                                f"(WAR r={corr_war_p[key]:.3f}, "
-                                f"-ERA r={corr_era_p[key]:.3f}, "
-                                f"n={pitch_sample_size})"
+                                f"{key} {direction} from {old_w:.3f} to {new_w:.3f} "
+                                f"(ElasticNet coef={raw_coefs_p[i]:.5f}, "
+                                f"n={pitch_sample_size}, R2={pitch_r2:.3f})"
                             ),
                         })
         else:
