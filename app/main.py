@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import yaml
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # Add project root to path
@@ -10,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.core.database import init_db, get_connection, load_config
 from app.utils.sparklines import text_sparkline
+from app.utils.sidebar_nav import render_sidebar_nav
 
 # Initialize database on startup
 init_db()
@@ -33,8 +35,12 @@ logs = conn.execute("""
 """).fetchall()
 
 # ============================================================
-# SIDEBAR — team info, quick stats, navigation shortcuts
+# SIDEBAR — grouped nav (helper) + team info / quick stats
+# Auto-discovered nav is hidden via .streamlit/config.toml so this is the
+# only navigation surface the user sees.
 # ============================================================
+render_sidebar_nav()
+
 with st.sidebar:
     st.markdown(f"### \u26be {config.get('team_name', 'My Team')}")
 
@@ -70,17 +76,6 @@ with st.sidebar:
             st.caption(f"Sellable: {sell_pp:,} PP")
 
     st.divider()
-
-    # Quick nav
-    st.markdown("**Quick Links**")
-    st.page_link("pages/1_Buy_Recommendations.py", label="Buy Recs", icon="\U0001f6d2")
-    st.page_link("pages/2_Sell_Recommendations.py", label="Sell Recs", icon="\U0001f4b0")
-    st.page_link("pages/4_Roster_Optimizer.py", label="Roster Optimizer", icon="📋")
-    st.page_link("pages/7_Game_Stats.py", label="Game Stats", icon="📊")
-    st.page_link("pages/13_Tournament_Builder.py", label="Tournament Builder", icon="\U0001f3c6")
-    st.page_link("pages/15_Export_Plan.py", label="Export Plan", icon="\U0001f4cb")
-
-    st.divider()
     st.caption("Updated: " + (str(logs[0]['last_import'])[:16] if logs else "Never"))
 
 # ============================================================
@@ -106,93 +101,53 @@ except Exception:
     pass
 
 # ============================================================
-# IMPORT SECTION
+# IMPORT STATUS STRIP — lives on Dashboard, links to Data Refresh page
+# The old inline import expander (80+ lines of ingest_file + file_uploader)
+# moved to app/pages/0_Data_Refresh.py. Dashboard now shows a thin "is
+# your data fresh?" strip and a button to the refresh page.
 # ============================================================
-with st.expander("\U0001f4e5 Import Data from OOTP", expanded=not bool(logs)):
-    st.markdown("""
-**Card Ratings & Market** (export every session):
-1. **Card Shop** > CSV export button
-2. **Roster > Player List > Batting Ratings** > Export CSV
-3. **Roster > Player List > Pitching Ratings** > Export CSV
-4. **Collection > Manage Cards > Batting Ratings** > Export CSV
-5. **Collection > Manage Cards > Pitching Ratings** > Export CSV
+if logs:
+    latest_import_raw = logs[0]['last_import']
+    try:
+        latest_dt = datetime.fromisoformat(str(latest_import_raw).replace("T", " "))
+        age_hours = (datetime.now() - latest_dt).total_seconds() / 3600.0
+        if age_hours < 1:
+            age_lbl = f"{int(age_hours * 60)}m ago"
+        elif age_hours < 24:
+            age_lbl = f"{int(age_hours)}h ago"
+        else:
+            age_lbl = f"{int(age_hours / 24)}d ago"
+    except Exception:
+        age_lbl = str(latest_import_raw)[:16]
+        age_hours = 0
 
-**Game Stats** (export periodically):
-6. **Roster > Batting Stats (1 & 2)** > Export CSV
-7. **Roster > Pitching Stats (1 & 2)** > Export CSV
-8. **League > Sortable Stats > Batting (Stats & Ratings)** > Export CSV
-9. **League > Sortable Stats > Pitching (Stats & Ratings)** > Export CSV
-
-**Lineups & Pitching Staff** (export when lineup changes):
-10. **Lineups > vs RHP + DH** > Export CSV
-11. **Lineups > vs LHP + DH** > Export CSV
-12. **Lineups > Overview** > Export CSV
-13. **Pitching** (team pitching roster) > Export CSV
-
-All CSVs go to: `""" + config.get('watch_directory', 'your watch directory') + """`
-    """)
-
-    col_import1, col_import2 = st.columns(2)
-
-    with col_import1:
-        if st.button("\U0001f4e5 Import All from Watch Folder", type="primary", use_container_width=True):
-            from app.core.ingestion import ingest_file
-            from app.core.recommendations import generate_recommendations
-            watch_dir = config.get('watch_directory', '')
-            if Path(watch_dir).exists():
-                csvs = list(Path(watch_dir).glob('*.csv'))
-                if csvs:
-                    progress = st.progress(0, text="Importing...")
-                    import_results = []
-                    for i, csv_path in enumerate(csvs):
-                        progress.progress((i + 1) / len(csvs), text=f"Importing {csv_path.name}...")
-                        result = ingest_file(str(csv_path))
-                        result['filename'] = csv_path.name
-                        import_results.append(result)
-                    progress.progress(1.0, text="Generating recommendations...")
-                    generate_recommendations()
-
-                    success_count = sum(1 for r in import_results if r.get('status') == 'success')
-                    total_rows = sum(r.get('rows', 0) for r in import_results)
-                    st.success(f"Imported {success_count}/{len(csvs)} files ({total_rows:,} rows)")
-
-                    with st.expander("Import details"):
-                        for r in import_results:
-                            status = r.get('status', 'unknown')
-                            rows = r.get('rows', 0)
-                            fname = r.get('filename', '?')
-                            ftype = r.get('file_type', '?')
-                            icon = "\u2705" if status == 'success' and rows > 0 else ("\u2796" if rows == 0 else "\u274c")
-                            st.write(f"{icon} `{ftype}` {rows:,} rows - *{fname}*")
-
-                    st.rerun()
-                else:
-                    st.warning("No CSV files in watch folder.")
-            else:
-                st.error(f"Watch folder not found: {watch_dir}")
-
-    with col_import2:
-        uploaded = st.file_uploader("Or drag & drop CSVs", type=['csv'],
-                                     accept_multiple_files=True, key="main_upload")
-        if uploaded:
-            import tempfile, os
-            from app.core.ingestion import ingest_file
-            from app.core.recommendations import generate_recommendations
-            for f in uploaded:
-                tmp_path = os.path.join(tempfile.gettempdir(), f.name)
-                with open(tmp_path, 'wb') as tmp:
-                    tmp.write(f.getbuffer())
-                result = ingest_file(tmp_path)
-                st.write(f"**{f.name}**: {result.get('rows', 0):,} rows")
-            generate_recommendations()
-            st.success("Import complete!")
-            st.rerun()
-
-# ============================================================
-# DASHBOARD — only when data exists
-# ============================================================
-if not logs:
-    st.info("\U0001f449 No data yet. Expand the import section above to get started.")
+    stale = age_hours >= 24
+    status_cols = st.columns([5, 2])
+    with status_cols[0]:
+        if stale:
+            st.warning(
+                f"\u23f0 Last refresh: **{age_lbl}** — your data may be stale. "
+                "Run a fresh import before acting on recommendations."
+            )
+        else:
+            st.caption(f"\u2714 Last refresh: {age_lbl}")
+    with status_cols[1]:
+        st.page_link(
+            "pages/0_Data_Refresh.py",
+            label="Open Data Refresh",
+            icon="\U0001f4e5",
+            use_container_width=True,
+        )
+else:
+    st.info(
+        "\U0001f449 No data yet. Open **Data Refresh** to scan your OOTP "
+        "watch folder and run your first import."
+    )
+    st.page_link(
+        "pages/0_Data_Refresh.py",
+        label="Open Data Refresh",
+        icon="\U0001f4e5",
+    )
     conn.close()
     st.stop()
 
@@ -218,11 +173,24 @@ avg_roster_meta_row = conn.execute("""
 """).fetchone()
 avg_roster_meta = avg_roster_meta_row['avg_meta'] or 0
 
-avg_market_top_row = conn.execute("""
-    SELECT AVG(COALESCE(meta_score_batting, meta_score_pitching)) as avg_meta
-    FROM cards WHERE tier >= 5 AND COALESCE(meta_score_batting, meta_score_pitching) > 0
-""").fetchone()
-avg_market_top = avg_market_top_row['avg_meta'] or 1
+# Team Health now benchmarks against the active tier's P75 (a competitive
+# roster at this tier), NOT hardcoded Diamond+ averages. Previously every
+# Low Bronze roster showed 45% health by construction — the benchmark was
+# Diamond meta. Source switches to tier_context so the bar scales with the
+# league the user is actually playing in.
+try:
+    from app.core.tier_context import tier_benchmarks as _tb, tier_meta_p50 as _tp50
+    _tier_bench = _tb(conn=conn)
+    _tier_norm_header = _tier_bench.get('tier_normalized') or 'Bronze'
+    avg_market_top = (_tier_bench.get('overall') or {}).get('p75') or _tp50(_tier_norm_header, conn=conn) + 80
+except Exception:
+    # Fallback if tier_context can't read leagues table — use the old
+    # Diamond+ benchmark so the page still renders.
+    avg_market_top_row = conn.execute("""
+        SELECT AVG(COALESCE(meta_score_batting, meta_score_pitching)) as avg_meta
+        FROM cards WHERE tier >= 5 AND COALESCE(meta_score_batting, meta_score_pitching) > 0
+    """).fetchone()
+    avg_market_top = avg_market_top_row['avg_meta'] or 1
 
 health_pct = min(100, int((avg_roster_meta / avg_market_top) * 100)) if avg_market_top > 0 else 0
 
@@ -251,38 +219,43 @@ tab_overview, tab_recs, tab_roster, tab_data = st.tabs([
 # TAB: Overview
 # ============================================================
 with tab_overview:
-    # Team Health Progress Bars
+    # Team Health Progress Bars — tier-relative, not "vs Diamond+"
     try:
+        from app.core.tier_context import tier_benchmarks, promotion_readiness, tier_meta_p50
+
+        # Pull tier benchmarks once; the UI stays readable even when the
+        # sample is thin (falls back to heuristic P50 per tier).
+        _bench = tier_benchmarks(conn=conn)
+        _tier_norm = _bench.get('tier_normalized') or 'Bronze'
+        _tier_label = _bench.get('league_tier') or _tier_norm
+        # P75 of the roster's own tier is the "competitive" benchmark — a
+        # card at that meta is a solid contributor in this tier. For Low
+        # Bronze this lands around 580-640 rather than the Diamond+ 850.
+        _tier_p75 = (_bench.get('overall') or {}).get('p75') or tier_meta_p50(_tier_norm, conn=conn) + 80
+
         bat_starter_meta_row = conn.execute("""
             SELECT AVG(meta_score) as avg_meta FROM roster_current
             WHERE lineup_role = 'starter' AND position NOT IN ('SP', 'RP', 'CL') AND meta_score > 0
         """).fetchone()
         bat_starter_meta = bat_starter_meta_row['avg_meta'] or 0 if bat_starter_meta_row else 0
-
-        market_bat_avg_row = conn.execute("""
-            SELECT AVG(meta_score_batting) as avg_meta FROM cards WHERE tier >= 5 AND meta_score_batting > 0
-        """).fetchone()
-        market_bat_avg = market_bat_avg_row['avg_meta'] or 1 if market_bat_avg_row else 1
-
-        batting_depth_pct = min(100, int((bat_starter_meta / market_bat_avg) * 100)) if market_bat_avg > 0 else 0
+        batting_depth_pct = min(100, int((bat_starter_meta / _tier_p75) * 100)) if _tier_p75 > 0 else 0
 
         pit_starter_meta_row = conn.execute("""
             SELECT AVG(meta_score) as avg_meta FROM roster_current
             WHERE lineup_role IN ('rotation', 'closer', 'bullpen') AND meta_score > 0
         """).fetchone()
         pit_starter_meta = pit_starter_meta_row['avg_meta'] or 0 if pit_starter_meta_row else 0
+        pitching_depth_pct = min(100, int((pit_starter_meta / _tier_p75) * 100)) if _tier_p75 > 0 else 0
 
-        market_pit_avg_row = conn.execute("""
-            SELECT AVG(meta_score_pitching) as avg_meta FROM cards WHERE tier >= 5 AND meta_score_pitching > 0
-        """).fetchone()
-        market_pit_avg = market_pit_avg_row['avg_meta'] or 1 if market_pit_avg_row else 1
-
-        pitching_depth_pct = min(100, int((pit_starter_meta / market_pit_avg) * 100)) if market_pit_avg > 0 else 0
-
+        # "Good arm" threshold is tier-relative: the P50 of owned cards at
+        # this tier. Previously hardcoded at 400, which meant no bullpen
+        # arm in Silver+ ever counted as good (the bar was too low) AND no
+        # bullpen arm in Stone ever counted as good (the bar was too high).
+        _bp_good_threshold = tier_meta_p50(_tier_norm, conn=conn)
         bp_good = conn.execute("""
             SELECT COUNT(*) as c FROM roster_current
-            WHERE position IN ('RP', 'CL') AND lineup_role IN ('bullpen', 'closer') AND meta_score > 400
-        """).fetchone()['c']
+            WHERE position IN ('RP', 'CL') AND lineup_role IN ('bullpen', 'closer') AND meta_score > ?
+        """, (_bp_good_threshold,)).fetchone()['c']
         bp_total = conn.execute("""
             SELECT COUNT(*) as c FROM roster_current
             WHERE position IN ('RP', 'CL') AND lineup_role IN ('bullpen', 'closer')
@@ -293,7 +266,7 @@ with tab_overview:
         with h1:
             st.markdown("**Overall**")
             st.progress(min(1.0, health_pct / 100))
-            st.caption(f"{health_pct}% vs Diamond+ avg")
+            st.caption(f"{health_pct}% of {_tier_label} P75")
         with h2:
             st.markdown("**Batting**")
             st.progress(min(1.0, batting_depth_pct / 100))
@@ -306,6 +279,125 @@ with tab_overview:
             st.markdown("**Bullpen**")
             st.progress(min(1.0, bullpen_pct / 100))
             st.caption(f"{bp_good}/{bp_total} quality arms")
+    except Exception:
+        pass
+
+    # ── Promotion Readiness ──
+    # Surfaces the gap between the current roster and the next tier's
+    # competitive threshold, with a per-position breakdown so the user
+    # knows *where* to spend PP for the push.
+    try:
+        from app.core.tier_context import promotion_readiness
+        readiness = promotion_readiness(conn=conn)
+        if readiness.get('target_tier'):
+            current_t = readiness.get('current_tier') or readiness.get('current_tier_normalized') or '?'
+            target_t = readiness['target_tier']
+            gap = readiness.get('overall_gap')
+            threshold = readiness.get('target_threshold_p75')
+            st.divider()
+            st.markdown(f"#### 🎯 Promotion Readiness — {current_t} → {target_t}")
+            pr1, pr2, pr3 = st.columns(3)
+            with pr1:
+                roster_p50 = readiness.get('roster_p50') or 0
+                st.metric("Roster P50 meta", f"{roster_p50:.0f}")
+            with pr2:
+                if threshold:
+                    st.metric(f"{target_t} threshold", f"{threshold:.0f}")
+                else:
+                    st.metric(f"{target_t} threshold", "—")
+            with pr3:
+                if gap is not None:
+                    if gap <= 0:
+                        st.metric("Overall gap", "Met", delta="ready for promotion",
+                                  delta_color="normal")
+                    else:
+                        st.metric("Overall gap", f"+{gap:.0f} meta",
+                                  delta="needed to close",
+                                  delta_color="inverse")
+                else:
+                    st.metric("Overall gap", "—")
+
+            # Position-level investment priorities — sorted so the biggest
+            # gaps surface first. Only show slots the roster currently fills
+            # (empty slots are already flagged by the Weakest Pos metric).
+            positions = readiness.get('positions') or {}
+            ordered = sorted(
+                ((pos, d) for pos, d in positions.items() if d.get('gap') is not None),
+                key=lambda x: -(x[1].get('gap') or 0),
+            )[:6]
+            if ordered:
+                invest_lines = []
+                for pos, d in ordered:
+                    cur = d.get('current_meta') or 0
+                    tgt = d.get('target_meta') or 0
+                    gp = d.get('gap') or 0
+                    prio = d.get('priority') or 'unknown'
+                    emoji = {
+                        'met': '✅', 'low': '🟢', 'medium': '🟡',
+                        'high': '🔴', 'unknown': '⚪',
+                    }.get(prio, '⚪')
+                    invest_lines.append(
+                        f"- {emoji} **{pos}** — current {cur:.0f} / target {tgt:.0f} "
+                        f"({'+' if gp > 0 else ''}{gp:.0f})"
+                    )
+                st.markdown("\n".join(invest_lines))
+    except Exception:
+        # Readiness is a nice-to-have, don't block the page on it.
+        pass
+
+    # ── Roster Momentum (hot/cold from history snapshots) ──
+    # Computed from player_history: how has each roster card's PERFORMANCE
+    # moved across the last 3 snapshots? Independent signal from meta —
+    # meta is static, momentum says "this guy is turning around" or
+    # "this guy is sliding" based on actual game output.
+    try:
+        from app.core.trend import roster_trends, summarize_trends
+        _trends = roster_trends(window=3, conn=conn)
+        _summary = summarize_trends(_trends)
+        if _summary['hot'] + _summary['cold'] > 0:
+            st.divider()
+            st.markdown("#### 📈 Roster Momentum (last 3 snapshots)")
+            mm1, mm2, mm3 = st.columns(3)
+            with mm1:
+                st.metric("🔥 Hot", _summary['hot'],
+                          delta=f"trending up", delta_color="normal")
+            with mm2:
+                st.metric("🧊 Cold", _summary['cold'],
+                          delta=f"trending down", delta_color="inverse")
+            with mm3:
+                st.metric("— Stable", _summary['stable'])
+
+            # Pull top 3 hot and cold by war/p_war delta, show inline
+            hot_sorted = sorted(
+                ((cid, t) for cid, t in _trends.items() if t.get('signal') == 'hot'),
+                key=lambda x: -(x[1].get('war_delta') or x[1].get('p_war_delta') or 0),
+            )[:5]
+            cold_sorted = sorted(
+                ((cid, t) for cid, t in _trends.items() if t.get('signal') == 'cold'),
+                key=lambda x: (x[1].get('war_delta') or x[1].get('p_war_delta') or 0),
+            )[:5]
+            # Resolve names
+            def _name_for(cid):
+                row = conn.execute("SELECT card_title FROM cards WHERE card_id = ?", (cid,)).fetchone()
+                return (row['card_title'] if row and row['card_title'] else f"card {cid}")[:44]
+            if hot_sorted:
+                st.markdown("**Hottest 5:**")
+                for cid, t in hot_sorted:
+                    w = t.get('war_delta') or t.get('p_war_delta') or 0
+                    bat = t.get('ops_plus_delta')
+                    pit = t.get('era_plus_delta')
+                    rate = (f"OPS+ {bat:+.0f}" if bat is not None else
+                            (f"ERA+ {pit:+.0f}" if pit is not None else ""))
+                    st.markdown(f"- 🔥 {_name_for(cid)} — WAR {w:+.1f}  {rate}")
+            if cold_sorted:
+                st.markdown("**Coldest 5:**")
+                for cid, t in cold_sorted:
+                    w = t.get('war_delta') or t.get('p_war_delta') or 0
+                    bat = t.get('ops_plus_delta')
+                    pit = t.get('era_plus_delta')
+                    rate = (f"OPS+ {bat:+.0f}" if bat is not None else
+                            (f"ERA+ {pit:+.0f}" if pit is not None else ""))
+                    st.markdown(f"- 🧊 {_name_for(cid)} — WAR {w:+.1f}  {rate}")
     except Exception:
         pass
 

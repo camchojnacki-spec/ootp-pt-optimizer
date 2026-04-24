@@ -8,8 +8,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from app.core.database import get_connection
 from app.core.live_card_tracker import get_live_cards, analyze_live_cards
 from app.core.recommendations import cache_live_card_analysis
+from app.utils.sidebar_nav import render_sidebar_nav
 
 st.set_page_config(page_title="Live Card Tracker", page_icon="📡", layout="wide")
+render_sidebar_nav()
 st.title("Live Card Tracker")
 st.caption("Compare OOTP Live card ratings to real MLB performance — spot upgrades before they happen")
 

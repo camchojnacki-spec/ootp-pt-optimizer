@@ -1,0 +1,8 @@
+[client]
+# Hide the auto-discovered sidebar navigation. We render our own grouped nav
+# via app/utils/sidebar_nav.py so the user gets sections (Decide / Analyze /
+# Library / Configure) instead of an alphabetical dump of 14 numbered files.
+showSidebarNavigation = false
+
+[theme]
+base = "dark"

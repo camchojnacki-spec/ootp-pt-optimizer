@@ -5,12 +5,23 @@ from app.utils.constants import FILE_PATTERNS
 
 
 def identify_file_type(filepath: str) -> str | None:
-    """Identify CSV file type from filename."""
+    """Identify CSV file type from filename.
+
+    Uses longest-match semantics: when multiple patterns match the same
+    filename, the longest (most specific) pattern wins. This prevents e.g.
+    a team-level "...sortable_stats_batting_stats.csv" file from being
+    misidentified as the player-level `stats_batting` type when a more
+    specific `team_stats_batting` pattern is present.
+    """
     name = Path(filepath).name.lower()
+    best_type: str | None = None
+    best_len = -1
     for file_type, pattern in FILE_PATTERNS.items():
-        if pattern.lower() in name:
-            return file_type
-    return None
+        pat = pattern.lower()
+        if pat in name and len(pat) > best_len:
+            best_type = file_type
+            best_len = len(pat)
+    return best_type
 
 
 def parse_market_csv(filepath: str) -> pd.DataFrame:
@@ -161,6 +172,20 @@ def parse_league_pitching_ratings_csv(filepath: str) -> pd.DataFrame:
     return df
 
 
+def parse_league_player_default_csv(filepath: str) -> pd.DataFrame:
+    """Parse the league-wide player `default` CSV.
+
+    Expected columns: POS, #, Name, Inf, TM, LG, Lev, DOB, Age, NAT, HT, WT, B, T, OVR
+
+    This is the only league-wide player export that carries the TM (short team
+    name) + LG columns. One row per card-instance-per-team, aligned row-for-row
+    with the ratings files from the same league/date.
+    """
+    df = pd.read_csv(filepath)
+    df.columns = df.columns.str.strip()
+    return df
+
+
 def parse_fielding_stats_csv(filepath: str) -> pd.DataFrame:
     """Parse fielding stats CSV export.
 
@@ -191,11 +216,63 @@ def parse_position_ratings_csv(filepath: str) -> pd.DataFrame:
     return df
 
 
+def parse_team_stats_batting_csv(filepath: str) -> pd.DataFrame:
+    """Parse league-wide team batting stats CSV (one row per team).
+
+    Expected columns: Team Name, G, 2B, 3B, HR, R, BB, SO, SB, AVG, OBP, SLG, OPS
+    """
+    df = pd.read_csv(filepath)
+    df.columns = df.columns.str.strip()
+    df = df.dropna(subset=['Team Name'])
+    return df
+
+
+def parse_team_stats_pitching_csv(filepath: str) -> pd.DataFrame:
+    """Parse league-wide team pitching stats CSV (one row per team).
+
+    Expected columns: Team Name, W, L, SV, IP, R, HR, BB, K, WHIP, AVG, ERA, FIP-
+    """
+    df = pd.read_csv(filepath)
+    df.columns = df.columns.str.strip()
+    df = df.dropna(subset=['Team Name'])
+    return df
+
+
+def parse_team_stats_park_csv(filepath: str) -> pd.DataFrame:
+    """Parse league-wide team park factor CSV (one row per team).
+
+    Expected columns: Team Name, Park, PF AVG, AVG L, AVG R, PF HR, HR L, HR R, PF D, PF T, PF
+    Park factors are centered at 1.000 (neutral). >1 = hitter-friendly.
+    """
+    df = pd.read_csv(filepath)
+    df.columns = df.columns.str.strip()
+    df = df.dropna(subset=['Team Name'])
+    return df
+
+
 def parse_pitch_ratings_csv(filepath: str) -> pd.DataFrame:
     """Parse individual pitch ratings CSV export.
 
     Expected columns: POS, #, Name, Inf, Age, T, FB, CH, CB, SL, SI, SP, CT, FO,
     CC, SC, KC, KN, PIT, VELO, Slot, STM
+    """
+    try:
+        df = pd.read_csv(filepath, encoding='utf-8')
+    except UnicodeDecodeError:
+        df = pd.read_csv(filepath, encoding='latin-1')
+    df.columns = df.columns.str.strip()
+    df = df.dropna(subset=['Name'], how='all')
+    return df
+
+
+def parse_fielding_ratings_csv(filepath: str) -> pd.DataFrame:
+    """Parse player fielding ratings CSV export (OOTP 27+).
+
+    Expected columns: POS, #, Name, Inf, Age, B, T, C ABI, C ARM, IF RNG,
+    IF ERR, IF ARM, TDP, OF RNG, OF ERR, OF ARM, St
+
+    Note the spaces in column names ('C ABI', 'IF RNG'...) — the handler
+    reads them via row.get('C ABI') etc., not via pandas attribute access.
     """
     try:
         df = pd.read_csv(filepath, encoding='utf-8')

@@ -12,9 +12,121 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.core.database import get_connection, load_config
+from app.core.meta_validation import get_meta_confidence
+from app.core.meta_scoring import explain_meta
 from app.utils.sparklines import text_sparkline
+from app.utils.sidebar_nav import render_sidebar_nav
+
+
+def _fetch_card_for_explainer(conn, card_id):
+    """Fetch the full card row needed by ``explain_meta``.
+
+    The scenario/upgrade dicts only carry a handful of fields (card_id, meta,
+    price, etc.), but the explainer needs the underlying ratings + position so
+    it can rebuild the breakdown exactly the way ``calc_*_meta`` did. Pulled
+    once per row inside the expander so the cost is paid lazily.
+    """
+    if not card_id:
+        return None
+    row = conn.execute(
+        """
+        SELECT card_id, card_title, position, position_name, pitcher_role, pitcher_role_name,
+               tier_name,
+               contact, gap_power, power, eye, avoid_ks, babip,
+               speed, stealing, baserunning,
+               of_range, of_error, of_arm,
+               catcher_ability, catcher_frame, catcher_arm,
+               infield_range, infield_error, infield_arm,
+               stuff, movement, control, p_hr, p_babip, stamina, hold
+        FROM cards WHERE card_id = ?
+        """,
+        (card_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _render_meta_explainer(exp: dict, key_prefix: str = ""):
+    """Render the explain_meta() output as Streamlit components.
+
+    Reused by Buy/Sell/Optimizer pages so the formula breakdown looks the same
+    everywhere. Caller is responsible for putting it inside an expander/popover
+    if they want progressive disclosure.
+    """
+    if not exp:
+        st.caption("(no explainer available — card data is missing the needed ratings)")
+        return
+    # OVR diagnostic — surfaced for sanity-check only. Meta v6 removed OVR
+    # from the formula (it was circular: calibration drops OVR for VIF>10
+    # but the formula re-added it at weight 2.00). The gap between meta and
+    # OVR is now *the signal*: "OOTP rates this card 80, our meta says X."
+    ovr = (exp.get('diagnostics') or {}).get('ovr')
+    if ovr:
+        st.caption(
+            f"Total breakdown: **{exp['total']:.0f}** meta · OOTP OVR **{ovr}** "
+            "(shown for comparison — not part of the meta formula). "
+            "Components sorted by impact — biggest positive = why this card is "
+            "valuable, biggest negative = what's holding it back."
+        )
+    else:
+        st.caption(
+            f"Total breakdown: **{exp['total']:.0f}** meta — "
+            "components sorted by impact."
+        )
+    if exp.get('components'):
+        comp_df = pd.DataFrame([
+            {"Rating": c['label'], "Raw": c['raw'],
+             "Weight": c['weight'], "Points": c['points']}
+            for c in exp['components']
+        ])
+        st.dataframe(
+            comp_df, use_container_width=True, hide_index=True,
+            column_config={
+                "Raw": st.column_config.NumberColumn(format="%.0f", width="small"),
+                "Weight": st.column_config.NumberColumn(format="%.2f", width="small"),
+                "Points": st.column_config.NumberColumn(format="%+.1f", width="small"),
+            },
+        )
+    if exp.get('bonuses'):
+        st.markdown("**Bonuses**")
+        for b in exp['bonuses']:
+            st.markdown(f"\u2022 {b['label']} \u2192 **{b['points']:+.1f}**")
+    if exp.get('penalties'):
+        st.markdown("**Penalties**")
+        for p in exp['penalties']:
+            st.markdown(f"\u2022 {p['label']} \u2192 **{p['points']:+.1f}**")
+    if exp.get('notes'):
+        st.markdown("---")
+        for n in exp['notes']:
+            st.caption(f"\U0001f4dd {n}")
+
+
+def _meta_confidence_chip_html(category: str, conn, display_name: str | None = None) -> str:
+    """Small HTML chip showing how reliable the meta sort is for a category.
+
+    The review flagged this as the single-highest-leverage change: every
+    meta-sorted list implicitly claims its ordering is useful, and without
+    the chip the user has no visible signal to calibrate that claim.
+
+    ``category`` matches a ``meta_calibration.calibration_type`` row:
+    'batting', 'pitching' (combined), 'pitching_sp', 'pitching_rp'.
+    ``display_name`` overrides the chip label when the raw category name
+    would read awkwardly (e.g. 'Pitching_Sp' → 'SP')."""
+    c = get_meta_confidence(category, conn)
+    tip = (
+        f"Meta vs observed performance: r={c['correlation']}, "
+        f"R\u00b2={c['r_squared']}, n={c['sample_size']}. "
+        f"Run /Game_Stats \u2192 Meta vs Reality to recalibrate."
+    )
+    label_name = display_name if display_name else category.title()
+    return (
+        f'<span title="{tip}" style="display:inline-block; padding:2px 8px; '
+        f'border-radius:10px; background:{c["color"]}; color:#fff; '
+        f'font-size:0.78em; font-weight:600; margin-left:6px;">'
+        f'{c["emoji"]} {label_name}: {c["label"]}</span>'
+    )
 
 st.set_page_config(page_title="Buy Recommendations", page_icon="🛒", layout="wide")
+render_sidebar_nav()
 
 conn = get_connection()
 config = load_config()
@@ -146,6 +258,22 @@ def _get_position_gaps():
     batting_pos = ['C', '1B', '2B', '3B', 'SS', 'LF', 'CF', 'RF']
     pitching_pos = ['SP', 'RP', 'CL']
 
+    # Collect all rostered player names up front — used to exclude "upgrades"
+    # that are just a different card version of a player already in the lineup
+    # (e.g. Bo Bichette → Bo Bichette NYM is the same player, not a real upgrade).
+    _rostered_names = set()
+    for _pos_key, _p in roster.items():
+        if _p and _p.get('player_name'):
+            _rostered_names.add(_p['player_name'].strip())
+
+    def _is_same_player_as_current(card_title: str, current_player_name: str) -> bool:
+        """Return True if this card represents the same player who's already starting."""
+        if not card_title or not current_player_name:
+            return False
+        core, _ = _strip_set_prefix(card_title)
+        # Match if the current player's full name appears at the start of the card core
+        return core.lower().startswith(current_player_name.strip().lower())
+
     for pos in batting_pos:
         current = roster.get(pos)
         current_meta = current['meta_score'] if current else 0
@@ -158,13 +286,23 @@ def _get_position_gaps():
         """, (pos,)).fetchone()
         market_ceiling = best['best_meta'] if best and best['best_meta'] else current_meta
 
-        # Best owned but not starting
-        bench_best = c.execute("""
+        # Best owned but not starting — exclude same-player cards and any card whose
+        # player name is already rostered at another slot (prevents duplicate promotes)
+        bench_candidates = c.execute("""
             SELECT card_title, meta_score_batting as meta, last_10_price
             FROM cards WHERE position_name = ? AND owned = 1
               AND meta_score_batting > ?
-            ORDER BY meta_score_batting DESC LIMIT 1
-        """, (pos, current_meta + 5)).fetchone()
+            ORDER BY meta_score_batting DESC LIMIT 10
+        """, (pos, current_meta + 5)).fetchall()
+        bench_best = None
+        for _c in bench_candidates:
+            _title = _c['card_title'] or ''
+            if _is_same_player_as_current(_title, current_name):
+                continue
+            if any(_is_same_player_as_current(_title, rn) for rn in _rostered_names):
+                continue
+            bench_best = _c
+            break
 
         gaps.append({
             'pos': pos,
@@ -192,12 +330,21 @@ def _get_position_gaps():
         """, (pos,)).fetchone()
         market_ceiling = best['best_meta'] if best and best['best_meta'] else current_meta
 
-        bench_best = c.execute("""
+        bench_candidates = c.execute("""
             SELECT card_title, meta_score_pitching as meta, last_10_price
             FROM cards WHERE pitcher_role_name = ? AND owned = 1
               AND meta_score_pitching > ?
-            ORDER BY meta_score_pitching DESC LIMIT 1
-        """, (pos, current_meta + 5)).fetchone()
+            ORDER BY meta_score_pitching DESC LIMIT 10
+        """, (pos, current_meta + 5)).fetchall()
+        bench_best = None
+        for _c in bench_candidates:
+            _title = _c['card_title'] or ''
+            if _is_same_player_as_current(_title, current_name):
+                continue
+            if any(_is_same_player_as_current(_title, rn) for rn in _rostered_names):
+                continue
+            bench_best = _c
+            break
 
         gaps.append({
             'pos': pos,
@@ -294,200 +441,182 @@ def _get_upgrade_candidates(budget, pos, is_pitcher=False):
 def _build_budget_scenarios(total_budget):
     """Build comparison scenarios for budget allocation.
 
-    Computes: what's the best 1-card buy, best 2-card buy, best 3-card buy
-    and compares total meta gain across the team.
+    Strategy: build ONE global candidate pool of upgrades, annotate each with
+    value_ratio (meta delta per 100 PP), then derive several scenarios by
+    sorting/filtering that pool. This guarantees all scenarios share the same
+    source of truth and lets us emphasize VALUE over raw meta delta.
+
+    Scenarios returned:
+      - 🎯 One Big Buy          — single highest-delta card within budget
+      - ⚖️ Two Balanced Buys   — 2 positions, highest combined delta
+      - 📈 Max Efficiency      — greedy by value_ratio, fill ~3 positions
+      - 💎 Value Hunt           — pure meta/PP ratio, 2-3 bargain cards
+      - 📊 Spread the Wealth    — 4+ positions improved (team breadth)
     """
+    if total_budget <= 0:
+        return []
+
     c = get_connection()
     gaps = _get_position_gaps()
-    roster = _get_roster_by_pos()
 
-    scenarios = []
-
-    # Scenario 1: Best single card (spend it all on biggest gap)
-    best_single = None
-    best_single_delta = 0
+    # ── Build ONE global candidate pool ─────────────────────────
+    # For each gap position (no free upgrade), pull the top-N market cards
+    # ordered by meta. We'll score value in Python.
+    pool = []
     for g in gaps:
         if g['has_owned_upgrade']:
-            continue  # Skip positions with free upgrades
+            continue  # free upgrade exists — don't pay for this slot
         pos = g['pos']
         is_pit = g['type'] == 'pit'
         current_meta = g['current_meta']
 
         if is_pit:
-            card = c.execute("""
+            rows = c.execute("""
                 SELECT card_id, card_title, meta_score_pitching as meta, last_10_price, tier_name
                 FROM cards WHERE pitcher_role_name = ? AND owned = 0 AND last_10_price > 0
                     AND last_10_price <= ? AND meta_score_pitching > ?
-                ORDER BY meta_score_pitching DESC LIMIT 1
-            """, (pos, total_budget, current_meta + 5)).fetchone()
+                ORDER BY meta_score_pitching DESC LIMIT 5
+            """, (pos, total_budget, current_meta + 5)).fetchall()
         else:
-            card = c.execute("""
+            rows = c.execute("""
                 SELECT card_id, card_title, meta_score_batting as meta, last_10_price, tier_name
                 FROM cards WHERE position_name = ? AND owned = 0 AND last_10_price > 0
                     AND last_10_price <= ? AND meta_score_batting > ?
-                ORDER BY meta_score_batting DESC LIMIT 1
-            """, (pos, total_budget, current_meta + 5)).fetchone()
+                ORDER BY meta_score_batting DESC LIMIT 5
+            """, (pos, total_budget, current_meta + 5)).fetchall()
 
-        if card:
-            delta = (card['meta'] or 0) - current_meta
-            if delta > best_single_delta:
-                best_single_delta = delta
-                best_single = {
-                    'pos': pos,
-                    'card': short_name(card['card_title']),
-                    'card_title': card['card_title'],
-                    'meta': round(card['meta']),
-                    'price': card['last_10_price'],
-                    'delta': round(delta),
-                    'tier': card['tier_name'],
-                    'replaces': g['current_name'],
-                    'card_id': card['card_id'],
-                }
-
-    if best_single:
-        scenarios.append({
-            'label': '🎯 One Big Buy',
-            'description': f"Spend {best_single['price']:,} PP on a single elite upgrade",
-            'cards': [best_single],
-            'total_cost': best_single['price'],
-            'total_delta': best_single['delta'],
-            'remaining_pp': total_budget - best_single['price'],
-            'positions_improved': 1,
-        })
-
-    # Scenario 2: Best two cards (half budget each)
-    half_budget = total_budget // 2
-    best_pair = []
-    used_positions = set()
-
-    for g in gaps:
-        if len(best_pair) >= 2:
-            break
-        if g['has_owned_upgrade']:
-            continue
-        pos = g['pos']
-        if pos in used_positions:
-            continue
-        is_pit = g['type'] == 'pit'
-        current_meta = g['current_meta']
-
-        if is_pit:
-            card = c.execute("""
-                SELECT card_id, card_title, meta_score_pitching as meta, last_10_price, tier_name
-                FROM cards WHERE pitcher_role_name = ? AND owned = 0 AND last_10_price > 0
-                    AND last_10_price <= ? AND meta_score_pitching > ?
-                ORDER BY meta_score_pitching DESC LIMIT 1
-            """, (pos, half_budget, current_meta + 5)).fetchone()
-        else:
-            card = c.execute("""
-                SELECT card_id, card_title, meta_score_batting as meta, last_10_price, tier_name
-                FROM cards WHERE position_name = ? AND owned = 0 AND last_10_price > 0
-                    AND last_10_price <= ? AND meta_score_batting > ?
-                ORDER BY meta_score_batting DESC LIMIT 1
-            """, (pos, half_budget, current_meta + 5)).fetchone()
-
-        if card:
-            delta = (card['meta'] or 0) - current_meta
-            if delta > 5:
-                best_pair.append({
-                    'pos': pos,
-                    'card': short_name(card['card_title']),
-                    'card_title': card['card_title'],
-                    'meta': round(card['meta']),
-                    'price': card['last_10_price'],
-                    'delta': round(delta),
-                    'tier': card['tier_name'],
-                    'replaces': g['current_name'],
-                    'card_id': card['card_id'],
-                })
-                used_positions.add(pos)
-
-    if len(best_pair) == 2:
-        total_cost = sum(c['price'] for c in best_pair)
-        total_delta = sum(c['delta'] for c in best_pair)
-        scenarios.append({
-            'label': '⚖️ Two Balanced Buys',
-            'description': f"Spread across 2 weak spots ({half_budget:,} PP each)",
-            'cards': best_pair,
-            'total_cost': total_cost,
-            'total_delta': total_delta,
-            'remaining_pp': total_budget - total_cost,
-            'positions_improved': 2,
-        })
-
-    # Scenario 3: Best efficiency — maximize meta gain per PP
-    third_budget = total_budget // 3
-    efficiency_picks = []
-    used_pos_3 = set()
-
-    # Collect all candidates across positions, sort by efficiency
-    all_efficient = []
-    for g in gaps:
-        if g['has_owned_upgrade']:
-            continue
-        pos = g['pos']
-        is_pit = g['type'] == 'pit'
-        current_meta = g['current_meta']
-
-        if is_pit:
-            cards = c.execute("""
-                SELECT card_id, card_title, meta_score_pitching as meta, last_10_price, tier_name
-                FROM cards WHERE pitcher_role_name = ? AND owned = 0 AND last_10_price > 0
-                    AND last_10_price <= ? AND meta_score_pitching > ?
-                ORDER BY (meta_score_pitching - ?) * 1.0 / last_10_price DESC LIMIT 3
-            """, (pos, total_budget, current_meta + 5, current_meta)).fetchall()
-        else:
-            cards = c.execute("""
-                SELECT card_id, card_title, meta_score_batting as meta, last_10_price, tier_name
-                FROM cards WHERE position_name = ? AND owned = 0 AND last_10_price > 0
-                    AND last_10_price <= ? AND meta_score_batting > ?
-                ORDER BY (meta_score_batting - ?) * 1.0 / last_10_price DESC LIMIT 3
-            """, (pos, total_budget, current_meta + 5, current_meta)).fetchall()
-
-        for card in cards:
-            delta = (card['meta'] or 0) - current_meta
-            price = card['last_10_price'] or 1
-            all_efficient.append({
+        for card in rows:
+            price = card['last_10_price'] or 0
+            meta = card['meta'] or 0
+            delta = meta - current_meta
+            if price <= 0 or delta <= 0:
+                continue
+            # Two value metrics:
+            #   - efficiency: delta per 100 PP (how much meta gain for your PP)
+            #   - value_ratio: meta^2 / PP (rewards expensive elite cards too)
+            pool.append({
                 'pos': pos,
                 'card': short_name(card['card_title']),
                 'card_title': card['card_title'],
-                'meta': round(card['meta']),
+                'meta': round(meta),
                 'price': price,
                 'delta': round(delta),
-                'efficiency': round(delta / (price / 100), 1),
+                'efficiency': round(delta / (price / 100.0), 2),
+                'value_ratio': round((meta * meta) / price, 1),
                 'tier': card['tier_name'],
                 'replaces': g['current_name'],
                 'card_id': card['card_id'],
             })
 
-    all_efficient.sort(key=lambda x: -x['efficiency'])
+    c.close()
 
-    # Greedy pack: pick best efficiency cards that fit within budget
-    remaining = total_budget
-    for cand in all_efficient:
-        if cand['pos'] in used_pos_3:
-            continue
-        if cand['price'] <= remaining:
-            efficiency_picks.append(cand)
-            used_pos_3.add(cand['pos'])
+    if not pool:
+        return []
+
+    def _pick_best_per_position(candidates, key, n_positions, budget):
+        """Greedy: pick the best candidate per position (sorted by key), bounded
+        by budget and n_positions. Returns list of picked dicts."""
+        picks = []
+        used_positions = set()
+        remaining = budget
+        sorted_pool = sorted(candidates, key=lambda x: -x[key])
+        for cand in sorted_pool:
+            if cand['pos'] in used_positions:
+                continue
+            if cand['price'] > remaining:
+                continue
+            picks.append(cand)
+            used_positions.add(cand['pos'])
             remaining -= cand['price']
-            if len(efficiency_picks) >= 3:
+            if len(picks) >= n_positions:
                 break
+        return picks
 
-    if len(efficiency_picks) >= 2:
-        total_cost = sum(c['price'] for c in efficiency_picks)
-        total_delta = sum(c['delta'] for c in efficiency_picks)
+    scenarios = []
+
+    # ── Scenario 1: One Big Buy — single highest-delta card ──
+    one_big = max(pool, key=lambda x: x['delta'])
+    if one_big:
         scenarios.append({
-            'label': '📈 Max Efficiency',
-            'description': f"Best bang-for-buck: {len(efficiency_picks)} cards, max team meta gain",
-            'cards': efficiency_picks,
+            'label': '🎯 One Big Buy',
+            'description': f"Single elite upgrade — biggest meta jump for {one_big['price']:,} PP",
+            'cards': [one_big],
+            'total_cost': one_big['price'],
+            'total_delta': one_big['delta'],
+            'remaining_pp': total_budget - one_big['price'],
+            'positions_improved': 1,
+            'avg_value': one_big['efficiency'],
+        })
+
+    # ── Scenario 2: Two Balanced Buys — best 2 positions by delta ──
+    pair = _pick_best_per_position(pool, 'delta', 2, total_budget)
+    if len(pair) == 2:
+        total_cost = sum(x['price'] for x in pair)
+        total_delta = sum(x['delta'] for x in pair)
+        scenarios.append({
+            'label': '⚖️ Two Balanced Buys',
+            'description': f"Top 2 weak spots — balanced allocation",
+            'cards': pair,
             'total_cost': total_cost,
             'total_delta': total_delta,
             'remaining_pp': total_budget - total_cost,
-            'positions_improved': len(efficiency_picks),
+            'positions_improved': 2,
+            'avg_value': round(sum(x['efficiency'] for x in pair) / 2, 2),
         })
 
-    c.close()
+    # ── Scenario 3: Max Efficiency — greedy by efficiency (delta/PP) ──
+    eff_picks = _pick_best_per_position(pool, 'efficiency', 3, total_budget)
+    if len(eff_picks) >= 2:
+        total_cost = sum(x['price'] for x in eff_picks)
+        total_delta = sum(x['delta'] for x in eff_picks)
+        scenarios.append({
+            'label': '📈 Max Efficiency',
+            'description': f"Best meta-per-PP across {len(eff_picks)} positions",
+            'cards': eff_picks,
+            'total_cost': total_cost,
+            'total_delta': total_delta,
+            'remaining_pp': total_budget - total_cost,
+            'positions_improved': len(eff_picks),
+            'avg_value': round(sum(x['efficiency'] for x in eff_picks) / len(eff_picks), 2),
+        })
+
+    # ── Scenario 4: Value Hunt — pure meta^2/PP (rewards elite bargains) ──
+    value_picks = _pick_best_per_position(pool, 'value_ratio', 3, total_budget)
+    # Only include if it's DIFFERENT from Max Efficiency (otherwise redundant)
+    if len(value_picks) >= 2:
+        eff_ids = {p['card_id'] for p in eff_picks}
+        value_ids = {p['card_id'] for p in value_picks}
+        if eff_ids != value_ids:
+            total_cost = sum(x['price'] for x in value_picks)
+            total_delta = sum(x['delta'] for x in value_picks)
+            scenarios.append({
+                'label': '💎 Value Hunt',
+                'description': f"Elite cards at bargain prices — highest meta²/PP",
+                'cards': value_picks,
+                'total_cost': total_cost,
+                'total_delta': total_delta,
+                'remaining_pp': total_budget - total_cost,
+                'positions_improved': len(value_picks),
+                'avg_value': round(sum(x['efficiency'] for x in value_picks) / len(value_picks), 2),
+            })
+
+    # ── Scenario 5: Spread the Wealth — 4+ positions improved ──
+    # Prefer cheapest efficient upgrade per position for maximum breadth
+    spread_picks = _pick_best_per_position(pool, 'efficiency', 5, total_budget)
+    if len(spread_picks) >= 4:
+        total_cost = sum(x['price'] for x in spread_picks)
+        total_delta = sum(x['delta'] for x in spread_picks)
+        scenarios.append({
+            'label': '📊 Spread the Wealth',
+            'description': f"Broad team boost — {len(spread_picks)} positions improved",
+            'cards': spread_picks,
+            'total_cost': total_cost,
+            'total_delta': total_delta,
+            'remaining_pp': total_budget - total_cost,
+            'positions_improved': len(spread_picks),
+            'avg_value': round(sum(x['efficiency'] for x in spread_picks) / len(spread_picks), 2),
+        })
+
     return scenarios
 
 
@@ -567,15 +696,24 @@ with col_b2:
 # ============================================================
 # TAB LAYOUT
 # ============================================================
-tab_invest, tab_gaps, tab_browse, tab_perf, tab_ai = st.tabs([
+tab_invest, tab_gaps, tab_browse, tab_perf = st.tabs([
     "💡 Investment Plan", "🔍 Position Gaps", "🏪 Market Browser",
-    "📊 Performance vs Meta", "🤖 AI Advisor"
+    "📊 Performance vs Meta"
 ])
 
 # ============================================================
 # TAB: Investment Plan (THE core feature)
 # ============================================================
 with tab_invest:
+    # AI Advisor entry point — replaces the old in-page sub-tab. The buy-strategy
+    # questions (best single buy / 1 big vs 2 small / long-term plan) now live on
+    # the standalone /AI_Advisor page so there's only one AI surface to maintain.
+    st.page_link(
+        "pages/12_AI_Advisor.py",
+        label="🤖 Want AI advice on your buys? Open AI Advisor → Buy Strategy",
+        icon="\U0001f916",
+    )
+
     # Free upgrades first
     gaps = _get_position_gaps()
     free_upgrades = [g for g in gaps if g['has_owned_upgrade']]
@@ -598,7 +736,14 @@ with tab_invest:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Meta": st.column_config.ProgressColumn(min_value=200, max_value=800, format="%d"),
+                "Meta": st.column_config.ProgressColumn(
+                    min_value=200, max_value=800, format="%d",
+                    help=(
+                        "Overall meta — same number you'll see on Card Detail "
+                        "and Roster Optimizer. vs-LHP / vs-RHP splits are on "
+                        "Card Detail if you need them for matchup planning."
+                    ),
+                ),
                 "New Meta": st.column_config.ProgressColumn(min_value=200, max_value=800, format="%d"),
                 "+Gain": st.column_config.NumberColumn(format="+%d"),
             }
@@ -609,6 +754,43 @@ with tab_invest:
 
     # Budget scenarios
     st.subheader("💰 How Should You Spend Your PP?")
+    st.caption("Each scenario uses meta-per-PP value scoring to suggest a different shopping strategy.")
+
+    # Meta-reliability chip — tells the user how much to trust the scenarios
+    # that follow. The review calls this out as P0 because every page that
+    # sorts by meta is implicitly claiming that ordering is meaningful.
+    # Pitching chips use pos:SP / pos:RP (direct meta→WAR correlation) rather
+    # than pitching_sp / pitching_rp (Ridge-fit on ratings only). The meta
+    # formula's overlays/bonuses are what make it predictive; the Ridge-fit
+    # under-reports because it can't see those.
+    st.markdown(
+        f'<div style="margin-bottom: 8px;">Scenario reliability: '
+        f'{_meta_confidence_chip_html("batting", conn)}'
+        f'{_meta_confidence_chip_html("pos:SP", conn, "Pitching SP")}'
+        f'{_meta_confidence_chip_html("pos:RP", conn, "Pitching RP")}</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Sort-mode toggle ──
+    # Previously the "best scenario" was always picked by avg efficiency
+    # (meta gain per PP), which disagreed with the Position Gaps tab — that
+    # tab sorts by raw gap. Same data, different answers. This toggle lets
+    # the user decide which question they're answering:
+    #   Efficiency     → stretch PP the furthest (may skip the biggest gap)
+    #   Position Need  → fix the weakest slot first (may pay more per point)
+    #   Blended        → geometric mean of the two metrics, a middle ground
+    sort_mode = st.radio(
+        "Optimize for",
+        ["Efficiency", "Position Need", "Blended"],
+        index=0,
+        horizontal=True,
+        key="invest_sort_mode",
+        help=(
+            "**Efficiency**: best meta-gain per PP. Favors cheap upgrades. "
+            "**Position Need**: biggest raw meta gap. Favors fixing the weakest slot. "
+            "**Blended**: balances both (geometric mean)."
+        ),
+    )
 
     scenarios = _build_budget_scenarios(pp_budget)
 
@@ -618,33 +800,55 @@ with tab_invest:
         else:
             st.info(f"No meaningful upgrades found at {pp_budget:,} PP. Try increasing your budget.")
     else:
-        # Scenario comparison cards
-        cols = st.columns(len(scenarios))
-        best_scenario = max(scenarios, key=lambda s: s['total_delta'])
+        # "Best scenario" selection uses the active sort mode so it matches
+        # whatever question the user's asking. Position Need uses total_delta
+        # (raw meta gained); Blended uses total_delta * avg_value for a
+        # compromise between size-of-fix and value-per-PP.
+        def _scenario_score(s):
+            delta = s.get('total_delta', 0) or 0
+            val = s.get('avg_value', 0) or 0
+            if sort_mode == "Position Need":
+                return delta
+            if sort_mode == "Blended":
+                # Geometric mean: rewards scenarios strong on BOTH axes,
+                # penalizes scenarios that max one and ignore the other.
+                return (delta * val) ** 0.5
+            return val  # Efficiency
 
-        for i, scenario in enumerate(scenarios):
-            with cols[i]:
-                is_best = scenario == best_scenario
-                border = f"border: 2px solid {GOLD};" if is_best else "border: 1px solid #333;"
-                badge = " 👑" if is_best else ""
+        best_scenario = max(scenarios, key=_scenario_score)
 
-                st.markdown(f"""
-                <div style="background: #1a1a2e; {border} border-radius: 10px; padding: 15px; text-align: center;">
-                    <h3 style="margin: 0; color: {'#FFD700' if is_best else '#fff'};">{scenario['label']}{badge}</h3>
-                    <p style="color: #aaa; font-size: 0.85em; margin: 5px 0;">{scenario['description']}</p>
-                    <hr style="border-color: #333;">
-                    <div style="font-size: 2em; font-weight: bold; color: {'#66BB6A' if is_best else '#4FC3F7'};">
-                        +{scenario['total_delta']}
+        # Wrap scenario cards — 3 per row to avoid squishing when 5 scenarios exist
+        per_row = 3
+        for row_start in range(0, len(scenarios), per_row):
+            row = scenarios[row_start:row_start + per_row]
+            cols = st.columns(len(row))
+            for i, scenario in enumerate(row):
+                with cols[i]:
+                    is_best = scenario == best_scenario
+                    border = f"border: 2px solid {GOLD};" if is_best else "border: 1px solid #333;"
+                    badge = " 👑" if is_best else ""
+                    avg_val = scenario.get('avg_value', 0)
+
+                    st.markdown(f"""
+                    <div style="background: #1a1a2e; {border} border-radius: 10px; padding: 15px; text-align: center; min-height: 260px;">
+                        <h3 style="margin: 0; color: {'#FFD700' if is_best else '#fff'};">{scenario['label']}{badge}</h3>
+                        <p style="color: #aaa; font-size: 0.85em; margin: 5px 0;">{scenario['description']}</p>
+                        <hr style="border-color: #333;">
+                        <div style="font-size: 2em; font-weight: bold; color: {'#66BB6A' if is_best else '#4FC3F7'};">
+                            +{scenario['total_delta']}
+                        </div>
+                        <p style="color: #aaa; margin: 0;">Total Meta Gain</p>
+                        <p style="color: #FFD700; margin: 5px 0; font-weight: bold;">
+                            {avg_val} meta/100PP value
+                        </p>
+                        <p style="color: #ccc; margin-top: 8px;">
+                            <strong>{scenario['total_cost']:,} PP</strong> • {scenario['positions_improved']} position{'s' if scenario['positions_improved'] > 1 else ''}
+                        </p>
+                        <p style="color: #888; font-size: 0.8em;">
+                            {scenario['remaining_pp']:,} PP remaining
+                        </p>
                     </div>
-                    <p style="color: #aaa; margin: 0;">Total Meta Gain</p>
-                    <p style="color: #ccc; margin-top: 8px;">
-                        <strong>{scenario['total_cost']:,} PP</strong> • {scenario['positions_improved']} position{'s' if scenario['positions_improved'] > 1 else ''}
-                    </p>
-                    <p style="color: #888; font-size: 0.8em;">
-                        {scenario['remaining_pp']:,} PP remaining
-                    </p>
-                </div>
-                """, unsafe_allow_html=True)
+                    """, unsafe_allow_html=True)
 
         st.divider()
 
@@ -661,12 +865,34 @@ with tab_invest:
                     with c3:
                         st.metric("Cost", f"{card['price']:,} PP")
                     with c4:
+                        eff = card.get('efficiency')
+                        if eff is not None:
+                            st.metric("Value", f"{eff} m/100PP",
+                                      help="Meta gained per 100 PP spent (higher = better deal)")
                         trend = text_sparkline(card.get('card_id'), conn) if card.get('card_id') else ''
                         if trend:
-                            st.markdown(f"**Trend** {trend}")
-                        eff = card.get('efficiency')
-                        if eff:
-                            st.metric("Eff", f"{eff} meta/100PP")
+                            st.caption(f"Trend {trend}")
+
+                    # ── "Why this meta?" explainer (Tier-2 #10) ──
+                    # Lazy-fetch the full card row + run explain_meta() so the
+                    # user can see exactly which ratings drove this score.
+                    # Wrapped in a per-card expander so the section stays quiet
+                    # by default and only opens when the user wants the math.
+                    _cid = card.get('card_id')
+                    if _cid:
+                        with st.expander(
+                            f"\U0001f50d Why does {card['card']} score {card['meta']}?",
+                            expanded=False,
+                        ):
+                            try:
+                                _full = _fetch_card_for_explainer(conn, _cid)
+                                _is_pit = bool(_full and (_full.get('pitcher_role') or _full.get('pitcher_role_name')))
+                                _exp = explain_meta(_full or {}, is_pitcher=_is_pit) if _full else None
+                            except Exception as _e:
+                                _exp = None
+                                st.caption(f"(explainer unavailable: {_e})")
+                            _render_meta_explainer(_exp, key_prefix=f"buy_{_cid}")
+                    st.markdown("---")
 
         # Visual: meta gain per PP spent comparison
         if len(scenarios) >= 2:
@@ -704,7 +930,12 @@ with tab_invest:
 # ============================================================
 with tab_gaps:
     st.subheader("🔍 Position Strength Map")
-    st.caption("Sorted by biggest gap between your starter and the best available card on market")
+    st.caption(
+        "Sorted by biggest gap between your starter and the best available card on market. "
+        "This view answers **\"where am I weakest?\"** — it ignores PP cost. "
+        "The Investment Plan tab answers **\"where do I get the most meta per PP?\"** — "
+        "use the sort toggle there to switch between Efficiency and Position Need if the two tabs disagree."
+    )
 
     gaps = _get_position_gaps()
 
@@ -770,7 +1001,21 @@ with tab_gaps:
 
             gap_table.append(row)
 
-        st.dataframe(pd.DataFrame(gap_table), use_container_width=True, hide_index=True)
+        st.dataframe(
+            pd.DataFrame(gap_table),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Meta": st.column_config.NumberColumn(
+                    format="%d", width="small",
+                    help="Overall meta — same number used everywhere in the app. "
+                         "vs-LHP / vs-RHP splits are on Card Detail."),
+                "Gap": st.column_config.NumberColumn(
+                    format="%+d", width="small",
+                    help="How many meta points the best available upgrade is ahead of "
+                         "your current starter at this position."),
+            },
+        )
 
 # ============================================================
 # TAB: Browse Market
@@ -844,11 +1089,30 @@ with tab_browse:
             pd.DataFrame(data),
             use_container_width=True,
             hide_index=True,
+            height=min(35 * len(data) + 40, 560),
             column_config={
-                "Meta": st.column_config.ProgressColumn(min_value=200, max_value=800, format="%d"),
-                "Price": st.column_config.NumberColumn(format="%d PP"),
-                "+Meta": st.column_config.NumberColumn(format="+%d"),
-                "Eff": st.column_config.NumberColumn(format="%.1f", help="Meta gain per 100 PP spent"),
+                # Explicit widths on every column. Previously Card/Pos/Tier/Trend
+                # were unconfigured, and Streamlit's auto-sizer collapsed Pos/Tier
+                # to near zero-width when use_container_width allocated most space
+                # to Card + the ProgressColumn.
+                "Card": st.column_config.TextColumn(width="large"),
+                "Pos": st.column_config.TextColumn(width="small"),
+                "Tier": st.column_config.TextColumn(width="small"),
+                "Trend": st.column_config.TextColumn(width="small",
+                    help="30-day price trend sparkline"),
+                "+Meta": st.column_config.NumberColumn(format="+%d", width="small",
+                    help="Meta delta vs your current starter at this position"),
+                "Meta": st.column_config.ProgressColumn(
+                    min_value=200, max_value=800, format="%d", width="medium",
+                    help=(
+                        "Overall meta — same number you'll see on Card Detail "
+                        "and Roster Optimizer. vs-LHP / vs-RHP splits are on "
+                        "Card Detail if you need them for matchup planning."
+                    ),
+                ),
+                "Price": st.column_config.NumberColumn(format="%d PP", width="small"),
+                "Eff": st.column_config.NumberColumn(format="%.1f", width="small",
+                    help="Meta gain per 100 PP spent (higher = better deal)"),
             }
         )
 
@@ -974,7 +1238,14 @@ with tab_perf:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Meta": st.column_config.ProgressColumn(min_value=200, max_value=800, format="%d"),
+                "Meta": st.column_config.ProgressColumn(
+                    min_value=200, max_value=800, format="%d",
+                    help=(
+                        "Overall meta — same number you'll see on Card Detail "
+                        "and Roster Optimizer. vs-LHP / vs-RHP splits are on "
+                        "Card Detail if you need them for matchup planning."
+                    ),
+                ),
                 "Perf Meta": st.column_config.ProgressColumn(min_value=200, max_value=800, format="%d"),
                 "Δ": st.column_config.NumberColumn(format="%+d", help="Performance meta - card meta"),
                 "Gap": st.column_config.NumberColumn(format="%.2f", help="ERA - FIP (negative = lucky)"),
@@ -1048,7 +1319,14 @@ with tab_perf:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Meta": st.column_config.ProgressColumn(min_value=200, max_value=800, format="%d"),
+                "Meta": st.column_config.ProgressColumn(
+                    min_value=200, max_value=800, format="%d",
+                    help=(
+                        "Overall meta — same number you'll see on Card Detail "
+                        "and Roster Optimizer. vs-LHP / vs-RHP splits are on "
+                        "Card Detail if you need them for matchup planning."
+                    ),
+                ),
                 "Perf Meta": st.column_config.ProgressColumn(min_value=200, max_value=800, format="%d"),
                 "Δ": st.column_config.NumberColumn(format="%+d"),
             }
@@ -1056,76 +1334,5 @@ with tab_perf:
 
     if not pit_outliers and not bat_outliers:
         st.info("No performance data available yet. Import game stats first.")
-
-# ============================================================
-# TAB: AI Advisor
-# ============================================================
-with tab_ai:
-    st.subheader("🤖 AI Investment Advisor")
-
-    try:
-        from app.core.ai_advisor import get_ai_config, ask_advisor, get_market_analysis
-        ai_config = get_ai_config()
-
-        if not ai_config["ready"]:
-            st.warning(f"AI Advisor not configured: {ai_config['message']}")
-        else:
-            st.info(f"Connected: {ai_config['message']}")
-
-            # Pre-built questions with budget context
-            ai_col1, ai_col2, ai_col3 = st.columns(3)
-            with ai_col1:
-                if st.button("🎯 Best single buy?", type="primary", use_container_width=True):
-                    with st.spinner("Analyzing your roster + market..."):
-                        result = ask_advisor(
-                            f"My budget is {pp_budget:,} PP. What is the single best card I can buy "
-                            f"to improve my team the most? Consider my weakest positions, platoon splits, "
-                            f"and in-game performance. Be specific with card names and prices.",
-                            conn
-                        )
-                    if result.get("error"):
-                        st.error(result["error"])
-                    else:
-                        st.markdown(result["response"])
-
-            with ai_col2:
-                if st.button("⚖️ 1 big vs 2 small?", use_container_width=True):
-                    with st.spinner("Comparing investment strategies..."):
-                        result = ask_advisor(
-                            f"I have {pp_budget:,} PP. Should I buy 1 expensive card or 2 cheaper cards? "
-                            f"Compare the options — which gives better short-term improvement vs long-term "
-                            f"team health? Consider which positions have the biggest gaps.",
-                            conn
-                        )
-                    if result.get("error"):
-                        st.error(result["error"])
-                    else:
-                        st.markdown(result["response"])
-
-            with ai_col3:
-                if st.button("📈 Long-term plan?", use_container_width=True):
-                    with st.spinner("Building investment roadmap..."):
-                        result = ask_advisor(
-                            f"I have {pp_budget:,} PP now. Build me a 3-step investment plan: "
-                            f"what to buy now, what to save for next, and what my endgame targets are "
-                            f"at each weak position. Include price targets and priority order.",
-                            conn
-                        )
-                    if result.get("error"):
-                        st.error(result["error"])
-                    else:
-                        st.markdown(result["response"])
-
-            custom_q = st.text_input("Ask a custom question",
-                                      placeholder="e.g., Best SS under 5K PP? Should I buy Pfaadt or Anderson?")
-            if custom_q:
-                with st.spinner("Analyzing..."):
-                    result = ask_advisor(custom_q, conn)
-                if result.get("error"):
-                    st.error(result["error"])
-                else:
-                    st.markdown(result["response"])
-    except ImportError:
-        st.warning("AI Advisor not available.")
 
 conn.close()

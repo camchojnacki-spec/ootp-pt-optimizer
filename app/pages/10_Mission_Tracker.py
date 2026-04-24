@@ -7,8 +7,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.core.database import get_connection
 from app.core.mission_tracker import get_mission_progress, get_mission_summary, get_best_mission_buys
+from app.utils.sidebar_nav import render_sidebar_nav
 
 st.set_page_config(page_title="Mission Tracker", page_icon="🎯", layout="wide")
+render_sidebar_nav()
 st.title("Mission Tracker")
 st.caption("Track Live Card collection by team — own at least 1 per team for mission eligibility")
 

@@ -9,8 +9,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.core.database import get_connection
+from app.utils.sidebar_nav import render_sidebar_nav
 
 st.set_page_config(page_title="Game Stats", page_icon="📊", layout="wide")
+render_sidebar_nav()
 
 conn = get_connection()
 
@@ -104,10 +106,19 @@ if has_pitching:
     """, (latest_pit,))
 
     if not pit_df.empty:
-        pit_df["BF"] = (pit_df["ip"] * 3 + pit_df["hits_allowed"] + pit_df["bb"] + pit_df["hbp"]).astype(int).replace(0, 1)
+        # OOTP IP notation: the fraction is outs, not decimal innings.
+        # 6.1 IP = 6*3+1 = 19 outs, NOT 6.1*3 = 18.3. Using decimal math
+        # systematically under/overstates K% and BB% across the whole league.
+        ip_whole = pit_df["ip"].astype(int)
+        ip_outs = ((pit_df["ip"] * 10).round() % 10).astype(int)
+        total_outs = ip_whole * 3 + ip_outs
+        pit_df["BF"] = (total_outs + pit_df["hits_allowed"] + pit_df["bb"] + pit_df["hbp"]).astype(int).replace(0, 1)
         pit_df["K%"] = (pit_df["k"] / pit_df["BF"] * 100).round(1)
         pit_df["BB%"] = (pit_df["bb"] / pit_df["BF"] * 100).round(1)
         pit_df["K-BB%"] = (pit_df["K%"] - pit_df["BB%"]).round(1)
+        # WAR/200 still uses raw IP — the /200 denominator is a rate target,
+        # not an outs calc, so OOTP's .1=out notation is acceptable noise at
+        # the scale of a full-season rate.
         pit_df["WAR/200"] = (pit_df["war"] * 200 / pit_df["ip"]).round(1)
         pit_df["ERA-FIP"] = (pit_df["era"] - pit_df["fip"]).round(2)
         pit_df["Role"] = pit_df.apply(
@@ -115,22 +126,34 @@ if has_pitching:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# HEADER — Team vitals
+# HEADER — League-wide vitals
+#
+# These KPIs are computed across every player in batting_stats / pitching_stats
+# for the latest snapshot, which is league-wide (200+ batters, 100+ pitchers) —
+# NOT just the user's team. Previously the labels read "Team AVG/OPS/..." which
+# misled users into thinking they were looking at their own roster's numbers.
+# The review flagged this: a user trusts the label, sees "Team OPS .720", and
+# concludes their team is league-average when that number is literally the
+# league average.
 # ════════════════════════════════════════════════════════════════════════════════
 st.title("📊 Game Stats")
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 if not bat_df.empty:
-    c1.metric("Team AVG", f"{bat_df['avg'].mean():.3f}")
-    c2.metric("Team OPS", f"{bat_df['ops'].mean():.3f}")
-    c3.metric("Team HR", int(bat_df["hr"].sum()))
+    c1.metric("League AVG", f"{bat_df['avg'].mean():.3f}")
+    c2.metric("League OPS", f"{bat_df['ops'].mean():.3f}")
+    c3.metric("League HR", int(bat_df["hr"].sum()))
 if not pit_df.empty:
     sp_df = pit_df[pit_df["gs"] > 0]
-    c4.metric("Team ERA", f"{pit_df['era'].mean():.2f}")
-    c5.metric("Team WHIP", f"{pit_df['whip'].mean():.2f}")
-    c6.metric("SP ERA", f"{sp_df['era'].mean():.2f}" if not sp_df.empty else "N/A")
+    c4.metric("League ERA", f"{pit_df['era'].mean():.2f}")
+    c5.metric("League WHIP", f"{pit_df['whip'].mean():.2f}")
+    c6.metric("League SP ERA", f"{sp_df['era'].mean():.2f}" if not sp_df.empty else "N/A")
 
-st.caption(f"Latest snapshot: {latest_bat or latest_pit}")
+st.caption(
+    f"Latest snapshot: {latest_bat or latest_pit}  \u00b7  "
+    f"KPIs computed across {len(bat_df)} batters and {len(pit_df)} pitchers league-wide "
+    f"(PA \u2265 {MIN_PA}, IP \u2265 {MIN_IP})."
+)
 
 # ════════════════════════════════════════════════════════════════════════════════
 # TABS
@@ -820,6 +843,139 @@ with tab_meta:
                 )
                 st.plotly_chart(fig_mp, use_container_width=True)
 
+    # ── Per-position calibration table (Tier-2 #8) ──
+    # The scatters above answer "does meta predict performance" *globally* —
+    # but they hide the fact that e.g. CF meta is much more predictive than RP
+    # meta. This table reads the per-position rows persisted by
+    # ``calibrate_per_position`` and surfaces the spread so the user can see
+    # which positions to trust the formula on and which to second-guess.
+    st.divider()
+    st.markdown("### 📍 Per-Position Confidence")
+    with st.expander("ℹ️ What is this?", expanded=False):
+        st.markdown(
+            "The scatter plots above show how well meta predicts performance "
+            "*overall*. This table breaks that down **per position** — the "
+            "formula might be excellent for shortstops but weak for relievers, "
+            "and you want to know that before trusting a Buy Rec.\n\n"
+            "- **r** = Pearson correlation between meta and WAR (per 600 PA / "
+            "200 IP). Higher = formula tracks reality better.\n"
+            "- **R²** = fraction of WAR variance explained by meta linearly. "
+            "0.25 means \"meta explains 25% of the WAR spread\".\n"
+            "- **n** = sample size (cards with both a meta score and qualifying "
+            "playing time). Below 5 the row gets flagged as *insufficient*.\n\n"
+            "🟢 high (r ≥ 0.5) · 🟡 medium (r ≥ 0.3) · 🟠 low (r ≥ 0.1) · "
+            "🔴 very low (r < 0.1) · ⚪ insufficient sample"
+        )
+
+    try:
+        # Pull the latest per-position calibration rows. We use a window to
+        # collapse history down to one row per position so reruns don't pollute
+        # the table.
+        _pos_rows = conn.execute("""
+            SELECT calibration_type, correlation, r_squared, sample_size, created_at
+            FROM meta_calibration mc
+            WHERE calibration_type LIKE 'pos:%'
+              AND created_at = (
+                  SELECT MAX(created_at) FROM meta_calibration mc2
+                  WHERE mc2.calibration_type = mc.calibration_type
+              )
+            ORDER BY r_squared DESC
+        """).fetchall()
+    except Exception as _e:
+        _pos_rows = []
+        st.caption(f"(per-position table unavailable: {_e})")
+
+    if _pos_rows:
+        _BAT_POS = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH"}
+        _pos_data = []
+        for _pr in _pos_rows:
+            _pos_name = (_pr["calibration_type"] or "").replace("pos:", "")
+            _corr = _pr["correlation"] or 0.0
+            _r2 = _pr["r_squared"] or 0.0
+            _n = int(_pr["sample_size"] or 0)
+            _abs = abs(_corr)
+            if _n < 5:
+                _conf = "⚪ Insufficient"
+            elif _abs >= 0.5:
+                _conf = "🟢 High"
+            elif _abs >= 0.3:
+                _conf = "🟡 Medium"
+            elif _abs >= 0.1:
+                _conf = "🟠 Low"
+            else:
+                _conf = "🔴 Very Low"
+            _pos_data.append({
+                "Position": _pos_name,
+                "Side": "Bat" if _pos_name in _BAT_POS else "Pit",
+                "r": round(_corr, 2),
+                "R²": round(_r2, 2),
+                "n": _n,
+                "Confidence": _conf,
+            })
+
+        _pos_df = pd.DataFrame(_pos_data)
+        # Side-by-side: batting on the left, pitching on the right
+        _bat_df = _pos_df[_pos_df["Side"] == "Bat"].drop(columns=["Side"])
+        _pit_df = _pos_df[_pos_df["Side"] == "Pit"].drop(columns=["Side"])
+
+        _pcol1, _pcol2 = st.columns(2)
+        with _pcol1:
+            st.markdown("**Batting positions**")
+            if not _bat_df.empty:
+                st.dataframe(
+                    _bat_df, use_container_width=True, hide_index=True,
+                    column_config={
+                        "Position": st.column_config.TextColumn(width="small"),
+                        "r": st.column_config.NumberColumn(
+                            format="%+.2f", width="small",
+                            help="Pearson correlation between meta and WAR/600 PA"),
+                        "R²": st.column_config.NumberColumn(
+                            format="%.2f", width="small",
+                            help="Fraction of WAR variance explained by meta"),
+                        "n": st.column_config.NumberColumn(format="%d", width="small"),
+                        "Confidence": st.column_config.TextColumn(width="medium"),
+                    },
+                )
+            else:
+                st.caption("No batting positions calibrated yet.")
+        with _pcol2:
+            st.markdown("**Pitching roles**")
+            if not _pit_df.empty:
+                st.dataframe(
+                    _pit_df, use_container_width=True, hide_index=True,
+                    column_config={
+                        "Position": st.column_config.TextColumn(width="small"),
+                        "r": st.column_config.NumberColumn(
+                            format="%+.2f", width="small",
+                            help="Pearson correlation between meta and WAR/200 IP"),
+                        "R²": st.column_config.NumberColumn(
+                            format="%.2f", width="small",
+                            help="Fraction of WAR variance explained by meta"),
+                        "n": st.column_config.NumberColumn(format="%d", width="small"),
+                        "Confidence": st.column_config.TextColumn(width="medium"),
+                    },
+                )
+            else:
+                st.caption("No pitching roles calibrated yet.")
+
+        # Quick takeaway: which position is the meta formula best/worst at?
+        _ranked = [d for d in _pos_data if d["n"] >= 5]
+        if _ranked:
+            _ranked.sort(key=lambda d: abs(d["r"]), reverse=True)
+            _best = _ranked[0]
+            _worst = _ranked[-1]
+            st.caption(
+                f"📈 Strongest fit: **{_best['Position']}** (r={_best['r']:+.2f}, "
+                f"R²={_best['R²']:.2f}, n={_best['n']}) · "
+                f"📉 Weakest fit: **{_worst['Position']}** (r={_worst['r']:+.2f}, "
+                f"R²={_worst['R²']:.2f}, n={_worst['n']})"
+            )
+    else:
+        st.info(
+            "No per-position calibration data yet. Run the calibration below — "
+            "it'll populate this table as a side-effect."
+        )
+
     # ── Calibration Section ──
     st.divider()
     st.subheader("🔧 Auto-Calibrate Meta Weights")
@@ -887,7 +1043,41 @@ with tab_meta:
         with cal_col2:
             # Show current vs calibrated weight comparison
             from app.utils.constants import DEFAULT_BATTING_WEIGHTS, DEFAULT_PITCHING_WEIGHTS
+            from app.core.meta_scoring import (
+                get_weight_diagnostics, _load_pitching_weights_for_role,
+            )
             bw, pw, _ = get_weights_with_source()
+            diag = get_weight_diagnostics()
+            sp_w = _load_pitching_weights_for_role('SP') or {}
+            rp_w = _load_pitching_weights_for_role('RP') or {}
+
+            # Per-type status chips: show sample size, CV R², Pearson r per
+            # calibration row so the user can see which slices passed the
+            # gate and which fell back to defaults.
+            def _fmt(val, digits=3):
+                if val is None:
+                    return "—"
+                try:
+                    return f"{float(val):.{digits}f}"
+                except (ValueError, TypeError):
+                    return "—"
+
+            def _status_chip(label, key):
+                info = diag.get(key) or {}
+                status = info.get("status", "missing")
+                r2 = _fmt(info.get("r_squared"))
+                corr = _fmt(info.get("correlation"))
+                n = info.get("sample_size") or "—"
+                icon = {
+                    "used": "✅", "rejected_low_r2": "⚠️",
+                    "missing": "⬜", "error": "❌",
+                }.get(status, "⬜")
+                st.caption(f"{icon} **{label}** — n={n}, CV R²={r2}, Pearson r={corr}")
+
+            _status_chip("Batting", "batting")
+            _status_chip("Pitching (SP)", "pitching_sp")
+            _status_chip("Pitching (RP)", "pitching_rp")
+            _status_chip("Pitching (combined)", "pitching")
 
             w_col1, w_col2 = st.columns(2)
             with w_col1:
@@ -906,19 +1096,26 @@ with tab_meta:
                              height=320)
 
             with w_col2:
-                st.markdown("**Pitching Weights**")
+                st.markdown("**Pitching Weights — SP vs RP**")
                 pit_w_data = []
                 for stat in ['stuff', 'movement', 'control', 'p_hr', 'ovr', 'stamina_hold']:
                     default = DEFAULT_PITCHING_WEIGHTS.get(stat, 0)
-                    current = pw.get(stat, default)
+                    combined = pw.get(stat, default)
+                    sp_val = sp_w.get(stat, default) if sp_w else default
+                    rp_val = rp_w.get(stat, default) if rp_w else default
                     pit_w_data.append({
                         "Stat": stat.replace('_', ' ').title(),
                         "Default": round(default, 2),
-                        "Current": round(current, 2),
-                        "Δ": round(current - default, 2),
+                        "SP": round(sp_val, 2),
+                        "RP": round(rp_val, 2),
+                        "Combined": round(combined, 2),
                     })
                 st.dataframe(pd.DataFrame(pit_w_data), use_container_width=True, hide_index=True,
-                             height=250)
+                             height=280)
+                st.caption(
+                    "SP / RP columns come from separate calibration runs — the "
+                    "scorer now dispatches per-card based on pitcher_role_name."
+                )
 
     except Exception as e:
         st.warning(f"Calibration module not available: {e}")

@@ -7,7 +7,12 @@ import json
 import logging
 import math
 
-from app.core.database import get_connection
+from app.core.database import get_connection, load_config
+from app.utils.constants import DEFAULT_BATTING_WEIGHTS, DEFAULT_PITCHING_WEIGHTS
+# MIN_CALIBRATION_R2 is the threshold a calibration run must clear before its
+# weights are written to meta_calibration. Kept in meta_scoring.py as the
+# single source of truth so the load path and the write path agree.
+from app.core.meta_scoring import MIN_CALIBRATION_R2
 
 logger = logging.getLogger(__name__)
 
@@ -677,12 +682,20 @@ CREATE TABLE IF NOT EXISTS meta_calibration (
     confidence REAL,
     changes_json TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
+);
+-- Covers the hot query path in meta_scoring._load_calibration_row, which
+-- hits the table once per weight load with (calibration_type, MAX(created_at)).
+-- Without the index, the table scan cost grows linearly with calibration
+-- history (per-position rows multiply the row count) and calibration loads
+-- happen on every rec regen, every roster scorer call, and every page render
+-- that uses weights. Added 2026-04-15 with the meta_calibration rewrite.
+CREATE INDEX IF NOT EXISTS idx_meta_calibration_type_created
+    ON meta_calibration(calibration_type, created_at DESC);
 """
 
 
 def _ensure_calibration_table(conn):
-    """Create the meta_calibration table if it does not exist."""
+    """Create the meta_calibration table and its hot-path index if missing."""
     conn.executescript(_META_CALIBRATION_DDL)
 
 
@@ -700,21 +713,21 @@ def _r_squared(actual: list[float], predicted: list[float]) -> float:
 
 
 def auto_calibrate_weights(conn=None) -> dict:
-    """Run auto-calibration using team's actual performance data.
+    """Run auto-calibration — now a passthrough to ``meta_calibration.run_calibration``.
 
-    Uses robust individual-correlation-based weighting instead of OLS regression.
-    Blends empirical weights with default weights using a confidence factor
-    based on sample size (more data = more trust in empirical weights).
+    **2026-04-15 rewrite**: the old 480-line ElasticNetCV implementation was
+    replaced with a RidgeCV + NNLS + Bayesian-prior-blend calibrator living in
+    ``app.core.meta_calibration``. This function is kept for backward
+    compatibility with the ``7_Game_Stats.py`` UI button and any external
+    callers — it simply delegates to ``run_calibration`` and packages the
+    result into the legacy ``{batting_weights, pitching_weights, changes,
+    message, confidence, ...}`` shape.
 
-    Returns dict with:
-        batting_weights: calibrated batting weights dict
-        pitching_weights: calibrated pitching weights dict
-        batting_r2: R-squared of calibrated model
-        pitching_r2: R-squared of calibrated model
-        changes: list of {stat, old_weight, new_weight, reason} dicts
-        confidence: 0-1 confidence in calibration (based on sample size)
-        message: status
+    The per-position calibration sub-step (``calibrate_per_position``) still
+    runs here since it's a separate concern — those rows drive the per-position
+    confidence chips on Buy Recs / Roster Optimizer.
     """
+    from app.core.meta_calibration import run_calibration
     from app.utils.constants import DEFAULT_BATTING_WEIGHTS, DEFAULT_PITCHING_WEIGHTS
 
     close_conn = False
@@ -730,387 +743,130 @@ def auto_calibrate_weights(conn=None) -> dict:
         "changes": [],
         "confidence": 0.0,
         "message": "",
+        "rejected_writes": [],
     }
 
     try:
         _ensure_calibration_table(conn)
 
-        # ---------------------------------------------------------------
-        # BATTING CALIBRATION
-        # ---------------------------------------------------------------
-        bat_stat_cols = ["contact", "gap_power", "power", "eye", "avoid_ks", "babip"]
-        bat_weight_keys = ["contact", "gap_power", "power", "eye", "avoid_ks", "babip"]
-        # defense handled separately (computed, not a single card column)
+        # ── Delegate to the new calibrator ─────────────────────────────
+        summary = run_calibration(conn)
 
-        # Join cards with batting_stats using card_id (most reliable) or name fallback
-        bat_rows = conn.execute("""
-            SELECT c.card_title, c.contact, c.gap_power, c.power, c.eye,
-                   c.avoid_ks, c.babip, c.card_value,
-                   c.infield_range, c.infield_error, c.infield_arm,
-                   c.of_range, c.of_error, c.of_arm,
-                   c.catcher_ability, c.catcher_frame, c.catcher_arm,
-                   c.position, c.speed, c.stealing, c.baserunning,
-                   bs.war, bs.ops, bs.pa
-            FROM cards c
-            INNER JOIN batting_stats bs ON bs.card_id = c.card_id
-            INNER JOIN (
-                SELECT card_id, MAX(snapshot_date) as max_date
-                FROM batting_stats WHERE card_id IS NOT NULL
-                GROUP BY card_id
-            ) latest ON bs.card_id = latest.card_id
-                    AND bs.snapshot_date = latest.max_date
-            WHERE c.position != 1 AND bs.pa >= 100
-        """).fetchall()
+        bat = summary.get("batting") or {}
+        sp = summary.get("pitching_sp") or {}
+        rp = summary.get("pitching_rp") or {}
+        combined = summary.get("pitching") or {}
 
-        # Fallback: name matching for stats without card_id
-        if len(bat_rows) < 15:
+        # Batting result shaping
+        if "error" not in bat and bat.get("weights"):
+            result["batting_weights"] = bat["weights"]
+            result["batting_r2"] = bat.get("r_squared", 0.0) or 0.0
+            bat_confidence = bat.get("confidence", 0.0) or 0.0
+            bat_sample = bat.get("sample_size", 0) or 0
+
+            # Build a changes list from the prior (config) → blended values
             try:
-                seen_ids = {r["card_title"] for r in bat_rows}
-                extra = conn.execute("""
-                    SELECT c.card_title, c.contact, c.gap_power, c.power, c.eye,
-                           c.avoid_ks, c.babip, c.card_value,
-                           c.infield_range, c.infield_error, c.infield_arm,
-                           c.of_range, c.of_error, c.of_arm,
-                           c.catcher_ability, c.catcher_frame, c.catcher_arm,
-                           c.position, c.speed, c.stealing, c.baserunning,
-                           bs.war, bs.ops, bs.pa
-                    FROM cards c
-                    INNER JOIN batting_stats bs
-                        ON c.card_title LIKE '%' || bs.player_name || '%'
-                    INNER JOIN (
-                        SELECT player_name, MAX(snapshot_date) as max_date
-                        FROM batting_stats WHERE card_id IS NULL
-                        GROUP BY player_name
-                    ) latest ON bs.player_name = latest.player_name
-                            AND bs.snapshot_date = latest.max_date
-                    WHERE c.position != 1 AND bs.pa >= 100
-                """).fetchall()
-                for r in extra:
-                    if r["card_title"] not in seen_ids:
-                        bat_rows.append(r)
-                        seen_ids.add(r["card_title"])
+                cfg_bat = load_config().get("batting_weights", DEFAULT_BATTING_WEIGHTS)
             except Exception:
-                pass
-
-        bat_sample_size = len(bat_rows)
-        bat_calibrated = dict(DEFAULT_BATTING_WEIGHTS)
-        bat_confidence = 0.0
-        bat_r2 = 0.0
-
-        if bat_sample_size >= 15:
-            bat_confidence = min(1.0, bat_sample_size / 100.0)
-
-            from app.core.meta_scoring import calc_defense_score, calc_speed_score
-            import numpy as np
-            from sklearn.linear_model import ElasticNetCV
-            from sklearn.preprocessing import StandardScaler
-
-            # Build feature matrix: each row is a player, each column is a stat
-            all_bat_keys = bat_weight_keys + ["defense", "speed_stealing"]
-            X_raw = []
-            y_war = []
-
-            for row in bat_rows:
-                d = dict(row)
-                features = [_safe_float(d[col]) for col in bat_stat_cols]
-                features.append(calc_defense_score(d))
-                features.append(calc_speed_score(d))
-                X_raw.append(features)
-                y_war.append(_safe_float(d["war"]))
-
-            X = np.array(X_raw, dtype=np.float64)
-            y = np.array(y_war, dtype=np.float64)
-
-            # Elastic Net with 10-fold CV — handles correlated predictors
-            # (the paper's recommended approach for 7-8 features, n=400+)
-            scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X)
-
-            enet = ElasticNetCV(
-                l1_ratio=[0.1, 0.3, 0.5, 0.7, 0.9],
-                cv=min(10, bat_sample_size),
-                max_iter=5000,
-                positive=True,  # Force non-negative weights
-                n_jobs=-1,
-            )
-            enet.fit(X_scaled, y)
-            bat_r2 = enet.score(X_scaled, y)
-
-            # Convert standardized coefficients back to original scale
-            raw_coefs = enet.coef_ / scaler.scale_
-
-            # Scale coefficients to match total weight of defaults
-            default_total = sum(
-                DEFAULT_BATTING_WEIGHTS.get(k, 0.0) for k in all_bat_keys
-            )
-            coef_sum = raw_coefs.sum()
-            if coef_sum > 0:
-                scale_factor = default_total / coef_sum
-                empirical = {k: round(float(raw_coefs[i]) * scale_factor, 2)
-                             for i, k in enumerate(all_bat_keys)}
-
-                # Bayesian blend: n/(n+k) observed + k/(n+k) prior
-                # k=100 = moderate prior strength
-                k_prior = 100
-                blend_ratio = bat_sample_size / (bat_sample_size + k_prior)
-                for key in all_bat_keys:
-                    default_w = DEFAULT_BATTING_WEIGHTS.get(key, 0.0)
-                    emp_w = empirical.get(key, 0.0)
-                    new_w = round(default_w * (1.0 - blend_ratio) + emp_w * blend_ratio, 2)
-                    bat_calibrated[key] = new_w
-
-                # Record changes
-                for key in all_bat_keys:
-                    old_w = DEFAULT_BATTING_WEIGHTS.get(key, 0.0)
-                    new_w = bat_calibrated[key]
-                    if abs(new_w - old_w) >= 0.05:
-                        direction = "increased" if new_w > old_w else "decreased"
-                        coef_idx = all_bat_keys.index(key)
-                        result["changes"].append({
-                            "stat": key,
-                            "type": "batting",
-                            "old_weight": old_w,
-                            "new_weight": new_w,
-                            "reason": (
-                                f"{key} {direction} from {old_w:.2f} to {new_w:.2f} "
-                                f"(ElasticNet coef={raw_coefs[coef_idx]:.4f}, "
-                                f"n={bat_sample_size}, R2={bat_r2:.3f})"
-                            ),
-                        })
+                cfg_bat = DEFAULT_BATTING_WEIGHTS
+            for stat, new_w in bat["weights"].items():
+                old_w = cfg_bat.get(stat, DEFAULT_BATTING_WEIGHTS.get(stat, 0.0))
+                if abs(new_w - old_w) >= 0.05:
+                    direction = "increased" if new_w > old_w else "decreased"
+                    result["changes"].append({
+                        "stat": stat,
+                        "type": "batting",
+                        "old_weight": round(float(old_w), 4),
+                        "new_weight": round(float(new_w), 4),
+                        "reason": (
+                            f"{stat} {direction} from {old_w:.2f} to {new_w:.2f} "
+                            f"(Ridge+NNLS, n={bat_sample}, "
+                            f"R²={result['batting_r2']:.3f})"
+                        ),
+                    })
         else:
-            if bat_sample_size > 0:
-                result["message"] += (
-                    f"Batting: only {bat_sample_size} players with 100+ PA "
-                    f"(need 15). Using defaults. "
-                )
-            else:
-                result["message"] += "Batting: no matched players found. Using defaults. "
+            bat_confidence, bat_sample = 0.0, 0
+            if bat.get("error"):
+                result["message"] += f"Batting: {bat['error']} "
 
-        # ---------------------------------------------------------------
-        # PITCHING CALIBRATION
-        # ---------------------------------------------------------------
-        pitch_stat_cols = ["stuff", "movement", "control", "p_hr"]
-        pitch_weight_keys = ["stuff", "movement", "control", "p_hr"]
+        # Pitching result shaping — use the combined row for legacy weights,
+        # but flag SP and RP separately in the message so the user sees both.
+        if "error" not in combined and combined.get("weights"):
+            result["pitching_weights"] = combined["weights"]
+            result["pitching_r2"] = combined.get("r_squared", 0.0) or 0.0
+            pitch_confidence = combined.get("confidence", 0.0) or 0.0
+            pitch_sample = combined.get("sample_size", 0) or 0
 
-        pitch_rows = conn.execute("""
-            SELECT c.card_title, c.stuff, c.movement, c.control, c.p_hr,
-                   c.card_value, c.stamina, c.hold,
-                   ps.war, ps.era, ps.ip
-            FROM cards c
-            INNER JOIN pitching_stats ps ON ps.card_id = c.card_id
-            INNER JOIN (
-                SELECT card_id, MAX(snapshot_date) as max_date
-                FROM pitching_stats WHERE card_id IS NOT NULL
-                GROUP BY card_id
-            ) latest ON ps.card_id = latest.card_id
-                    AND ps.snapshot_date = latest.max_date
-            WHERE c.pitcher_role IS NOT NULL AND ps.ip >= 30
-        """).fetchall()
-
-        # Fallback: name matching for stats without card_id
-        if len(pitch_rows) < 10:
             try:
-                seen = {r["card_title"] for r in pitch_rows}
-                extra = conn.execute("""
-                    SELECT c.card_title, c.stuff, c.movement, c.control, c.p_hr,
-                           c.card_value, c.stamina, c.hold,
-                           ps.war, ps.era, ps.ip
-                    FROM cards c
-                    INNER JOIN pitching_stats ps
-                        ON c.card_title LIKE '%' || ps.player_name || '%'
-                    INNER JOIN (
-                        SELECT player_name, MAX(snapshot_date) as max_date
-                        FROM pitching_stats WHERE card_id IS NULL
-                        GROUP BY player_name
-                    ) latest ON ps.player_name = latest.player_name
-                            AND ps.snapshot_date = latest.max_date
-                    WHERE c.pitcher_role IS NOT NULL AND ps.ip >= 30
-                """).fetchall()
-                for r in extra:
-                    if r["card_title"] not in seen:
-                        pitch_rows.append(r)
-                        seen.add(r["card_title"])
+                cfg_pit = load_config().get("pitching_weights", DEFAULT_PITCHING_WEIGHTS)
             except Exception:
-                pass
-
-        pitch_sample_size = len(pitch_rows)
-        pitch_calibrated = dict(DEFAULT_PITCHING_WEIGHTS)
-        pitch_confidence = 0.0
-        pitch_r2 = 0.0
-
-        if pitch_sample_size >= 10:
-            pitch_confidence = min(1.0, pitch_sample_size / 100.0)
-
-            import numpy as np
-            from sklearn.linear_model import ElasticNetCV
-            from sklearn.preprocessing import StandardScaler
-
-            # Feature columns: core stats + interaction terms (SIERA precedent)
-            all_pitch_keys = pitch_weight_keys + [
-                "stuff_x_movement", "stuff_x_control", "movement_x_control"
-            ]
-            X_raw_p = []
-            y_war_p = []
-
-            for row in pitch_rows:
-                d = dict(row)
-                stu = _safe_float(d["stuff"])
-                mov = _safe_float(d["movement"])
-                ctrl = _safe_float(d["control"])
-                phr = _safe_float(d["p_hr"])
-                features = [stu, mov, ctrl, phr,
-                            stu * mov, stu * ctrl, mov * ctrl]
-                X_raw_p.append(features)
-                y_war_p.append(_safe_float(d["war"]))
-
-            X_p = np.array(X_raw_p, dtype=np.float64)
-            y_p = np.array(y_war_p, dtype=np.float64)
-
-            scaler_p = StandardScaler()
-            X_p_scaled = scaler_p.fit_transform(X_p)
-
-            enet_p = ElasticNetCV(
-                l1_ratio=[0.1, 0.3, 0.5, 0.7, 0.9],
-                cv=min(10, pitch_sample_size),
-                max_iter=5000,
-                positive=True,
-                n_jobs=-1,
-            )
-            enet_p.fit(X_p_scaled, y_p)
-            pitch_r2 = enet_p.score(X_p_scaled, y_p)
-
-            raw_coefs_p = enet_p.coef_ / scaler_p.scale_
-
-            # Scale main stats (first 4) to match default total, interactions separately
-            main_keys = pitch_weight_keys
-            interaction_keys = ["stuff_x_movement", "stuff_x_control", "movement_x_control"]
-            main_coefs = raw_coefs_p[:len(main_keys)]
-            interaction_coefs = raw_coefs_p[len(main_keys):]
-
-            default_total_p = sum(
-                DEFAULT_PITCHING_WEIGHTS.get(k, 0.0) for k in main_keys
-            )
-            main_sum = main_coefs.sum()
-            if main_sum > 0:
-                scale_p = default_total_p / main_sum
-                for i, key in enumerate(main_keys):
-                    empirical_w = float(main_coefs[i]) * scale_p
-                    k_prior = 100
-                    blend_ratio = pitch_sample_size / (pitch_sample_size + k_prior)
-                    default_w = DEFAULT_PITCHING_WEIGHTS.get(key, 0.0)
-                    pitch_calibrated[key] = round(
-                        default_w * (1.0 - blend_ratio) + empirical_w * blend_ratio, 2
-                    )
-
-                # Interaction weights: use raw scaled coefficients (small values)
-                for i, key in enumerate(interaction_keys):
-                    raw_val = float(interaction_coefs[i])
-                    default_w = DEFAULT_PITCHING_WEIGHTS.get(key, 0.01)
-                    pitch_calibrated[key] = round(
-                        default_w * 0.3 + raw_val * 0.7, 4
-                    )
-
-                # Record changes
-                for i, key in enumerate(all_pitch_keys):
-                    old_w = DEFAULT_PITCHING_WEIGHTS.get(key, 0.0)
-                    new_w = pitch_calibrated.get(key, old_w)
-                    if abs(new_w - old_w) >= 0.01:
-                        direction = "increased" if new_w > old_w else "decreased"
-                        result["changes"].append({
-                            "stat": key,
-                            "type": "pitching",
-                            "old_weight": old_w,
-                            "new_weight": new_w,
-                            "reason": (
-                                f"{key} {direction} from {old_w:.3f} to {new_w:.3f} "
-                                f"(ElasticNet coef={raw_coefs_p[i]:.5f}, "
-                                f"n={pitch_sample_size}, R2={pitch_r2:.3f})"
-                            ),
-                        })
+                cfg_pit = DEFAULT_PITCHING_WEIGHTS
+            for stat, new_w in combined["weights"].items():
+                old_w = cfg_pit.get(stat, DEFAULT_PITCHING_WEIGHTS.get(stat, 0.0))
+                threshold = 0.01 if "_x_" in stat else 0.05
+                if abs(new_w - old_w) >= threshold:
+                    direction = "increased" if new_w > old_w else "decreased"
+                    result["changes"].append({
+                        "stat": stat,
+                        "type": "pitching",
+                        "old_weight": round(float(old_w), 4),
+                        "new_weight": round(float(new_w), 4),
+                        "reason": (
+                            f"{stat} {direction} from {old_w:.3f} to {new_w:.3f} "
+                            f"(Ridge+NNLS combined SP+RP, n={pitch_sample}, "
+                            f"R²={result['pitching_r2']:.3f})"
+                        ),
+                    })
         else:
-            if pitch_sample_size > 0:
-                result["message"] += (
-                    f"Pitching: only {pitch_sample_size} pitchers with 30+ IP "
-                    f"(need 10). Using defaults. "
-                )
-            else:
-                result["message"] += "Pitching: no matched pitchers found. Using defaults. "
+            pitch_confidence, pitch_sample = 0.0, 0
+            if combined.get("error"):
+                result["message"] += f"Pitching (combined): {combined['error']} "
 
-        # ---------------------------------------------------------------
-        # Store results
-        # ---------------------------------------------------------------
-        overall_confidence = 0.0
-        if bat_sample_size >= 15 and pitch_sample_size >= 10:
+        # Report SP/RP split R² in the message even when below gate
+        if "error" not in sp:
+            result["message"] += (
+                f"SP R²={sp.get('r_squared', 0):.3f} (n={sp.get('sample_size', 0)}). "
+            )
+        if "error" not in rp:
+            result["message"] += (
+                f"RP R²={rp.get('r_squared', 0):.3f} (n={rp.get('sample_size', 0)}). "
+            )
+
+        # Overall confidence: average of the two sub-confidences, weighted
+        if bat_sample >= 15 and pitch_sample >= 10:
             overall_confidence = (bat_confidence + pitch_confidence) / 2.0
-        elif bat_sample_size >= 15:
+        elif bat_sample >= 15:
             overall_confidence = bat_confidence * 0.5
-        elif pitch_sample_size >= 10:
+        elif pitch_sample >= 10:
             overall_confidence = pitch_confidence * 0.5
-
-        result["batting_weights"] = bat_calibrated
-        result["pitching_weights"] = pitch_calibrated
-        result["batting_r2"] = round(bat_r2, 4)
-        result["pitching_r2"] = round(pitch_r2, 4)
+        else:
+            overall_confidence = 0.0
         result["confidence"] = round(overall_confidence, 3)
 
-        # Persist to DB
-        if bat_sample_size >= 15:
-            conn.execute(
-                "INSERT INTO meta_calibration "
-                "(calibration_type, weights_json, r_squared, correlation, "
-                "sample_size, confidence, changes_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    "batting",
-                    json.dumps(bat_calibrated),
-                    bat_r2,
-                    _pearson_correlation(
-                        [_safe_float(p["war"]) for p in bat_rows],
-                        [sum(
-                            _safe_float(p[col]) * bat_calibrated.get(col, 0.0)
-                            for col in bat_stat_cols
-                        ) for p in bat_rows],
-                    ) if bat_rows else 0.0,
-                    bat_sample_size,
-                    bat_confidence,
-                    json.dumps([c for c in result["changes"] if c["type"] == "batting"]),
-                ),
-            )
-
-        if pitch_sample_size >= 10:
-            conn.execute(
-                "INSERT INTO meta_calibration "
-                "(calibration_type, weights_json, r_squared, correlation, "
-                "sample_size, confidence, changes_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    "pitching",
-                    json.dumps(pitch_calibrated),
-                    pitch_r2,
-                    _pearson_correlation(
-                        [_safe_float(p["war"]) for p in pitch_rows],
-                        [sum(
-                            _safe_float(p[col]) * pitch_calibrated.get(col, 0.0)
-                            for col in pitch_stat_cols
-                        ) for p in pitch_rows],
-                    ) if pitch_rows else 0.0,
-                    pitch_sample_size,
-                    pitch_confidence,
-                    json.dumps([c for c in result["changes"] if c["type"] == "pitching"]),
-                ),
-            )
-
         conn.commit()
+
+        # ── Per-position calibration (Tier-2 #8) ──
+        # Run alongside the global calibration so the per-position chips on
+        # Buy Recs / Roster Optimizer always reflect the latest stats. Keep
+        # any failure non-fatal — the global calibration is the load-bearing
+        # path and shouldn't break if a position bucket has weird data.
+        try:
+            pos_result = calibrate_per_position(conn)
+            result["per_position"] = pos_result.get("by_position", {})
+            if pos_result.get("message"):
+                result["message"] += " " + pos_result["message"]
+        except Exception as e:
+            logger.warning(f"Per-position calibration sub-step failed: {e}")
 
         changes_count = len(result["changes"])
         if changes_count > 0:
             result["message"] += (
                 f"Calibration complete: {changes_count} weight(s) adjusted. "
-                f"Batting R2={bat_r2:.3f} (n={bat_sample_size}), "
-                f"Pitching R2={pitch_r2:.3f} (n={pitch_sample_size}). "
+                f"Batting R²={result['batting_r2']:.3f} (n={bat_sample}), "
+                f"Pitching R²={result['pitching_r2']:.3f} (n={pitch_sample}). "
                 f"Confidence={overall_confidence:.1%}."
             )
-        elif bat_sample_size >= 15 or pitch_sample_size >= 10:
+        elif bat_sample >= 15 or pitch_sample >= 10:
             result["message"] += (
                 "Calibration ran but defaults are already well-aligned with performance. "
                 "No weight changes needed."
@@ -1123,6 +879,255 @@ def auto_calibrate_weights(conn=None) -> dict:
         result["message"] = f"Calibration error: {e}"
         return result
 
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def calibrate_per_position(conn=None) -> dict:
+    """Compute per-position correlation/R\u00b2 between meta_score and observed WAR.
+
+    The global ``auto_calibrate_weights`` answers "how well does the meta
+    formula predict performance overall?" but it can't tell the user whether
+    e.g. catcher meta is much less reliable than shortstop meta. Per-position
+    calibration fills that gap so the UI can render position-specific trust
+    chips on Buy Recs / Roster Optimizer / Sell Recs.
+
+    For each position (batting and pitching role), this:
+      1. Loads the latest stat snapshot per player at that position.
+      2. Computes Pearson r and R\u00b2 between meta_score and a perf metric:
+         - Batters: WAR scaled to /600 PA so part-time players don't anchor low
+         - Pitchers: WAR scaled to /200 IP for the same reason
+      3. Persists one row per position into ``meta_calibration`` with
+         ``calibration_type = 'pos:<POSITION>'``.
+
+    Returns a dict::
+        {
+          "by_position": {
+            "C":  {"correlation": 0.41, "r_squared": 0.17, "sample_size": 8},
+            "SS": {"correlation": 0.62, "r_squared": 0.38, "sample_size": 11},
+            ...
+          },
+          "message": "...",
+        }
+
+    The per-position rows live alongside the existing ``batting`` / ``pitching``
+    rows; they're discoverable via ``get_meta_confidence_by_position``.
+    """
+    close_conn = False
+    if conn is None:
+        conn = get_connection()
+        close_conn = True
+
+    out: dict = {"by_position": {}, "message": ""}
+
+    try:
+        _ensure_calibration_table(conn)
+
+        # ── Batters ──
+        # Pull every batter with a current meta + a perf row, latest snapshot
+        # per player. Keep PA gating modest (>= 30) so early-season catchers
+        # and platoon guys still contribute — the per-position table is meant
+        # to be descriptive, not predictive.
+        bat_rows = conn.execute("""
+            SELECT c.position_name as pos, c.meta_score_batting as meta,
+                   bs.war, bs.pa
+            FROM cards c
+            INNER JOIN batting_stats bs ON bs.card_id = c.card_id
+            INNER JOIN (
+                SELECT card_id, MAX(snapshot_date) as max_date
+                FROM batting_stats WHERE card_id IS NOT NULL
+                GROUP BY card_id
+            ) latest ON bs.card_id = latest.card_id
+                    AND bs.snapshot_date = latest.max_date
+            WHERE c.position_name IS NOT NULL
+              AND c.meta_score_batting > 0
+              AND bs.pa >= 30
+        """).fetchall()
+
+        # Bucket by position
+        pos_buckets: dict[str, list[tuple[float, float]]] = {}
+        for r in bat_rows:
+            pos = r["pos"]
+            war = _safe_float(r["war"])
+            pa = _safe_float(r["pa"])
+            meta = _safe_float(r["meta"])
+            if pa <= 0 or meta <= 0:
+                continue
+            war600 = war * 600.0 / pa
+            pos_buckets.setdefault(pos, []).append((meta, war600))
+
+        # ── Pitchers ──
+        pit_rows = conn.execute("""
+            SELECT c.pitcher_role_name as pos, c.meta_score_pitching as meta,
+                   ps.war, ps.ip
+            FROM cards c
+            INNER JOIN pitching_stats ps ON ps.card_id = c.card_id
+            INNER JOIN (
+                SELECT card_id, MAX(snapshot_date) as max_date
+                FROM pitching_stats WHERE card_id IS NOT NULL
+                GROUP BY card_id
+            ) latest ON ps.card_id = latest.card_id
+                    AND ps.snapshot_date = latest.max_date
+            WHERE c.pitcher_role_name IS NOT NULL
+              AND c.meta_score_pitching > 0
+              AND ps.ip >= 10
+        """).fetchall()
+
+        for r in pit_rows:
+            pos = r["pos"]
+            war = _safe_float(r["war"])
+            ip = _safe_float(r["ip"])
+            meta = _safe_float(r["meta"])
+            if ip <= 0 or meta <= 0:
+                continue
+            war200 = war * 200.0 / ip
+            pos_buckets.setdefault(pos, []).append((meta, war200))
+
+        # Compute per-position stats and persist
+        persisted = 0
+        for pos, pairs in pos_buckets.items():
+            n = len(pairs)
+            if n < 5:
+                # Too few samples to trust the correlation — still record so
+                # the UI can show "n=3 — insufficient" instead of going dark.
+                out["by_position"][pos] = {
+                    "correlation": 0.0,
+                    "r_squared": 0.0,
+                    "sample_size": n,
+                }
+                continue
+            xs = [p[0] for p in pairs]
+            ys = [p[1] for p in pairs]
+            corr = _pearson_correlation(xs, ys)
+            # R\u00b2 here means "squared correlation" — i.e. fraction of
+            # variance in WAR explainable by a linear meta map. We deliberately
+            # do NOT use the residual-based _r_squared() helper because we have
+            # no fitted model in this lightweight per-position pass.
+            r2 = corr * corr
+            out["by_position"][pos] = {
+                "correlation": round(corr, 3),
+                "r_squared": round(r2, 3),
+                "sample_size": n,
+            }
+            try:
+                conn.execute(
+                    "INSERT INTO meta_calibration "
+                    "(calibration_type, weights_json, r_squared, correlation, "
+                    "sample_size, confidence, changes_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        f"pos:{pos}",
+                        "{}",  # no per-position weights stored — only stats
+                        r2,
+                        corr,
+                        n,
+                        min(1.0, n / 50.0),
+                        "[]",
+                    ),
+                )
+                persisted += 1
+            except Exception as e:
+                logger.warning(f"Failed to persist per-position calibration for {pos}: {e}")
+
+        conn.commit()
+        out["message"] = (
+            f"Per-position calibration: {persisted} positions stored "
+            f"({len(out['by_position'])} buckets total)."
+        )
+        return out
+
+    except Exception as e:
+        logger.error(f"Per-position calibration error: {e}", exc_info=True)
+        out["message"] = f"Error: {e}"
+        return out
+
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def get_meta_confidence_by_position(position: str, conn=None) -> dict:
+    """Return the latest per-position confidence chip for ``position``.
+
+    Same shape as ``get_meta_confidence`` but reads ``calibration_type =
+    'pos:<position>'`` rows. Falls back to the broader batting/pitching chip
+    when the position-specific row is missing or has too few samples.
+    """
+    close_conn = False
+    if conn is None:
+        conn = get_connection()
+        close_conn = True
+
+    BATTING_POSITIONS = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH"}
+
+    try:
+        _ensure_calibration_table(conn)
+        row = conn.execute(
+            "SELECT correlation, r_squared, sample_size "
+            "FROM meta_calibration WHERE calibration_type = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (f"pos:{position}",),
+        ).fetchone()
+
+        if not row or int(row["sample_size"] or 0) < 5:
+            # Fallback to broader chip — better than going dark
+            fallback_cat = "batting" if position in BATTING_POSITIONS else "pitching"
+            base = get_meta_confidence(fallback_cat, conn)
+            base["category"] = position
+            base["fallback"] = True
+            return base
+
+        corr = _safe_float(row["correlation"])
+        r2 = _safe_float(row["r_squared"])
+        n = int(row["sample_size"])
+        abs_corr = abs(corr)
+
+        if n < 5:
+            level, label_prefix, emoji, color = (
+                "none", "Insufficient data", "\u26aa", "#555555",
+            )
+        elif abs_corr >= 0.5:
+            level, label_prefix, emoji, color = (
+                "high", "High", "\U0001f7e2", "#2E7D32",
+            )
+        elif abs_corr >= 0.3:
+            level, label_prefix, emoji, color = (
+                "medium", "Medium", "\U0001f7e1", "#F9A825",
+            )
+        elif abs_corr >= 0.1:
+            level, label_prefix, emoji, color = (
+                "low", "Low", "\U0001f7e0", "#EF6C00",
+            )
+        else:
+            level, label_prefix, emoji, color = (
+                "low", "Very Low", "\U0001f534", "#C62828",
+            )
+
+        return {
+            "category": position,
+            "correlation": round(corr, 3),
+            "r_squared": round(r2, 3),
+            "sample_size": n,
+            "level": level,
+            "label": f"{label_prefix} (r={corr:.2f}, n={n})",
+            "emoji": emoji,
+            "color": color,
+            "fallback": False,
+        }
+    except Exception as e:
+        logger.error(f"get_meta_confidence_by_position failed for {position}: {e}", exc_info=True)
+        return {
+            "category": position,
+            "correlation": 0.0,
+            "r_squared": 0.0,
+            "sample_size": 0,
+            "level": "none",
+            "label": "Error",
+            "emoji": "\u26aa",
+            "color": "#555555",
+            "fallback": True,
+        }
     finally:
         if close_conn:
             conn.close()
@@ -1184,6 +1189,110 @@ def apply_calibrated_weights(conn=None) -> tuple[dict, dict]:
     except Exception as e:
         logger.error(f"Error loading calibrated weights: {e}", exc_info=True)
         return dict(DEFAULT_BATTING_WEIGHTS), dict(DEFAULT_PITCHING_WEIGHTS)
+
+    finally:
+        if close_conn:
+            conn.close()
+
+
+def get_meta_confidence(category: str = "batting", conn=None) -> dict:
+    """Return the latest observed correlation between meta_score and real
+    in-game performance for a category ("batting" or "pitching"), bucketed
+    into a coarse label the UI can show as a chip.
+
+    This reads the newest row from `meta_calibration` for the category. The
+    `correlation` field on that table is the Pearson r from the last full
+    calibration run (see `calibrate_meta_weights`). The chip gives users a
+    one-glance answer to "can I trust the meta sort on this page?" — the
+    review made this a P0 ask: every page that shows a meta-ordered list is
+    implicitly claiming the ordering is useful, and without the chip the user
+    has no way to know whether that claim holds.
+
+    Returns a dict with:
+        category:   passed-through ("batting" / "pitching")
+        correlation: float  (0.0 if no calibration has been run)
+        r_squared:   float
+        sample_size: int
+        level:       "high" / "medium" / "low" / "none"
+        label:       short text e.g. "High (r=0.52)" / "No data"
+        emoji:       single char visual marker
+        color:       hex color for the chip background
+
+    Thresholds are deliberately generous — the review calls out that even
+    r=0.3 is more useful than nothing, and r=0.5+ is the "trust it" zone.
+    """
+    close_conn = False
+    if conn is None:
+        conn = get_connection()
+        close_conn = True
+
+    default = {
+        "category": category,
+        "correlation": 0.0,
+        "r_squared": 0.0,
+        "sample_size": 0,
+        "level": "none",
+        "label": "No calibration yet",
+        "emoji": "\u26aa",
+        "color": "#555555",
+    }
+
+    try:
+        _ensure_calibration_table(conn)
+        row = conn.execute(
+            "SELECT correlation, r_squared, sample_size "
+            "FROM meta_calibration WHERE calibration_type = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (category,),
+        ).fetchone()
+        if not row:
+            return default
+
+        corr = _safe_float(row["correlation"])
+        r2 = _safe_float(row["r_squared"])
+        n = int(row["sample_size"] or 0)
+
+        # Treat absolute correlation — a strongly negative correlation is
+        # still informative, just inverted. In practice correlation here is
+        # nonnegative because the formula is sign-aligned, but guard for it.
+        abs_corr = abs(corr)
+        if n < 20:
+            level, label_prefix, emoji, color = (
+                "none", "Insufficient data", "\u26aa", "#555555",
+            )
+        elif abs_corr >= 0.5:
+            level, label_prefix, emoji, color = (
+                "high", "High", "\U0001f7e2", "#2E7D32",
+            )
+        elif abs_corr >= 0.3:
+            level, label_prefix, emoji, color = (
+                "medium", "Medium", "\U0001f7e1", "#F9A825",
+            )
+        elif abs_corr >= 0.1:
+            level, label_prefix, emoji, color = (
+                "low", "Low", "\U0001f7e0", "#EF6C00",
+            )
+        else:
+            level, label_prefix, emoji, color = (
+                "low", "Very Low", "\U0001f534", "#C62828",
+            )
+
+        label = f"{label_prefix} (r={corr:.2f})" if level != "none" else label_prefix
+
+        return {
+            "category": category,
+            "correlation": round(corr, 3),
+            "r_squared": round(r2, 3),
+            "sample_size": n,
+            "level": level,
+            "label": label,
+            "emoji": emoji,
+            "color": color,
+        }
+
+    except Exception as e:
+        logger.error(f"get_meta_confidence failed: {e}", exc_info=True)
+        return default
 
     finally:
         if close_conn:

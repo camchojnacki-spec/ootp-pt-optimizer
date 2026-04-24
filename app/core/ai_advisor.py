@@ -291,22 +291,31 @@ def _build_portfolio_context(conn) -> str:
 
 
 def _call_gemini(system_prompt: str, user_message: str, ai_config: dict,
-                  max_tokens: int = 1024) -> dict:
-    """Call Google Gemini API."""
+                  max_tokens: int = 1024, response_schema: dict = None) -> dict:
+    """Call Google Gemini API.
+
+    If response_schema is provided, enforces JSON output matching the schema
+    (via response_mime_type='application/json').
+    """
     from google import genai
     from google.genai import types
 
     client = genai.Client(api_key=ai_config["api_key"])
     model = ai_config.get("model", "gemini-2.0-flash")
 
+    config_kwargs = {
+        "system_instruction": system_prompt,
+        "temperature": 0.3,
+        "max_output_tokens": max_tokens,
+    }
+    if response_schema is not None:
+        config_kwargs["response_mime_type"] = "application/json"
+        config_kwargs["response_schema"] = response_schema
+
     resp = client.models.generate_content(
         model=model,
         contents=user_message,
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=0.3,
-            max_output_tokens=max_tokens,
-        ),
+        config=types.GenerateContentConfig(**config_kwargs),
     )
 
     text = resp.text or ""
@@ -1153,6 +1162,7 @@ def ai_optimize_all_positions(upgrade_plan: list, conn, perf_bat: dict = None,
                             'emoji': emoji,
                             'action': action or 'Keep',
                             'card_name': card_name,
+                            'current_name': current_name,
                             'replaces': replaces,
                             'platoon_partner': platoon_partner,
                             'reason': reason,
@@ -1354,9 +1364,110 @@ def _build_manager_review_context(conn) -> str:
         if record_row:
             lines.append(f"CURRENT RECORD: {record_row['team_record']} ({record_row['games_played']} games)")
         if team_perf and team_perf['ops']:
-            lines.append(f"TEAM OPS: {team_perf['ops']:.3f}")
+            lines.append(f"TEAM OPS (player avg): {team_perf['ops']:.3f}")
         if team_pitch and team_pitch['era']:
-            lines.append(f"TEAM ERA: {team_pitch['era']:.2f} WHIP: {team_pitch['whip']:.2f}")
+            lines.append(f"TEAM ERA (player avg): {team_pitch['era']:.2f} WHIP: {team_pitch['whip']:.2f}")
+    except Exception:
+        pass
+
+    # ── League framing — rank us against the other 29 teams using the
+    # league_team_stats table (populated from lb124_statistics_team_* CSVs).
+    # This gives the model relative context: are we top-5 offense or last?
+    # Is our pitching actually bad or does it just look bad in isolation?
+    try:
+        from app.core.database import load_config as _load_cfg
+        _cfg = _load_cfg()
+        _our_team = _cfg.get("team_name", "Toronto Dark Knights")
+
+        _league_filter_sql = "WHERE league_id = ?" if active_league else "WHERE 1=1"
+        _league_params = (active_league,) if active_league else ()
+
+        _league_rows = conn.execute(
+            f"""
+            SELECT team_name, ops, era, fip_minus, runs, runs_allowed,
+                   wins, losses, pf_overall, park_name,
+                   snapshot_date
+            FROM league_team_stats
+            {_league_filter_sql}
+              AND snapshot_date = (
+                  SELECT MAX(snapshot_date) FROM league_team_stats {_league_filter_sql}
+              )
+            ORDER BY ops DESC
+            """,
+            _league_params + _league_params,
+        ).fetchall()
+
+        if _league_rows:
+            _n = len(_league_rows)
+
+            def _rank_of(sorted_rows, team):
+                for i, r in enumerate(sorted_rows, start=1):
+                    if r['team_name'] == team:
+                        return i
+                return None
+
+            _by_ops = _league_rows  # already sorted by OPS desc
+            _by_era = sorted(_league_rows, key=lambda r: (r['era'] or 99.0))
+            _by_fip = sorted(_league_rows, key=lambda r: (r['fip_minus'] or 999))
+            _by_runs_for = sorted(_league_rows, key=lambda r: -(r['runs'] or 0))
+            _by_runs_against = sorted(_league_rows, key=lambda r: (r['runs_allowed'] or 99999))
+
+            _ops_vals = [r['ops'] for r in _league_rows if r['ops']]
+            _era_vals = [r['era'] for r in _league_rows if r['era'] is not None]
+            _fip_vals = [r['fip_minus'] for r in _league_rows if r['fip_minus']]
+
+            _ops_avg = sum(_ops_vals) / len(_ops_vals) if _ops_vals else None
+            _era_avg = sum(_era_vals) / len(_era_vals) if _era_vals else None
+            _fip_avg = sum(_fip_vals) / len(_fip_vals) if _fip_vals else None
+
+            _us = next((r for r in _league_rows if r['team_name'] == _our_team), None)
+
+            lines.append("")
+            lines.append(f"LEAGUE CONTEXT ({active_league or '?'}, {_n} teams, team totals this season):")
+            if _ops_avg is not None:
+                lines.append(f"  League avg OPS: {_ops_avg:.3f}")
+            if _era_avg is not None:
+                lines.append(f"  League avg ERA: {_era_avg:.2f}")
+            if _fip_avg is not None:
+                lines.append(f"  League avg FIP-: {_fip_avg:.0f} (100 = league avg, lower=better)")
+
+            if _us:
+                _r_ops = _rank_of(_by_ops, _our_team)
+                _r_era = _rank_of(_by_era, _our_team)
+                _r_fip = _rank_of(_by_fip, _our_team)
+                _r_rf = _rank_of(_by_runs_for, _our_team)
+                _r_ra = _rank_of(_by_runs_against, _our_team)
+                _us_ops = _us['ops']
+                _us_era = _us['era']
+                _us_fip = _us['fip_minus']
+                _us_rf = _us['runs']
+                _us_ra = _us['runs_allowed']
+                _us_w = _us['wins']
+                _us_l = _us['losses']
+                _pf = _us['pf_overall']
+                _park = _us['park_name']
+
+                lines.append("")
+                lines.append(f"OUR TEAM ({_our_team}) vs league — actual team totals:")
+                if _us_w is not None and _us_l is not None:
+                    lines.append(f"  Record: {_us_w}-{_us_l}")
+                if _us_ops is not None and _r_ops:
+                    lines.append(f"  Team OPS: {_us_ops:.3f} (rank {_r_ops}/{_n})")
+                if _us_rf is not None and _r_rf:
+                    lines.append(f"  Runs scored: {_us_rf} (rank {_r_rf}/{_n})")
+                if _us_era is not None and _r_era:
+                    lines.append(f"  Team ERA: {_us_era:.2f} (rank {_r_era}/{_n}, lower=better)")
+                if _us_fip is not None and _r_fip:
+                    lines.append(f"  Team FIP-: {_us_fip} (rank {_r_fip}/{_n}, 100=avg, lower=better)")
+                if _us_ra is not None and _r_ra:
+                    lines.append(f"  Runs allowed: {_us_ra} (rank {_r_ra}/{_n})")
+                if _pf is not None and _park:
+                    _pf_note = (
+                        " (neutral)" if 0.98 <= _pf <= 1.02
+                        else " (hitter-friendly)" if _pf > 1.02
+                        else " (pitcher-friendly)"
+                    )
+                    lines.append(f"  Home park: {_park}, PF {_pf:.2f}{_pf_note}")
     except Exception:
         pass
 
@@ -1515,3 +1626,234 @@ def get_strategy_recommendations(conn=None) -> dict:
     except Exception as e:
         logger.error(f"Strategy recommendations API error: {e}", exc_info=True)
         return {"response": None, "tokens_used": 0, "model": None, "error": f"API error: {e}"}
+
+
+# ============================================================================
+# Unified Roster Analysis — one JSON-enforced call that returns manager review,
+# strategy sliders, and upgrade guidance in a single structured response.
+# This is what the Roster Optimizer auto-runs on page load.
+# ============================================================================
+
+UNIFIED_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "required": [
+        "team_identity",
+        "critical_gaps",
+        "composition_notes",
+        "strategy_sliders",
+        "upgrade_priorities",
+        "sanity_check",
+    ],
+    "properties": {
+        "team_identity": {
+            "type": "string",
+            "description": "One short line: what kind of team is this? "
+                           "(e.g., 'contact-and-speed offense with groundball pitching')",
+        },
+        "critical_gaps": {
+            "type": "array",
+            "description": "Roster-construction gaps that need addressing. 0-5 items.",
+            "items": {
+                "type": "object",
+                "required": ["gap", "severity"],
+                "properties": {
+                    "gap": {
+                        "type": "string",
+                        "description": "Short description of the gap (max 80 chars)",
+                    },
+                    "severity": {
+                        "type": "string",
+                        "description": "'critical', 'moderate', or 'minor'",
+                    },
+                    "affects_position": {
+                        "type": "string",
+                        "description": "Which roster position is affected (e.g. 'bench', 'bullpen', 'SP')",
+                    },
+                },
+            },
+        },
+        "composition_notes": {
+            "type": "array",
+            "description": "Subtler composition observations (handedness, overlap, etc). 1-3 items.",
+            "items": {"type": "string"},
+        },
+        "strategy_sliders": {
+            "type": "array",
+            "description": "OOTP strategy slider recommendations. Include ALL 15 sliders listed below.",
+            "items": {
+                "type": "object",
+                "required": ["category", "name", "value", "reason"],
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": "One of: 'Offensive', 'Pitching & Defense', 'Substitution'",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Slider name (e.g. 'Stealing Bases', 'Hook Starting Pitchers')",
+                    },
+                    "value": {
+                        "type": "integer",
+                        "description": "Recommended value 1-5 (1=Never/Conservative/Quick, 5=Frequently/Aggressive/Slow, 3=default)",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "One sentence tying the value to actual roster numbers (max 120 chars)",
+                    },
+                },
+            },
+        },
+        "upgrade_priorities": {
+            "type": "array",
+            "description": "Which ROLES to prioritize acquiring next. 2-5 items.",
+            "items": {
+                "type": "object",
+                "required": ["role", "reason"],
+                "properties": {
+                    "role": {
+                        "type": "string",
+                        "description": "Role needed (e.g. 'LH bench bat', 'Setup RP', 'Backup C with power')",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this role is a priority (max 120 chars)",
+                    },
+                },
+            },
+        },
+        "sanity_check": {
+            "type": "string",
+            "description": "Final 1-2 sentence sanity check: does this strategy + roster combination make sense together? Flag any contradictions.",
+        },
+    },
+}
+
+
+def get_unified_roster_analysis(conn=None) -> dict:
+    """One-shot structured analysis of the current roster.
+
+    Makes a single API call with JSON schema enforcement and returns a dict
+    with: team_identity, critical_gaps, composition_notes, strategy_sliders,
+    upgrade_priorities, sanity_check.
+
+    This replaces the separate get_roster_manager_review and
+    get_strategy_recommendations calls — one structured call is faster,
+    cheaper, and produces a coherent analysis (sliders aligned with gaps).
+
+    Returns dict with keys:
+        analysis: parsed JSON dict (or None on error)
+        raw_response: string response from model
+        tokens_used: int
+        model: model name
+        error: error message or None
+    """
+    import json as _json
+
+    ai_config = get_ai_config()
+    if not ai_config["ready"]:
+        return {
+            "analysis": None,
+            "raw_response": None,
+            "tokens_used": 0,
+            "model": None,
+            "error": ai_config["message"],
+        }
+
+    from app.core.database import get_connection
+    close_conn = False
+    if conn is None:
+        conn = get_connection()
+        close_conn = True
+
+    try:
+        context = _build_manager_review_context(conn)
+    except Exception as e:
+        context = f"(Could not build context: {e})"
+    finally:
+        if close_conn:
+            conn.close()
+
+    system_prompt = (
+        "You are an expert Major League Baseball manager and OOTP 27 tactical coordinator. "
+        "You are analyzing a 26-man roster to produce a COMPLETE, COHERENT team plan in a "
+        "single structured output. Your response must be valid JSON matching the provided schema.\n\n"
+        "==== ROSTER CONSTRUCTION RULES ====\n"
+        "- 26-man: 13 position players + 13 pitchers\n"
+        "- Position players: 2 C, 4-6 IF (including utility), 4-5 OF, 1 DH\n"
+        "- Pitchers: 5 SP, 7-8 RP (including closer + 1-2 setup)\n"
+        "- Ideal bench: 1 backup C, 1 utility IF, 1 4th OF, 1 platoon bat (opposite-hand of primary)\n"
+        "- Handedness: 2-3 LH bats minimum, 1+ LH reliever for matchups\n\n"
+        "==== STRATEGY SLIDER TACTICAL RULES ====\n"
+        "Scale: 1=Never/Conservative/Quick, 3=neutral, 5=Frequently/Aggressive/Slow\n"
+        "- High team SPEED (avg>=55) + low POWER -> aggressive running (4-5), steal more, hit&run\n"
+        "- High POWER (avg>=75) + low SPEED -> swing away (1-2 bunt/steal), don't waste outs\n"
+        "- High CONTACT (avg>=85) + low POWER -> hit&run 4, bunt for hit 3-4, manufacture runs\n"
+        "- Weak bullpen -> quick hook on SP (2), aggressive L/R matchups (4-5)\n"
+        "- Strong closer + weak setup -> late-game protection, hold runners more\n"
+        "- Weak defense (low IF/OF range) -> shift more (4), don't play infield in (2)\n"
+        "- Power pitchers (avg STU>=85) -> slower hooks (4), let them work through\n"
+        "- Control pitchers (avg CTRL>=85, low STU) -> quicker hooks if struggling (2)\n"
+        "- No LH bullpen arms -> skip L/R pitching matchups (2)\n"
+        "- LH-heavy lineup -> L/R batting matchups 4 to exploit opposing RHPs\n\n"
+        "==== REQUIRED STRATEGY SLIDERS (include ALL 15) ====\n"
+        "Offensive: Stealing Bases, Base-Running, Hit & Run, Sacrifice Bunt, Bunt for Hit\n"
+        "Pitching & Defense: Hook Starting Pitchers, Hook Relievers, Infield Shifts, "
+        "Outfield Shifts, Play Infield In\n"
+        "Substitution: L/R Pitching Matchups, L/R Batting Matchups, Pinch-Hit for Position Players, "
+        "Use Pinch Runners, Use of Openers\n\n"
+        "==== OUTPUT REQUIREMENTS ====\n"
+        "- Be specific: cite actual roster numbers in reasons (e.g., 'avg SPD 51 is average')\n"
+        "- Be consistent: slider recommendations must match the team identity and address gaps\n"
+        "- In sanity_check, verify the strategy makes sense given the roster — if not, flag it\n"
+        "- Be blunt about gaps. Don't invent problems. If a bench slot is well-built, say so\n"
+        "- Max 4 critical_gaps, max 3 composition_notes, max 5 upgrade_priorities"
+    )
+
+    user_message = f"=== ROSTER STATE ===\n{context}\n\n=== ANALYZE ==="
+
+    try:
+        if ai_config["provider"] == "gemini":
+            result = _call_gemini(
+                system_prompt, user_message, ai_config,
+                max_tokens=8000,  # generous room: schema output + Gemini 2.5 Flash thinking
+                response_schema=UNIFIED_ANALYSIS_SCHEMA,
+            )
+        else:
+            # Anthropic: no native schema enforcement, rely on prompt
+            result = _call_anthropic(system_prompt, user_message, ai_config, max_tokens=4000)
+
+        raw = result.get("response", "")
+        parsed = None
+        parse_error = None
+
+        if raw:
+            try:
+                # Anthropic may wrap JSON in a code block — strip if needed
+                clean = raw.strip()
+                if clean.startswith("```"):
+                    clean = clean.split("```", 2)
+                    clean = clean[1] if len(clean) > 1 else raw
+                    if clean.startswith("json\n"):
+                        clean = clean[5:]
+                    clean = clean.rsplit("```", 1)[0] if "```" in clean else clean
+                parsed = _json.loads(clean)
+            except Exception as e:
+                parse_error = f"Could not parse JSON: {e}"
+                logger.warning(f"Unified analysis JSON parse failed: {e}\nRaw: {raw[:500]}")
+
+        return {
+            "analysis": parsed,
+            "raw_response": raw,
+            "tokens_used": result.get("tokens_used", 0),
+            "model": result.get("model"),
+            "error": result.get("error") or parse_error,
+        }
+    except Exception as e:
+        logger.error(f"Unified analysis API error: {e}", exc_info=True)
+        return {
+            "analysis": None,
+            "raw_response": None,
+            "tokens_used": 0,
+            "model": None,
+            "error": f"API error: {e}",
+        }

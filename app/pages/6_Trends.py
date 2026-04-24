@@ -7,8 +7,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.core.database import get_connection
 from app.core.history import get_meta_movers, get_market_trends, get_player_trend
+from app.utils.sidebar_nav import render_sidebar_nav
 
 st.set_page_config(page_title="Trends & History", page_icon="\U0001f4c8", layout="wide")
+render_sidebar_nav()
 st.title("\U0001f4c8 Trends & History")
 
 # ============================================================================

@@ -22,7 +22,17 @@ env/
 # Data files (contain user-specific data)
 data/*.db
 data/*.sqlite
+data/backups/
 *.db
+*.db-shm
+*.db-wal
+
+# Claude Code tooling + editor temps
+.claude/
+*.tmp.*
+
+# Local user notes (Word docs from planning sessions, etc.)
+*.docx
 
 # Config (contains API keys)
 config.yaml

@@ -9,8 +9,10 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.core.database import load_config, get_connection, init_db
+from app.utils.sidebar_nav import render_sidebar_nav
 
 st.set_page_config(page_title="Settings", page_icon="⚙️", layout="wide")
+render_sidebar_nav()
 st.title("Settings")
 
 config_path = Path(__file__).parent.parent.parent / "config.yaml"

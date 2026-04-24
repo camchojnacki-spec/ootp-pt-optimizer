@@ -11,8 +11,10 @@ from app.core.price_analysis import (
     get_price_history, get_biggest_movers, get_price_stats,
     get_price_momentum, get_market_momentum_summary,
 )
+from app.utils.sidebar_nav import render_sidebar_nav
 
 st.set_page_config(page_title="Price Trends", page_icon="📈", layout="wide")
+render_sidebar_nav()
 st.title("Price Trends")
 
 conn = get_connection()

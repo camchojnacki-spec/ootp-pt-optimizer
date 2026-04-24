@@ -6,8 +6,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from app.core.database import get_connection, load_config
 from app.core.ai_advisor import get_api_key, get_ai_config, ask_advisor, get_market_analysis, get_trade_advice, get_flip_strategy
+from app.utils.sidebar_nav import render_sidebar_nav
+
+config = load_config()
+pp_budget = int(config.get('pp_budget', 500) or 500)
 
 st.set_page_config(page_title="AI Advisor", page_icon="\U0001f916", layout="wide")
+render_sidebar_nav()
 
 st.title("\U0001f916 AI Advisor")
 st.caption("AI-powered portfolio analysis and recommendations")
@@ -103,6 +108,64 @@ if st.session_state.get("ai_show_custom", False):
 
     if "ai_response_custom" in st.session_state:
         _render_response(st.session_state["ai_response_custom"])
+
+# ---------------------------------------------------------------------------
+# Buy Strategy — moved here from Buy Recs > AI Advisor sub-tab (Tier-3 #11).
+# Three pre-built buy-decision questions that use your active PP budget.
+# ---------------------------------------------------------------------------
+st.divider()
+st.subheader("Buy Strategy")
+st.caption(f"Budget-aware questions using your current PP budget: **{pp_budget:,} PP**")
+
+bs_col1, bs_col2, bs_col3 = st.columns(3)
+
+with bs_col1:
+    if st.button("\U0001f3af Best single buy?", type="primary", disabled=not has_key,
+                 use_container_width=True, key="btn_buy_single"):
+        with st.spinner("Analyzing your roster + market..."):
+            result = ask_advisor(
+                f"My budget is {pp_budget:,} PP. What is the single best card I can buy "
+                f"to improve my team the most? Consider my weakest positions, platoon splits, "
+                f"and in-game performance. Be specific with card names and prices.",
+                conn,
+            )
+        _display_response(result, "ai_response_buy_single")
+
+with bs_col2:
+    if st.button("\u2696\ufe0f 1 big vs 2 small?", disabled=not has_key,
+                 use_container_width=True, key="btn_buy_split"):
+        with st.spinner("Comparing investment strategies..."):
+            result = ask_advisor(
+                f"I have {pp_budget:,} PP. Should I buy 1 expensive card or 2 cheaper cards? "
+                f"Compare the options — which gives better short-term improvement vs long-term "
+                f"team health? Consider which positions have the biggest gaps.",
+                conn,
+            )
+        _display_response(result, "ai_response_buy_split")
+
+with bs_col3:
+    if st.button("\U0001f4c8 Long-term plan?", disabled=not has_key,
+                 use_container_width=True, key="btn_buy_plan"):
+        with st.spinner("Building investment roadmap..."):
+            result = ask_advisor(
+                f"I have {pp_budget:,} PP now. Build me a 3-step investment plan: "
+                f"what to buy now, what to save for next, and what my endgame targets are "
+                f"at each weak position. Include price targets and priority order.",
+                conn,
+            )
+        _display_response(result, "ai_response_buy_plan")
+
+if "ai_response_buy_single" in st.session_state:
+    with st.expander("Best single buy", expanded=True):
+        _render_response(st.session_state["ai_response_buy_single"])
+
+if "ai_response_buy_split" in st.session_state:
+    with st.expander("1 big vs 2 small", expanded=True):
+        _render_response(st.session_state["ai_response_buy_split"])
+
+if "ai_response_buy_plan" in st.session_state:
+    with st.expander("Long-term plan", expanded=True):
+        _render_response(st.session_state["ai_response_buy_plan"])
 
 # ---------------------------------------------------------------------------
 # Card-Specific Advice

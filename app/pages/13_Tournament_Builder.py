@@ -14,8 +14,10 @@ from app.core.tournament import (
     calculate_chemistry, calculate_salary, validate_roster,
     BATTING_POSITIONS, ROSTER_SIZE, EMPTY_SLOT_VALUE,
 )
+from app.utils.sidebar_nav import render_sidebar_nav
 
 st.set_page_config(page_title="Tournament Builder", page_icon="🏆", layout="wide")
+render_sidebar_nav()
 st.title("🏆 Tournament Roster Builder")
 st.caption("Build and optimize your roster for Perfect Team tournaments")
 

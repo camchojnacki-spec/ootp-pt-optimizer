@@ -244,3 +244,97 @@ def get_market_momentum_summary(conn=None):
         'sell_signals': sell_signals[:10],
         'most_volatile': most_volatile[:10],
     }
+
+
+def find_price_anomalies(conn=None, owned_only: bool = True,
+                         multiplier: float = 2.5, min_meta: int = 200) -> list[dict]:
+    """Flag cards whose ``last_10_price`` looks suspicious vs their tier+meta peers.
+
+    Motivation: the product review flagged a Mitch Keller PIT card priced at
+    765 PP (Bronze SP, ~488 meta) while peer cards in the same band were trading
+    at 200-330 PP. Manual one-off investigations don't scale; this function
+    detects anomalies systematically by comparing each card's price to the
+    median price of similar cards in the same tier and meta band.
+
+    A card is flagged if::
+
+        last_10_price > peer_median_price * multiplier
+        AND last_10_price > 100  (exclude noise on cheap cards)
+        AND there are ≥ 5 peers in the comparison band
+
+    Args:
+        conn: optional sqlite3.Connection
+        owned_only: if True, only return cards the user owns (focus on what
+                    affects their actual sell-rec PP estimates)
+        multiplier: how many times the peer median triggers a flag
+        min_meta: ignore cards below this meta (noisy floor for cheap commons)
+
+    Returns:
+        list of dicts with: card_id, card_title, tier_name, position,
+        meta_score, last_10_price, peer_median, peer_count, ratio
+    """
+    close_conn = False
+    if conn is None:
+        conn = get_connection()
+        close_conn = True
+
+    try:
+        # Pull the candidate set: priced cards with a meta value.
+        rows = conn.execute("""
+            SELECT card_id, card_title, tier_name, position, pitcher_role,
+                   COALESCE(meta_score_batting, meta_score_pitching) AS meta_score,
+                   last_10_price, sell_order_low, buy_order_high, owned
+            FROM cards
+            WHERE last_10_price IS NOT NULL AND last_10_price > 100
+              AND COALESCE(meta_score_batting, meta_score_pitching) >= ?
+              AND tier_name IS NOT NULL
+        """, (min_meta,)).fetchall()
+
+        # Bucket by (tier_name, pitcher_or_batter) so SPs are compared with SPs,
+        # batters with batters, etc. A 100-meta band is wide enough to have a
+        # meaningful peer count without smearing across the rating ladder.
+        buckets: dict[tuple, list[dict]] = {}
+        for r in rows:
+            d = dict(r)
+            is_pitcher = d.get('pitcher_role') is not None
+            band = int((d['meta_score'] or 0) // 100) * 100
+            key = (d['tier_name'], 'pit' if is_pitcher else 'bat', band)
+            buckets.setdefault(key, []).append(d)
+
+        anomalies: list[dict] = []
+        for key, peers in buckets.items():
+            if len(peers) < 5:
+                continue  # not enough peers to trust the median
+            prices = sorted(p['last_10_price'] for p in peers if p['last_10_price'])
+            if not prices:
+                continue
+            median = prices[len(prices) // 2]
+            if median <= 0:
+                continue
+            for p in peers:
+                if owned_only and not (p.get('owned') or 0):
+                    continue
+                price = p['last_10_price']
+                if price > median * multiplier:
+                    anomalies.append({
+                        'card_id': p['card_id'],
+                        'card_title': p['card_title'],
+                        'tier_name': p['tier_name'],
+                        'position': p['position'],
+                        'is_pitcher': key[1] == 'pit',
+                        'meta_score': round(p['meta_score'] or 0),
+                        'last_10_price': price,
+                        'sell_order_low': p.get('sell_order_low') or 0,
+                        'buy_order_high': p.get('buy_order_high') or 0,
+                        'peer_median': median,
+                        'peer_count': len(peers),
+                        'ratio': round(price / median, 2),
+                        'owned': p.get('owned') or 0,
+                    })
+
+        # Worst (most-inflated) first.
+        anomalies.sort(key=lambda a: a['ratio'], reverse=True)
+        return anomalies
+    finally:
+        if close_conn:
+            conn.close()

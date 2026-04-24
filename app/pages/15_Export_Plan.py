@@ -7,8 +7,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.core.database import get_connection, load_config
+from app.core.plan_history import (
+    save_plan_snapshot,
+    get_latest_plan,
+    diff_plan_against_current,
+    list_plans,
+)
+from app.utils.sidebar_nav import render_sidebar_nav
 
 st.set_page_config(page_title="Export Roster Plan", page_icon="\U0001f4e6", layout="wide")
+render_sidebar_nav()
 st.title("Export Roster Plan")
 
 conn = get_connection()
@@ -73,7 +81,7 @@ st.subheader("Sell Recommendations")
 sells = conn.execute("""
     SELECT r.card_id, r.card_title, r.position, r.reason, r.priority,
            r.estimated_price, r.meta_score, r.roster_impact,
-           c.tier_name, c.buy_order_high, c.sell_order_low
+           c.tier_name, c.owned, c.buy_order_high, c.sell_order_low
     FROM recommendations r
     LEFT JOIN cards c ON r.card_id = c.card_id
     WHERE r.rec_type = 'sell' AND r.dismissed = 0
@@ -83,10 +91,20 @@ sells = conn.execute("""
 total_sell_pp = sum(r['estimated_price'] or 0 for r in sells)
 
 if sells:
-    # Categorize
-    duplicates = [r for r in sells if 'duplicate' in (r['reason'] or '').lower()]
-    off_roster = [r for r in sells if r not in duplicates and 'not on active' in (r['reason'] or '').lower()]
-    other_sells = [r for r in sells if r not in duplicates and r not in off_roster]
+    # Categorize — MUST match the logic used on the Sell Recommendations page
+    # (app/pages/2_Sell_Recommendations.py ~line 51): a card is a duplicate if
+    # its reason mentions "duplicate" OR its owned count > 1. Previously this
+    # page only checked the reason text, which caused the duplicates count
+    # shown here to drift from the Sell Recs page for cards with multiple
+    # copies but a non-duplicate-worded reason.
+    def _is_duplicate(r):
+        reason = (r['reason'] or '').lower()
+        owned_count = r['owned'] or 0
+        return 'duplicate' in reason or owned_count > 1
+
+    duplicates = [r for r in sells if _is_duplicate(r)]
+    off_roster = [r for r in sells if not _is_duplicate(r) and 'not on active' in (r['reason'] or '').lower()]
+    other_sells = [r for r in sells if not _is_duplicate(r) and r not in off_roster]
 
     sc1, sc2, sc3 = st.columns(3)
     with sc1:
@@ -388,6 +406,27 @@ report_text = "\n".join(lines)
 # Show preview
 st.text_area("Plan Preview", report_text, height=400)
 
+# Capture callback for the download buttons. Snapshots the current sells/buys
+# so a future import can diff against this exact plan and report adherence.
+# Streamlit fires on_click before the download payload is served, so the
+# snapshot lands in the DB even if the user cancels the file save dialog —
+# that's intentional: the *intent* to act on this plan is what we want to
+# remember, not just the file ending up on disk.
+def _capture_plan_snapshot():
+    cap_conn = get_connection()
+    try:
+        save_plan_snapshot(
+            team_name=team_name,
+            pp_budget=int(budget or 0),
+            sells=[dict(r) for r in sells],
+            buys=[dict(r) for r in buys],
+            roster_meta_at_export=float(total_meta or 0),
+            conn=cap_conn,
+            notes=None,
+        )
+    finally:
+        cap_conn.close()
+
 # Download buttons
 dl_col1, dl_col2 = st.columns(2)
 
@@ -399,6 +438,8 @@ with dl_col1:
         mime="text/plain",
         type="primary",
         use_container_width=True,
+        on_click=_capture_plan_snapshot,
+        key="dl_text",
     )
 
 with dl_col2:
@@ -436,9 +477,179 @@ with dl_col2:
             file_name=f"roster_plan_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv",
             use_container_width=True,
+            on_click=_capture_plan_snapshot,
+            key="dl_csv",
         )
     else:
         st.button("Download as CSV", disabled=True, use_container_width=True,
                    help="No recommendations to export")
+
+# Manual save (no download) — for users who want to mark a plan as committed
+# without re-downloading. Useful when the workflow is "I downloaded yesterday,
+# acted today, want a fresh baseline".
+if st.button(
+    "💾 Save Plan Snapshot (no download)",
+    use_container_width=False,
+    help="Persist this plan to history so a future import can show adherence.",
+):
+    _capture_plan_snapshot()
+    st.success("Plan snapshot saved. Adherence will appear after your next import.")
+    st.rerun()
+
+st.divider()
+
+# ============================================================
+# 6. PLAN ADHERENCE — Tier-2 #7
+# ============================================================
+# After the user imports their next data export, this section shows how much
+# of the most-recently-saved plan was actually executed. The diff is computed
+# fresh on every page load against the live cards/roster tables, so the
+# moment a sold card's owned count drops, it shows up here.
+st.subheader("📋 Plan Adherence — Did you follow the last plan?")
+
+_latest = get_latest_plan(conn)
+if not _latest:
+    st.info(
+        "No saved plans yet. Click **Download** above (or the Save Plan Snapshot "
+        "button) to capture this plan — adherence will appear here after your "
+        "next data import."
+    )
+else:
+    _diff = diff_plan_against_current(_latest["id"], conn)
+    if not _diff:
+        st.warning("Couldn't load adherence diff for the latest plan.")
+    else:
+        _exported_at = _latest.get("exported_at", "unknown")
+        st.caption(
+            f"Comparing against plan saved **{_exported_at}** "
+            f"(roster meta at export: **{_latest.get('roster_meta_at_export', 0):.0f}**)."
+        )
+
+        _se = _diff["sells_executed"]
+        _st_total = _diff["sells_total"]
+        _be = _diff["buys_executed"]
+        _bt_total = _diff["buys_total"]
+        _total_actions = _st_total + _bt_total
+        _total_executed = _se + _be
+        _adherence_pct = (_total_executed / _total_actions * 100) if _total_actions else 0
+
+        am1, am2, am3, am4 = st.columns(4)
+        with am1:
+            st.metric(
+                "Adherence",
+                f"{_adherence_pct:.0f}%",
+                help="Fraction of plan actions (sells + buys) actually executed",
+            )
+        with am2:
+            st.metric(
+                "Sells executed",
+                f"{_se} / {_st_total}",
+                delta=f"{_diff['exec_pp_sells']:,} PP captured" if _se else None,
+                delta_color="normal",
+            )
+        with am3:
+            st.metric(
+                "Buys executed",
+                f"{_be} / {_bt_total}",
+                delta=f"-{_diff['exec_pp_buys']:,} PP spent" if _be else None,
+                delta_color="inverse",
+            )
+        with am4:
+            _md = _diff["meta_delta"]
+            st.metric(
+                "Roster meta Δ",
+                f"{_diff['current_roster_meta']:.0f}",
+                delta=f"{_md:+.0f} since plan",
+                help="Current starter meta vs. starter meta when this plan was exported",
+            )
+
+        # Per-action detail tables
+        with st.expander(
+            f"Sell actions ({_se}/{_st_total} executed)",
+            expanded=False,
+        ):
+            if _diff["sells"]:
+                _sell_rows = []
+                for s in _diff["sells"]:
+                    _sell_rows.append({
+                        "Status": "✅ Sold" if s["executed"] else "⏳ Pending",
+                        "Card": s.get("card_title") or "",
+                        "Pos": s.get("position") or "",
+                        "Price": int(s.get("estimated_price") or 0),
+                        "Owned (then→now)": f"{s.get('owned_at_export', 0)} → {s.get('owned_now', 0)}",
+                        "Reason": (s.get("reason") or "")[:60],
+                    })
+                st.dataframe(
+                    pd.DataFrame(_sell_rows),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "Status": st.column_config.TextColumn(width="small"),
+                        "Price": st.column_config.NumberColumn(format="%d PP", width="small"),
+                        "Owned (then→now)": st.column_config.TextColumn(width="small"),
+                    },
+                )
+            else:
+                st.caption("No sells in this plan.")
+
+        with st.expander(
+            f"Buy actions ({_be}/{_bt_total} executed)",
+            expanded=False,
+        ):
+            if _diff["buys"]:
+                _priority_labels = {1: "Urgent", 2: "High", 3: "Medium", 4: "Low"}
+                _buy_rows = []
+                for b in _diff["buys"]:
+                    _pri = b.get("priority")
+                    _buy_rows.append({
+                        "Status": "✅ Bought" if b["executed"] else "⏳ Pending",
+                        "Priority": _priority_labels.get(_pri, str(_pri or "")),
+                        "Card": b.get("card_title") or "",
+                        "Pos": b.get("position") or "",
+                        "Price": int(b.get("estimated_price") or 0),
+                        "Meta": int(b.get("meta_score") or 0) if b.get("meta_score") else 0,
+                        "Owned (then→now)": f"{b.get('owned_at_export', 0)} → {b.get('owned_now', 0)}",
+                    })
+                st.dataframe(
+                    pd.DataFrame(_buy_rows),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "Status": st.column_config.TextColumn(width="small"),
+                        "Priority": st.column_config.TextColumn(width="small"),
+                        "Price": st.column_config.NumberColumn(format="%d PP", width="small"),
+                        "Meta": st.column_config.NumberColumn(
+                            format="%d", width="small",
+                            help="Overall meta — same number used everywhere in the app. "
+                                 "vs-LHP / vs-RHP splits are on Card Detail."),
+                        "Owned (then→now)": st.column_config.TextColumn(width="small"),
+                    },
+                )
+            else:
+                st.caption("No buys in this plan.")
+
+        # ── Plan history ──
+        _history = list_plans(conn, limit=10)
+        if len(_history) > 1:
+            with st.expander(
+                f"📜 Plan history ({len(_history)} most recent)",
+                expanded=False,
+            ):
+                _hist_rows = []
+                for h in _history:
+                    _hist_rows.append({
+                        "When": h.get("exported_at") or "",
+                        "Sells": h.get("sells_count") or 0,
+                        "Buys": h.get("buys_count") or 0,
+                        "Sell PP": h.get("sells_total_pp") or 0,
+                        "Buy PP": h.get("buys_total_pp") or 0,
+                        "Roster Meta": round(h.get("roster_meta_at_export") or 0),
+                    })
+                st.dataframe(
+                    pd.DataFrame(_hist_rows),
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "Sell PP": st.column_config.NumberColumn(format="%d PP"),
+                        "Buy PP": st.column_config.NumberColumn(format="%d PP"),
+                    },
+                )
 
 conn.close()

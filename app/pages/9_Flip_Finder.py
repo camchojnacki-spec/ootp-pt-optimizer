@@ -15,8 +15,10 @@ from app.core.flip_finder import (
     find_hot_streak_flips,
     get_flip_summary,
 )
+from app.utils.sidebar_nav import render_sidebar_nav
 
 st.set_page_config(page_title="Flip Finder", page_icon="🔄", layout="wide")
+render_sidebar_nav()
 st.title("Flip Finder")
 st.caption("Find cards to buy low and sell high for PP profit")
 

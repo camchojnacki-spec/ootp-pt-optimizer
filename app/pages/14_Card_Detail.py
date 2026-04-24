@@ -7,9 +7,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from app.core.database import get_connection
+from app.core.meta_scoring import (
+    calc_batting_meta, calc_batting_meta_vs_rhp, calc_batting_meta_vs_lhp,
+    calc_pitching_meta, calc_pitching_meta_vs_lhb, calc_pitching_meta_vs_rhb,
+    explain_meta,
+)
 from app.utils.sparklines import get_price_history
+from app.utils.sidebar_nav import render_sidebar_nav
 
 st.set_page_config(page_title="Card Detail", page_icon="\U0001f4cb", layout="wide")
+render_sidebar_nav()
 st.title("Card Detail")
 
 conn = get_connection()
@@ -115,7 +122,44 @@ with ratings_col:
             st.metric("Velocity", card['velocity'] or "---")
 
         if card['meta_score_pitching']:
-            st.metric("Meta Score (Pitching)", f"{card['meta_score_pitching']:.0f}")
+            # Compute split-aware metas for the tooltip. Overall is the canonical
+            # number used elsewhere in the app; the splits show how much the
+            # number shifts when this pitcher faces an L-heavy or R-heavy lineup.
+            try:
+                _row = dict(card)
+                _meta_overall = card['meta_score_pitching']
+                _meta_vlhb = calc_pitching_meta_vs_lhb(_row) or 0
+                _meta_vrhb = calc_pitching_meta_vs_rhb(_row) or 0
+            except Exception:
+                _meta_overall = card['meta_score_pitching']
+                _meta_vlhb = _meta_vrhb = 0
+            st.metric(
+                "Meta Score (Pitching)",
+                f"{_meta_overall:.0f}",
+                help=(
+                    "Overall meta — the canonical score used everywhere in the app "
+                    "(Buy Recs, Roster Optimizer, Sell Recs).\n\n"
+                    f"• vs LHB split: {_meta_vlhb:.0f}\n"
+                    f"• vs RHB split: {_meta_vrhb:.0f}\n\n"
+                    "Splits are derived from this pitcher's vsL/vsR ratings. "
+                    "Use them when your matchup planning calls for it; "
+                    "Overall is the default sort key everywhere else."
+                ),
+            )
+            if _meta_vlhb and _meta_vrhb:
+                _split_cols = st.columns(2)
+                with _split_cols[0]:
+                    _delta_l = _meta_vlhb - _meta_overall
+                    st.caption(
+                        f"vs LHB: **{_meta_vlhb:.0f}** "
+                        f"({'+' if _delta_l >= 0 else ''}{_delta_l:.0f})"
+                    )
+                with _split_cols[1]:
+                    _delta_r = _meta_vrhb - _meta_overall
+                    st.caption(
+                        f"vs RHB: **{_meta_vrhb:.0f}** "
+                        f"({'+' if _delta_r >= 0 else ''}{_delta_r:.0f})"
+                    )
     else:
         st.subheader("Batting Ratings")
         bat_labels = ["CON", "GAP", "POW", "EYE", "K's", "BABIP"]
@@ -132,7 +176,104 @@ with ratings_col:
         st.dataframe(bat_df, use_container_width=True, hide_index=True)
 
         if card['meta_score_batting']:
-            st.metric("Meta Score (Batting)", f"{card['meta_score_batting']:.0f}")
+            # Compute split-aware metas for the tooltip. Overall is the canonical
+            # number used everywhere in the app; the vs-LHP/vs-RHP variants show
+            # how much the number shifts based on this batter's handedness splits.
+            try:
+                _row = dict(card)
+                _meta_overall = card['meta_score_batting']
+                _meta_vlhp = calc_batting_meta_vs_lhp(_row) or 0
+                _meta_vrhp = calc_batting_meta_vs_rhp(_row) or 0
+            except Exception:
+                _meta_overall = card['meta_score_batting']
+                _meta_vlhp = _meta_vrhp = 0
+            st.metric(
+                "Meta Score (Batting)",
+                f"{_meta_overall:.0f}",
+                help=(
+                    "Overall meta — the canonical score used everywhere in the app "
+                    "(Buy Recs, Roster Optimizer, Sell Recs). All cross-page "
+                    "comparisons use this number.\n\n"
+                    f"• vs LHP split: {_meta_vlhp:.0f}\n"
+                    f"• vs RHP split: {_meta_vrhp:.0f}\n\n"
+                    "Splits are derived from this batter's vsL/vsR ratings. Use "
+                    "them when planning platoons; Overall is the default sort "
+                    "key everywhere else."
+                ),
+            )
+            if _meta_vlhp and _meta_vrhp:
+                _split_cols = st.columns(2)
+                with _split_cols[0]:
+                    _delta_l = _meta_vlhp - _meta_overall
+                    st.caption(
+                        f"vs LHP: **{_meta_vlhp:.0f}** "
+                        f"({'+' if _delta_l >= 0 else ''}{_delta_l:.0f})"
+                    )
+                with _split_cols[1]:
+                    _delta_r = _meta_vrhp - _meta_overall
+                    st.caption(
+                        f"vs RHP: **{_meta_vrhp:.0f}** "
+                        f"({'+' if _delta_r >= 0 else ''}{_delta_r:.0f})"
+                    )
+
+    # ── Why this meta? — explainer expander (Tier-2 #10 from the review) ──
+    # Cards expose their formula contributions so the user isn't reading the
+    # meta number as a black box. Reconciles to within 0.1 of the canonical
+    # calc_*_meta functions so the breakdown total matches the headline number.
+    try:
+        _exp = explain_meta(dict(card), is_pitcher=is_pitcher)
+    except Exception:
+        _exp = None
+    if _exp:
+        with st.expander("\U0001f50d Why this meta?", expanded=False):
+            _ovr = (_exp.get('diagnostics') or {}).get('ovr')
+            if _ovr:
+                st.caption(
+                    f"Total breakdown: **{_exp['total']:.0f}** meta · "
+                    f"OOTP OVR **{_ovr}** (comparison only — not a formula input). "
+                    "Contributions sorted by impact."
+                )
+            else:
+                st.caption(
+                    f"Total breakdown: **{_exp['total']:.0f}** meta — "
+                    "contributions sorted by impact."
+                )
+            if _exp['components']:
+                _comp_df = pd.DataFrame([
+                    {
+                        "Rating": c['label'],
+                        "Raw": c['raw'],
+                        "Weight": c['weight'],
+                        "Points": c['points'],
+                    }
+                    for c in _exp['components']
+                ])
+                st.dataframe(
+                    _comp_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Rating": st.column_config.TextColumn(width="medium"),
+                        "Raw": st.column_config.NumberColumn(format="%.0f", width="small",
+                            help="The OOTP rating value (0-200)"),
+                        "Weight": st.column_config.NumberColumn(format="%.2f", width="small",
+                            help="Current calibrated weight from Settings"),
+                        "Points": st.column_config.NumberColumn(format="%+.0f", width="small",
+                            help="Contribution to the meta total (raw × weight, with diminishing returns above 110)"),
+                    },
+                )
+            if _exp['bonuses']:
+                st.markdown("**Bonuses**")
+                for b in _exp['bonuses']:
+                    st.markdown(f"• {b['label']} → **{b['points']:+.0f}**")
+            if _exp['penalties']:
+                st.markdown("**Penalties**")
+                for p in _exp['penalties']:
+                    st.markdown(f"• {p['label']} → **{p['points']:+.0f}**")
+            if _exp['notes']:
+                st.markdown("---")
+                for n in _exp['notes']:
+                    st.caption(f"\U0001f4dd {n}")
 
     # Speed / Baserunning
     if not is_pitcher:
@@ -214,17 +355,63 @@ with market_col:
 
     price_cols = st.columns(2)
     with price_cols[0]:
-        st.metric("Buy Order High", f"{card['buy_order_high']:,} PP" if card['buy_order_high'] else "---")
-        st.metric("Last 10 Price", f"{card['last_10_price']:,} PP" if card['last_10_price'] else "---")
+        st.metric(
+            "Buy Order High",
+            f"{card['buy_order_high']:,} PP" if card['buy_order_high'] else "---",
+            help=(
+                "**The highest active BID** — what other players are currently "
+                "willing to pay for this card. If you list at this price, it "
+                "should sell instantly. Lower than Sell Order Low because that's "
+                "what makes a market spread."
+            ),
+        )
+        st.metric(
+            "Last 10 Price",
+            f"{card['last_10_price']:,} PP" if card['last_10_price'] else "---",
+            help=(
+                "**Average of the last 10 completed sales.** This is the most "
+                "honest 'real' price — actual transactions, not just standing "
+                "orders. The app uses this as the default Est. Price for sell "
+                "recommendations because it's the least gameable."
+            ),
+        )
     with price_cols[1]:
-        st.metric("Sell Order Low", f"{card['sell_order_low']:,} PP" if card['sell_order_low'] else "---")
-        st.metric("Last 10 Variance", f"{card['last_10_variance']:,}" if card['last_10_variance'] else "---")
+        st.metric(
+            "Sell Order Low",
+            f"{card['sell_order_low']:,} PP" if card['sell_order_low'] else "---",
+            help=(
+                "**The lowest active ASK** — what other players are currently "
+                "trying to sell this card for. If you bid at this price, you "
+                "should fill instantly. Higher than Buy Order High because "
+                "that's the spread sellers want to capture."
+            ),
+        )
+        st.metric(
+            "Last 10 Variance",
+            f"{card['last_10_variance']:,}" if card['last_10_variance'] else "---",
+            help=(
+                "**Std. dev. of the last 10 sale prices.** High variance = "
+                "volatile market (less predictable Est. Price). Low variance = "
+                "stable market. Useful for spotting cards in price discovery."
+            ),
+        )
 
-    # Spread analysis
+    # Spread analysis — disclose what wide vs tight spreads mean for liquidity.
     if card['buy_order_high'] and card['sell_order_low'] and card['sell_order_low'] > 0:
         spread = card['sell_order_low'] - card['buy_order_high']
         spread_pct = (spread / card['sell_order_low']) * 100
-        st.caption(f"Spread: {spread:,} PP ({spread_pct:.1f}%)")
+        if spread_pct >= 30:
+            _liquidity_note = "  ⚠️ Wide spread → low liquidity (orders may take time to fill)"
+        elif spread_pct <= 10:
+            _liquidity_note = "  ✅ Tight spread → liquid market"
+        else:
+            _liquidity_note = ""
+        st.caption(f"Spread: {spread:,} PP ({spread_pct:.1f}%){_liquidity_note}")
+        st.caption(
+            "**Spread** = Sell Low − Buy High. A spread under ~10% usually means "
+            "a liquid card you can flip quickly; over ~30% means thin demand "
+            "where you may have to wait or accept a worse fill."
+        )
 
     # Price history chart
     st.markdown("**Price History**")
@@ -278,7 +465,28 @@ with market_col:
                 "Last 10": s['last_10_price'] or 0,
                 "Variance": s['last_10_variance'] or 0,
             } for s in snapshots]
-            st.dataframe(pd.DataFrame(snap_data), use_container_width=True, hide_index=True)
+            st.dataframe(
+                pd.DataFrame(snap_data),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Buy High": st.column_config.NumberColumn(
+                        format="%d PP", width="small",
+                        help="Highest active BID at snapshot time — what buyers were "
+                             "willing to pay. Lower than Sell Low by the spread."),
+                    "Sell Low": st.column_config.NumberColumn(
+                        format="%d PP", width="small",
+                        help="Lowest active ASK at snapshot time — what sellers were "
+                             "asking. Higher than Buy High by the spread."),
+                    "Last 10": st.column_config.NumberColumn(
+                        format="%d PP", width="small",
+                        help="Average of the last 10 completed sales — what the app "
+                             "uses as the default Est. Price."),
+                    "Variance": st.column_config.NumberColumn(
+                        format="%d", width="small",
+                        help="Std. dev. of the last 10 sales — high = volatile market."),
+                },
+            )
 
 st.divider()
 
@@ -368,6 +576,112 @@ else:
                 st.warning(f"OPS+ {ops_plus} -- Below average")
     else:
         st.caption("No batting stats found for this card.")
+
+st.divider()
+
+# ============================================================
+# 4b. SUPERSTATS (game-log-derived)
+# ============================================================
+# From the HTML game logs: per-at-bat exit velocity, batted ball type,
+# observed handedness splits, and opponent-quality-adjusted performance.
+# Pooled across every team in the league that has this card (cross-team
+# sample, dramatically stabilizes vs single-team stats).
+try:
+    from app.core.superstats import card_full_superstat_report
+    from app.core.card_aggregation import card_confidence
+    _sr = card_full_superstat_report(card_id=card['card_id'], conn=conn)
+    _ss = _sr.get('superstats') or {}
+    _split = _sr.get('observed_splits') or {}
+    _oq = _sr.get('opponent_adjusted') or {}
+    _conf = card_confidence(card_id=card['card_id'], conn=conn)
+    _n = _ss.get('n_at_bats', 0)
+    if _n >= 30 or (_oq and _oq.get('pa', 0) >= 30):
+        st.subheader("Superstats — from game logs")
+        st.caption(
+            f"Pooled across every team instance of this card in the league. "
+            f"Based on {_n} at-bats parsed from OOTP HTML game logs."
+        )
+        # Top metrics
+        sm1, sm2, sm3, sm4, sm5 = st.columns(5)
+        if _ss.get('ev_avg') is not None:
+            sm1.metric("Avg Exit Velocity", f"{_ss['ev_avg']:.1f} mph",
+                       delta=f"p90 {_ss.get('ev_p90')}" if _ss.get('ev_p90') else None,
+                       delta_color="off")
+        if _ss.get('ld_pct') is not None:
+            sm2.metric("Line Drive %", f"{_ss['ld_pct']:.0f}%",
+                       delta=f"lg avg ~28%", delta_color="off")
+        if _ss.get('k_pct') is not None:
+            sm3.metric("True K %", f"{_ss['k_pct']:.1f}%",
+                       delta=f"{_ss.get('strikeouts_swinging', 0)}sw / {_ss.get('strikeouts_looking', 0)}look",
+                       delta_color="off")
+        if _ss.get('hard_hit_rate') is not None:
+            sm4.metric("Hard-hit % (≥90 mph)", f"{_ss['hard_hit_rate']:.0f}%",
+                       delta=f"barrel {_ss.get('barrel_rate', 0):.0f}%", delta_color="off")
+        if _conf and _conf.get('score') is not None:
+            lbl = _conf.get('label', 'none')
+            emoji = {'high': '🟢', 'medium': '🟡', 'low': '🔴'}.get(lbl, '⚪')
+            sm5.metric("Confidence", f"{emoji} {_conf['score']}",
+                       delta=lbl.title(), delta_color="off")
+
+        # Batted-ball distribution
+        bb_types = _ss.get('batted_balls') or {}
+        if bb_types:
+            st.markdown("**Batted ball mix**")
+            bbc1, bbc2, bbc3 = st.columns(3)
+            bbc1.write(f"Line Drive — **{_ss.get('ld_pct') or 0:.0f}%** "
+                       f"(EV {_ss.get('ev_on_ld') or 0:.0f} mph)")
+            bbc2.write(f"Groundball — **{_ss.get('gb_pct') or 0:.0f}%** "
+                       f"(EV {_ss.get('ev_on_gb') or 0:.0f} mph)")
+            bbc3.write(f"Fly/Popup — **{_ss.get('fb_pct') or 0:.0f}%** "
+                       f"(EV {_ss.get('ev_on_fb') or 0:.0f} mph)")
+
+        # Observed splits
+        vs_l = _split.get('vs_LHP') or {}
+        vs_r = _split.get('vs_RHP') or {}
+        if (vs_l.get('pa') or 0) >= 20 or (vs_r.get('pa') or 0) >= 20:
+            st.markdown("**Observed platoon splits (from game logs, not card ratings)**")
+            sp1, sp2 = st.columns(2)
+            with sp1:
+                st.markdown("vs LHP")
+                if vs_l.get('insufficient_sample') or (vs_l.get('pa') or 0) < 20:
+                    st.caption(f"Only {vs_l.get('pa', 0)} PA — insufficient")
+                else:
+                    st.write(f"**{vs_l['pa']}** PA · hit% **{vs_l['hit_pct']:.0f}** · "
+                             f"K% {vs_l['k_pct']:.0f} · BB% {vs_l['bb_pct']:.0f} · "
+                             f"HR% {vs_l['hr_pct']:.1f} · EV {vs_l.get('ev_avg') or 0:.0f}")
+            with sp2:
+                st.markdown("vs RHP")
+                if vs_r.get('insufficient_sample') or (vs_r.get('pa') or 0) < 20:
+                    st.caption(f"Only {vs_r.get('pa', 0)} PA — insufficient")
+                else:
+                    st.write(f"**{vs_r['pa']}** PA · hit% **{vs_r['hit_pct']:.0f}** · "
+                             f"K% {vs_r['k_pct']:.0f} · BB% {vs_r['bb_pct']:.0f} · "
+                             f"HR% {vs_r['hr_pct']:.1f} · EV {vs_r.get('ev_avg') or 0:.0f}")
+            gap = _split.get('split_gap_hit_pct')
+            if gap is not None and gap >= 8:
+                st.warning(f"Platoon gap: **{gap:.1f}pp** difference in hit% between LHP/RHP splits — "
+                           f"use this card in favorable matchups and platoon the weak side.")
+
+        # Opponent quality
+        if _oq.get('available'):
+            st.markdown("**Opponent-quality context**")
+            oqc1, oqc2, oqc3, oqc4 = st.columns(4)
+            oqc1.metric("Avg opposing ERA+ faced",
+                        f"{_oq.get('avg_opp_era_plus') or 0:.0f}",
+                        delta="harder than avg" if (_oq.get('avg_opp_era_plus') or 100) > 105
+                              else ("easier than avg" if (_oq.get('avg_opp_era_plus') or 100) < 95 else "average"),
+                        delta_color="off")
+            oqc2.metric("PA vs aces (ERA+ ≥125)", _oq.get('faced_aces', 0))
+            oqc3.metric("PA vs filler (ERA+ ≤80)", _oq.get('faced_filler', 0))
+            oqc4.metric("Adjusted hit%",
+                        f"{_oq.get('adjusted_hit_pct') or 0:.1f}%",
+                        delta=f"raw {_oq.get('raw_hit_pct') or 0:.1f}%", delta_color="off")
+    else:
+        st.caption("No game-log at-bats yet for this card (need HTML logs "
+                   "from OOTP — see Almanac setting).")
+except Exception as _e:
+    # Don't break the page if superstats aren't available
+    st.caption(f"Superstats unavailable: {_e}")
 
 st.divider()
 

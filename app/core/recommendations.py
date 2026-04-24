@@ -2,6 +2,15 @@
 import sqlite3
 from datetime import datetime
 from app.core.database import get_connection, load_config
+from app.core.tier_context import tier_budget_ceiling, get_active_league_tier
+from app.core.position_eligibility import (
+    BATTING_POSITIONS,
+    POS_RATING_COL,
+    build_eligible_where_clause,
+    select_rating_columns,
+    position_meta_penalty,
+    format_position_annotation,
+)
 
 
 def generate_recommendations():
@@ -19,8 +28,16 @@ def generate_recommendations():
     max_budget_pct = rec_config.get('max_budget_pct', 0.80)
     max_spend = int(budget * max_budget_pct)
 
+    # Tier-aware per-card ceiling: don't recommend 50k PP diamonds to a
+    # Low Bronze team. The user's PP budget caps the upper bound, but the
+    # tier ceiling caps it further when the user is sitting on a large PP
+    # pile (which otherwise tempts the engine to surface expensive cards).
+    league_tier = get_active_league_tier(conn)
+    tier_ceiling = tier_budget_ceiling(league_tier)
+    tier_max_spend = min(max_spend, tier_ceiling) if tier_ceiling else max_spend
+
     # Generate buy recommendations
-    _generate_buy_recs(conn, max_spend, min_meta_improvement)
+    _generate_buy_recs(conn, tier_max_spend, min_meta_improvement)
 
     # Integrate live card upgrade signals into buy recs
     _boost_live_card_upgrades(conn)
@@ -56,6 +73,11 @@ def _generate_buy_recs(conn, max_spend, min_meta_improvement):
     Scans the FULL market (not limited by budget) so the Recommendations tab
     has useful data at any slider position. Budget filtering is done at display time.
     Priority is tiered: budget-friendly cards get higher priority.
+
+    Pitching now tracks ALL occupants per role (SP1–SP5, the bullpen, CL) and
+    benchmarks against the WEAKEST slot, not the best. Previously an ace-
+    quality market card looked unneeded because SP1 already held that slot,
+    even though SP5 was bleeding runs.
     """
     cursor = conn.cursor()
 
@@ -65,50 +87,111 @@ def _generate_buy_recs(conn, max_spend, min_meta_improvement):
         FROM roster_current WHERE lineup_role IN ('starter', 'rotation', 'closer', 'bullpen')
     """).fetchall()
 
+    # Batting: one starter per position → track the best (for replacement comparisons).
+    # Pitching: multiple slots per role → track the full sorted list so we can
+    # suggest upgrades to the worst slot, which is where real improvement lives.
     roster_by_pos = {}
+    pitchers_by_role: dict[str, list[dict]] = {'SP': [], 'RP': [], 'CL': []}
     for r in roster:
         pos = r['position']
-        if pos not in roster_by_pos or r['meta_score'] > roster_by_pos[pos]['meta_score']:
-            roster_by_pos[pos] = dict(r)
+        r_dict = dict(r)
+        if pos in pitchers_by_role:
+            pitchers_by_role[pos].append(r_dict)
+        else:
+            if pos not in roster_by_pos or r_dict['meta_score'] > roster_by_pos[pos]['meta_score']:
+                roster_by_pos[pos] = r_dict
+    # Sort each pitching role ascending (weakest first) so [0] is the upgrade target.
+    for role in pitchers_by_role:
+        pitchers_by_role[role].sort(key=lambda p: p.get('meta_score') or 0)
 
-    # All field positions we expect filled
-    # DH excluded — any batter can DH, no need for a dedicated DH card
-    batting_positions = ['C', '1B', '2B', '3B', 'SS', 'LF', 'CF', 'RF']
-    pitching_positions = ['SP', 'RP', 'CL']
+    # All field positions we expect filled.
+    # DH excluded — any batter can DH, no need for a dedicated DH card.
+    # Uses the shared BATTING_POSITIONS constant so every rec engine agrees
+    # on the set of slots it optimizes for.
+    batting_positions = list(BATTING_POSITIONS)
+    # Expected slot counts per pitching role — matches PT 40-man / active
+    # pitching staff conventions. RP count is approximate; real staffs range
+    # 6–8 but 7 is the normative target. CL is always a single slot.
+    pitching_slots = {'SP': 5, 'RP': 7, 'CL': 1}
 
-    # 1. Roster gap analysis — positions with no starter or weak starter
+    # Track (card_id, position) pairs we've already written so the multi-position
+    # loop doesn't emit duplicate recs (a card eligible at CF, LF, and RF should
+    # surface at most once per slot, and we don't want two LF recs for the same
+    # card if the query fires twice).
+    already_recommended: set[tuple[int, str]] = set()
+
+    # Pre-build the SELECT fragment for pos_rating_* columns — we need the
+    # ratings in-hand so we can compute per-position penalties without a
+    # second query per card.
+    rating_cols_sql = select_rating_columns()
+
+    # 1. Roster gap analysis — positions with no starter or weak starter.
+    # Each position scan considers cards whose PRIMARY position matches OR
+    # whose pos_rating_{slot} meets ELIGIBILITY_THRESHOLD. A meta penalty is
+    # applied for non-primary assignments so low-rating corner-OF cards
+    # don't silently beat true specialists on raw meta alone.
     for pos in batting_positions:
         current = roster_by_pos.get(pos)
         current_meta = current['meta_score'] if current else 0
 
-        # Scan full market — no budget cap, higher per-position limit
-        market_cards = cursor.execute("""
-            SELECT card_id, card_title, position_name, meta_score_batting as meta_score,
-                   last_10_price, sell_order_low, buy_order_high, tier_name, tier
+        where_frag, where_params = build_eligible_where_clause(pos)
+
+        # Scan full market — no budget cap, higher per-position limit.
+        # We fetch pos_rating columns too so ``position_meta_penalty`` can
+        # read the defensive rating for the target slot without a re-query.
+        market_cards = cursor.execute(f"""
+            SELECT card_id, card_title, position_name, meta_score_batting as raw_meta,
+                   last_10_price, sell_order_low, buy_order_high, tier_name, tier,
+                   {rating_cols_sql}
             FROM cards
-            WHERE position_name = ? AND owned = 0
+            WHERE {where_frag} AND owned = 0
                 AND last_10_price > 0
+                AND pitcher_role IS NULL
                 AND meta_score_batting > ?
             ORDER BY meta_score_batting DESC
-        """, (pos, current_meta + min_meta_improvement)).fetchall()
+        """, (*where_params, current_meta)).fetchall()
 
         for card in market_cards:
-            price = card['last_10_price'] or card['sell_order_low'] or 0
+            card_dict = dict(card)
+            card_id = card_dict['card_id']
+            # Guard against double-insertion if the same card qualifies at
+            # multiple target positions via different code paths.
+            if (card_id, pos) in already_recommended:
+                continue
+
+            price = card_dict['last_10_price'] or card_dict['sell_order_low'] or 0
             if price <= 0:
                 continue
 
-            meta = card['meta_score']
+            # Effective meta at THIS slot = raw meta minus defensive penalty.
+            # A primary-CF card at RF (rating 67) pays 0; the same card at LF
+            # (rating 32) pays ~7 — enough to keep ranking honest, not enough
+            # to hide a genuine upgrade.
+            raw_meta = card_dict['raw_meta'] or 0
+            penalty = position_meta_penalty(card_dict, pos)
+            meta = raw_meta - penalty
+            # Drop cards that fall below the min-improvement bar AFTER
+            # penalty. The SQL filter only screened raw meta; the penalty
+            # can push a borderline card back under the threshold.
+            if meta <= current_meta + min_meta_improvement:
+                continue
+
             value_ratio = (meta * meta * 1.0 / price) if price > 0 else 0
             delta = meta - current_meta
+            annotation = format_position_annotation(card_dict, pos)
 
             if not current:
-                reason = f"Empty {pos} slot — {card['card_title']} fills gap"
+                reason = f"Empty {pos} slot — {card_dict['card_title']} fills gap{annotation}"
                 priority = 1
             elif price <= max_spend:
-                reason = f"Upgrade {pos}: +{delta:.0f} meta over {current['player_name']}"
+                reason = f"Upgrade {pos}: +{delta:.0f} meta over {current['player_name']}{annotation}"
                 priority = 2 if delta > 100 else 3
             else:
-                reason = f"Upgrade {pos}: +{delta:.0f} meta over {current['player_name']} (save up)"
+                # Aspirational: exceeds current budget but clearly better.
+                # Kept at Priority 3/4 (not hidden) so the user sees targets
+                # worth saving for; the display layer is responsible for
+                # tagging these as "save up".
+                reason = f"Upgrade {pos}: +{delta:.0f} meta over {current['player_name']} (save up){annotation}"
                 priority = 3 if delta > 200 else 4
 
             cursor.execute("""
@@ -116,15 +199,27 @@ def _generate_buy_recs(conn, max_spend, min_meta_improvement):
                     priority, estimated_price, meta_score, value_ratio, roster_impact)
                 VALUES ('buy', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                card['card_id'], card['card_title'], pos, reason,
-                priority, price, meta, round(value_ratio, 2),
+                card_id, card_dict['card_title'], pos, reason,
+                priority, price, round(meta, 1), round(value_ratio, 2),
                 f"Replace {current['player_name']}" if current else f"Fill {pos}"
             ))
+            already_recommended.add((card_id, pos))
 
-    # Same for pitching positions
-    for pos in pitching_positions:
-        current = roster_by_pos.get(pos)
-        current_meta = current['meta_score'] if current else 0
+    # Pitching — benchmark against the WEAKEST slot per role, not the best.
+    # If you have SP1=800 meta and SP5=520 meta, a 600-meta SP is a real
+    # upgrade (replaces SP5) even though it doesn't beat SP1.
+    for pos, expected_slots in pitching_slots.items():
+        occupants = pitchers_by_role[pos]
+        # Open slots matter too: SP staff of 4 with 5 expected = one empty slot.
+        open_slots = max(0, expected_slots - len(occupants))
+        # Benchmark meta: weakest occupant, or 0 if any slot is empty.
+        weakest = occupants[0] if occupants else None
+        if open_slots > 0:
+            benchmark_meta = 0
+            benchmark_name = None
+        else:
+            benchmark_meta = (weakest['meta_score'] if weakest else 0) or 0
+            benchmark_name = weakest['player_name'] if weakest else None
 
         market_cards = cursor.execute("""
             SELECT card_id, card_title, pitcher_role_name, meta_score_pitching as meta_score,
@@ -134,7 +229,7 @@ def _generate_buy_recs(conn, max_spend, min_meta_improvement):
                 AND last_10_price > 0
                 AND meta_score_pitching > ?
             ORDER BY meta_score_pitching DESC
-        """, (pos, current_meta + min_meta_improvement)).fetchall()
+        """, (pos, benchmark_meta + min_meta_improvement)).fetchall()
 
         for card in market_cards:
             price = card['last_10_price'] or card['sell_order_low'] or 0
@@ -143,16 +238,27 @@ def _generate_buy_recs(conn, max_spend, min_meta_improvement):
 
             meta = card['meta_score']
             value_ratio = (meta * meta * 1.0 / price) if price > 0 else 0
-            delta = meta - current_meta
+            delta = meta - benchmark_meta
+
+            # Mirror the comparison and priority logic used above for batters.
+            # Re-bind ``current`` and ``current_meta`` so the downstream reason/
+            # impact strings read identically to the batting branch.
+            current = weakest if open_slots == 0 else None
+            current_meta = benchmark_meta
+
+            # Weakest-slot label: SP5 when the rotation is full, SP3 when two
+            # slots are open and this card would be the 3rd body, etc.
+            weakest_slot_num = expected_slots if open_slots == 0 else (expected_slots - open_slots + 1)
+            slot_label = f"{pos}{weakest_slot_num}" if expected_slots > 1 else pos
 
             if not current:
-                reason = f"Empty {pos} slot — {card['card_title']} fills gap"
+                reason = f"Empty {slot_label} slot — {card['card_title']} fills gap"
                 priority = 1
             elif price <= max_spend:
-                reason = f"Upgrade {pos}: +{delta:.0f} meta over {current['player_name']}"
+                reason = f"Upgrade {slot_label}: +{delta:.0f} meta over {current['player_name']}"
                 priority = 2 if delta > 100 else 3
             else:
-                reason = f"Upgrade {pos}: +{delta:.0f} meta over {current['player_name']} (save up)"
+                reason = f"Upgrade {slot_label}: +{delta:.0f} meta over {current['player_name']} (save up)"
                 priority = 3 if delta > 200 else 4
 
             cursor.execute("""
@@ -162,83 +268,17 @@ def _generate_buy_recs(conn, max_spend, min_meta_improvement):
             """, (
                 card['card_id'], card['card_title'], pos, reason,
                 priority, price, meta, round(value_ratio, 2),
-                f"Replace {current['player_name']}" if current else f"Fill {pos}"
+                f"Replace {current['player_name']} ({slot_label})" if current else f"Fill {slot_label}"
             ))
 
-    # 1b. Multi-position eligibility scan — find cards that can play secondary positions
-    # Maps position abbreviations to their pos_rating column names
-    pos_rating_map = {
-        'C': 'pos_rating_c', '1B': 'pos_rating_1b', '2B': 'pos_rating_2b',
-        '3B': 'pos_rating_3b', 'SS': 'pos_rating_ss',
-        'LF': 'pos_rating_lf', 'CF': 'pos_rating_cf', 'RF': 'pos_rating_rf',
-    }
-
-    # Collect card_ids already recommended to avoid duplicates
-    already_recommended = set()
-    existing_recs = cursor.execute(
-        "SELECT card_id, position FROM recommendations WHERE rec_type = 'buy' AND dismissed = 0"
-    ).fetchall()
-    for er in existing_recs:
-        already_recommended.add((er['card_id'], er['position']))
-
-    for pos in batting_positions:
-        current = roster_by_pos.get(pos)
-        current_meta = current['meta_score'] if current else 0
-        rating_col = pos_rating_map[pos]
-
-        # Find unowned batting cards with a decent rating at this secondary position
-        # that are listed at a different primary position
-        multi_pos_cards = cursor.execute(f"""
-            SELECT card_id, card_title, position_name, meta_score_batting as meta_score,
-                   last_10_price, sell_order_low, buy_order_high, tier_name, tier,
-                   {rating_col} as sec_pos_rating
-            FROM cards
-            WHERE position_name != ? AND owned = 0
-                AND last_10_price > 0
-                AND meta_score_batting > ?
-                AND {rating_col} >= 100
-                AND pitcher_role_name IS NULL
-            ORDER BY meta_score_batting DESC
-            LIMIT 20
-        """, (pos, current_meta + min_meta_improvement)).fetchall()
-
-        for card in multi_pos_cards:
-            # Skip if already recommended for this position
-            if (card['card_id'], pos) in already_recommended:
-                continue
-            # Skip if already recommended for their primary position
-            if (card['card_id'], card['position_name']) in already_recommended:
-                continue
-
-            price = card['last_10_price'] or card['sell_order_low'] or 0
-            if price <= 0:
-                continue
-
-            meta = card['meta_score']
-            value_ratio = (meta * meta * 1.0 / price) if price > 0 else 0
-            delta = meta - current_meta
-            sec_rating = card['sec_pos_rating']
-
-            if not current:
-                reason = f"Empty {pos} slot — {card['card_title']} (primary {card['position_name']}). Can also play {pos} (rating: {sec_rating})"
-                priority = 2
-            elif price <= max_spend:
-                reason = f"Upgrade {pos}: +{delta:.0f} meta over {current['player_name']}. Can also play {pos} (rating: {sec_rating})"
-                priority = 3
-            else:
-                reason = f"Upgrade {pos}: +{delta:.0f} meta over {current['player_name']} (save up). Can also play {pos} (rating: {sec_rating})"
-                priority = 4
-
-            cursor.execute("""
-                INSERT INTO recommendations (rec_type, card_id, card_title, position, reason,
-                    priority, estimated_price, meta_score, value_ratio, roster_impact)
-                VALUES ('buy', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                card['card_id'], card['card_title'], pos, reason,
-                priority, price, meta, round(value_ratio, 2),
-                f"Secondary pos: {card['position_name']} -> {pos}"
-            ))
-            already_recommended.add((card['card_id'], pos))
+    # (Multi-position scan removed 2026-04-20: the primary loop above now
+    # honors pos_rating_* natively via build_eligible_where_clause, so a
+    # CF-primary card with LF=32 competes for the LF slot in the SAME pass
+    # that handles true-LF cards. The old secondary scan gated on rating
+    # >= 100 — too strict; Van Haltren's LF=32 never qualified — and
+    # skipped cards already matched at their primary position, so versatile
+    # cards were actively hidden from secondary slots. See
+    # memory/project_position_flexibility_gap.md for the backstory.)
 
     # 2. Best value buys across all positions (no budget cap, min meta 200)
     value_buys = cursor.execute("""
@@ -313,7 +353,7 @@ def _boost_live_card_upgrades(conn):
 
     for rec in live_recs:
         cached = cursor.execute(
-            "SELECT signal, score, reasons FROM live_card_cache WHERE card_id = ?",
+            "SELECT signal, confidence, score, reasons FROM live_card_cache WHERE card_id = ?",
             (rec['card_id'],)
         ).fetchone()
 
@@ -416,13 +456,20 @@ def _generate_sell_recs(conn):
 def _flag_underperformer_sells(conn):
     """Flag owned players whose in-game stats don't match their meta scores.
 
-    Batters: meta_score > 600 but OPS < 0.650 with 50+ AB
-    Pitchers: meta_score > 400 but ERA > 5.00 with 30+ IP
+    Uses performance gaps, not hardcoded meta thresholds. Prior code had
+    ``meta > 600`` for batters and ``meta > 400`` for pitchers, which
+    silently excluded every Low Bronze roster from ever being flagged
+    (their card metas rarely reach those floors). ``lineup_role`` already
+    gates to active roster, so the meta threshold was redundant AND
+    tier-biased. Removed.
     """
+    import logging
+    logger = logging.getLogger(__name__)
     cursor = conn.cursor()
 
     try:
-        # Underperforming batters
+        # Underperforming batters: active roster + 50+ AB + OPS below .650.
+        # (.650 is roughly the low-end "starter-worthy" floor across tiers.)
         bat_underperformers = cursor.execute("""
             SELECT r.player_name, r.position, r.meta_score,
                    bs.ops, bs.ab,
@@ -435,8 +482,7 @@ def _flag_underperformer_sells(conn):
             ) latest ON bs.player_name = latest.player_name
                     AND bs.snapshot_date = latest.max_date
             LEFT JOIN cards c ON c.card_title LIKE '%' || r.player_name || '%' AND c.owned > 0
-            WHERE r.meta_score > 600
-                AND bs.ops < 0.650
+            WHERE bs.ops < 0.650
                 AND bs.ab >= 50
                 AND r.lineup_role IN ('starter', 'rotation', 'closer', 'bullpen')
         """).fetchall()
@@ -457,7 +503,9 @@ def _flag_underperformer_sells(conn):
                 if existing:
                     continue
 
-            reason = f"Underperformer: meta {meta:.0f} but .{int(ops * 1000):03d} OPS in-game. Consider selling for ~{price:,} PP"
+            # OPS formatted explicitly for values >= 1.000 (fixes .1050 bug).
+            ops_str = f"{ops:.3f}" if ops >= 1.0 else f".{int(round(ops * 1000)):03d}"
+            reason = f"Underperformer: meta {meta:.0f} but {ops_str} OPS in-game. Consider selling for ~{price:,} PP"
 
             cursor.execute("""
                 INSERT INTO recommendations (rec_type, card_id, card_title, position, reason,
@@ -481,8 +529,7 @@ def _flag_underperformer_sells(conn):
             ) latest ON ps.player_name = latest.player_name
                     AND ps.snapshot_date = latest.max_date
             LEFT JOIN cards c ON c.card_title LIKE '%' || r.player_name || '%' AND c.owned > 0
-            WHERE r.meta_score > 400
-                AND ps.era > 5.00
+            WHERE ps.era > 5.00
                 AND ps.ip >= 30
                 AND r.lineup_role IN ('starter', 'rotation', 'closer', 'bullpen')
         """).fetchall()
@@ -513,8 +560,15 @@ def _flag_underperformer_sells(conn):
                 2, price, meta, 0, "Underperforming in-game"
             ))
 
-    except Exception:
-        pass  # Stats tables may not exist yet — this is optional
+    except sqlite3.OperationalError as e:
+        # Stats tables may not exist yet on fresh install — that's expected
+        # and non-fatal. Anything else we want to see in the logs.
+        if "no such table" in str(e).lower():
+            logger.info("Skipping underperformer detection: stats tables not yet created")
+        else:
+            logger.warning(f"Underperformer detection failed: {e}", exc_info=True)
+    except Exception as e:
+        logger.warning(f"Underperformer detection failed: {e}", exc_info=True)
 
 
 def cache_live_card_analysis(results: list):
