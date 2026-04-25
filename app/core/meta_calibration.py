@@ -743,6 +743,51 @@ def run_calibration(conn=None, league_id=None):
             _save_calibration(conn, 'pitching', combined_fit, events)
         summary['pitching'] = combined_fit
 
+        # ══ Per-league fits (Epic G, 2026-04-24) ══
+        # Cross-league residuals between lb124 and i76 are opposite-signed,
+        # so pooled weights under-fit both leagues. We fit each qualifying
+        # league separately and store under `{type}:{league}` so the weight
+        # loader can prefer the league-specific row when the active league
+        # matches. The gate (CV R² OR Pearson r) prevents small-sample
+        # fits from being used; those fall back to pooled at load time.
+        league_ids = []
+        try:
+            for lr in conn.execute(
+                "SELECT DISTINCT league_id FROM batting_stats "
+                "WHERE league_id IS NOT NULL"
+            ).fetchall():
+                league_ids.append(lr[0])
+        except Exception as _e:
+            logger.warning("cross-league calibration scan failed: %s", _e)
+        summary['per_league'] = {}
+        for lg in league_ids:
+            per = {}
+            # Batting per league
+            try:
+                lbf = calibrate_batting(conn, league_id=lg, prior_weights=prior_bat)
+                if 'error' not in lbf:
+                    clipped, events = _sanity_clip(lbf['weights'], prior_bat)
+                    lbf['weights'] = clipped
+                    lbf['sanity_clip_events'] = events
+                    _save_calibration(conn, f'batting:{lg}', lbf, events)
+                per['batting'] = lbf
+            except Exception as _e:
+                per['batting'] = {'error': str(_e)}
+            # Pitching per league (combined role only — SP/RP splits would
+            # shrink sample size another ~50% and are mostly pooled-tied).
+            try:
+                lpf = calibrate_pitching(conn, league_id=lg, role_filter=None,
+                                         prior_weights=prior_pit)
+                if 'error' not in lpf:
+                    clipped, events = _sanity_clip(lpf['weights'], prior_pit)
+                    lpf['weights'] = clipped
+                    lpf['sanity_clip_events'] = events
+                    _save_calibration(conn, f'pitching:{lg}', lpf, events)
+                per['pitching'] = lpf
+            except Exception as _e:
+                per['pitching'] = {'error': str(_e)}
+            summary['per_league'][lg] = per
+
         conn.commit()
         summary['finished_at'] = datetime.now().isoformat()
         return summary

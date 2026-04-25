@@ -263,6 +263,38 @@ def _do_refresh() -> dict:
     except Exception as e:
         logger.exception("Autonomous sweep failed")
 
+    # Retention sweep — keep the DB from growing unboundedly:
+    #   - ingestion_log: keep 30 days (file mtime debugging)
+    #   - recommendations: keep last batch per calendar day for 30 days,
+    #     drop older days entirely (intraday churn is noise, daily snapshots
+    #     are enough for "what did we recommend when" history)
+    # Run quietly; errors shouldn't block the refresh.
+    try:
+        from app.core.database import get_connection as _gc
+        _rc = _gc()
+        try:
+            r1 = _rc.execute(
+                "DELETE FROM ingestion_log WHERE ingested_at < datetime('now', '-30 days')"
+            ).rowcount
+            r2 = _rc.execute(
+                """DELETE FROM recommendations
+                   WHERE DATE(created_at) < DATE('now', '-30 days')
+                      OR created_at NOT IN (
+                          SELECT MAX(created_at) FROM recommendations
+                          GROUP BY DATE(created_at)
+                      )"""
+            ).rowcount
+            _rc.commit()
+            if r1 or r2:
+                logger.info(
+                    "retention sweep: %d ingestion_log, %d recommendations pruned",
+                    r1, r2,
+                )
+        finally:
+            _rc.close()
+    except Exception:
+        logger.exception("retention sweep failed")
+
     summary['duration'] = time.time() - started
 
     # Persist status

@@ -48,7 +48,11 @@ EXPORT_GROUPS: dict[str, dict] = {
         'priority': 1,
     },
     'collection': {
-        'label': 'Collection (all cards)',
+        # Label deliberately avoids "card list" / "all cards" phrasing, which
+        # users conflate with the Market / Auction House export
+        # (pt_card_list.csv). This label is the Collection → Manage Cards
+        # Ratings CSVs — a completely different OOTP menu.
+        'label': 'Collection Ratings (Manage Cards)',
         # OOTP's Collection Export only writes the currently-selected view.
         # Users routinely click Export while on the default "Overview" view,
         # which produces collection_..._default.csv (aggregates only, useless
@@ -57,7 +61,7 @@ EXPORT_GROUPS: dict[str, dict] = {
         # Export clicked after each switch.
         'hint': ('Collection → Manage Cards → switch view to **Batting Ratings** '
                  '→ Export, then **Pitching Ratings** → Export (default view is '
-                 'not enough)'),
+                 'not enough; this is NOT the Market / pt_card_list export)'),
         'file_types': ['collection_batting', 'collection_pitching'],
         'priority': 1,
     },
@@ -258,7 +262,18 @@ def build_staleness_report(watch_dir: str) -> StalenessReport:
         overall_label = f"{worst.label} never exported — please run now"
     elif worst_rank_val >= 3:
         overall_status = 'stale'
-        overall_label = f"{worst.label} is {worst.newest_age_h:.0f}h old — refresh now"
+        # Collection stale headlines get the inline fix — the generic
+        # "refresh now" wording leads users to re-export the Market CSV
+        # (pt_card_list) thinking that's the card list, which doesn't
+        # update the Ratings views we actually consume.
+        if worst.group_key == 'collection':
+            overall_label = (
+                f"{worst.label} is {worst.newest_age_h:.0f}h old — in OOTP: "
+                "Collection → Manage Cards → switch view to Batting Ratings "
+                "→ Export, then Pitching Ratings → Export"
+            )
+        else:
+            overall_label = f"{worst.label} is {worst.newest_age_h:.0f}h old — refresh now"
     elif worst and worst.relative_status == 'lagging':
         overall_status = 'aging'
         # Special case: Collection lagging while a FRESH collection_default

@@ -36,7 +36,7 @@ with tab_buy:
     if summary['buy_signals']:
         st.dataframe(
             pd.DataFrame(summary['buy_signals'])[DISPLAY_COLS],
-            use_container_width=True, hide_index=True,
+            width='stretch', hide_index=True,
         )
     else:
         st.info("No buy-low signals detected. Need more price snapshots or price movement.")
@@ -45,7 +45,7 @@ with tab_sell:
     if summary['sell_signals']:
         st.dataframe(
             pd.DataFrame(summary['sell_signals'])[DISPLAY_COLS],
-            use_container_width=True, hide_index=True,
+            width='stretch', hide_index=True,
         )
     else:
         st.info("No sell-high signals detected. Need more price snapshots or price movement.")
@@ -55,7 +55,7 @@ with tab_vol:
         vol_cols = ['Card', 'Pos', 'Tier', 'Price', 'Volatility', 'Momentum', 'Direction', 'Signal']
         st.dataframe(
             pd.DataFrame(summary['most_volatile'])[vol_cols],
-            use_container_width=True, hide_index=True,
+            width='stretch', hide_index=True,
         )
     else:
         st.info("No volatility data yet. Need more price snapshots.")
@@ -93,7 +93,7 @@ if search:
                                       mode='lines', name='Buy High', line=dict(dash='dot')))
             fig.update_layout(title=f"Price History", xaxis_title="Date", yaxis_title="PP",
                               height=400)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
         stats = get_price_stats(card_id, conn)
         if stats and stats['snapshot_count']:
@@ -140,7 +140,7 @@ if movers:
             "Change": m['price_change'],
             "% Change": f"{m['pct_change']}%",
         })
-    st.dataframe(pd.DataFrame(mover_data), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(mover_data), width='stretch', hide_index=True)
 else:
     st.info("Need multiple price snapshots to show movers. Import market data over multiple sessions.")
 

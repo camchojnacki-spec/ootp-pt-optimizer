@@ -308,7 +308,7 @@ with tab_grid:
         styled = grid.style.format("{:+.3f}", na_rep="\u2014").background_gradient(
             cmap="RdYlGn", vmin=-0.5, vmax=0.5, axis=None,
         )
-        st.dataframe(styled, use_container_width=True)
+        st.dataframe(styled, width='stretch')
 
         # Top absolute-r cells so the user sees the strongest signals first.
         flat = grid.stack(future_stack=True).dropna().reset_index()
@@ -316,7 +316,7 @@ with tab_grid:
         flat["|r|"] = flat["r"].abs()
         flat = flat.sort_values("|r|", ascending=False).head(12).drop(columns=["|r|"])
         st.markdown("**Strongest 12 signals in this view:**")
-        st.dataframe(flat, use_container_width=True, hide_index=True,
+        st.dataframe(flat, width='stretch', hide_index=True,
                      column_config={"r": st.column_config.NumberColumn(format="%+.3f")})
 
 
@@ -384,7 +384,7 @@ with tab_ranks:
             meta_col: "Meta", "last_10_price": "Price", "fit": "Fit (\u03c3)",
             "owned": "Owned",
         }),
-        use_container_width=True, hide_index=True,
+        width='stretch', hide_index=True,
         column_config={
             "Fit (\u03c3)": st.column_config.NumberColumn(format="%+.2f",
                 help="Z-score composite. +1.0 = 1 SD above mean on the outcomes that matter for this role."),
@@ -399,7 +399,7 @@ with tab_ranks:
             "Net weight (sum of signed r \u00d7 direction)": weights.values,
         }).sort_values("Net weight (sum of signed r \u00d7 direction)",
                        key=lambda s: s.abs(), ascending=False)
-        st.dataframe(weights_df, use_container_width=True, hide_index=True,
+        st.dataframe(weights_df, width='stretch', hide_index=True,
                      column_config={
                          "Net weight (sum of signed r \u00d7 direction)":
                              st.column_config.NumberColumn(format="%+.3f"),

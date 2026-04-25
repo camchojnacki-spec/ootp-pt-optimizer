@@ -53,7 +53,7 @@ if summary['teams_needed']:
                 "Mission Value": s['mission_value'],
             })
         st.markdown(f"**{len(shopping)} cards needed — total cost: {total_cost:,} PP**")
-        st.dataframe(pd.DataFrame(shop_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(shop_data), width='stretch', hide_index=True)
     else:
         st.info("No affordable Live cards found for missing teams.")
 
@@ -79,7 +79,7 @@ for t in progress:
     })
 
 df = pd.DataFrame(prog_data)
-st.dataframe(df, use_container_width=True, hide_index=True)
+st.dataframe(df, width='stretch', hide_index=True)
 
 # Expandable owned cards per team
 st.divider()
@@ -110,6 +110,6 @@ if owned_teams:
                         "Price": f"{c['last_10_price']:,}" if c['last_10_price'] else "—",
                         "Mission": c['mission_value'] or 0,
                     })
-                st.dataframe(pd.DataFrame(tc_data), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(tc_data), width='stretch', hide_index=True)
 
 conn.close()

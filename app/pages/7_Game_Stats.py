@@ -224,7 +224,7 @@ with tab_overview:
             yaxis=dict(gridcolor=GRID, zeroline=False),
             margin=dict(t=20, b=40, l=50, r=20),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     if not pit_df.empty:
         col_luck, col_dom = st.columns(2)
@@ -278,7 +278,7 @@ with tab_overview:
                 yaxis=dict(gridcolor=GRID, zeroline=False),
                 margin=dict(t=20, b=40, l=50, r=20),
             )
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width='stretch')
 
         with col_dom:
             st.markdown("### Pitching: Dominance (K% vs BB%)")
@@ -320,7 +320,7 @@ with tab_overview:
                 yaxis=dict(gridcolor=GRID, zeroline=False),
                 margin=dict(t=20, b=40, l=50, r=20),
             )
-            st.plotly_chart(fig3, use_container_width=True)
+            st.plotly_chart(fig3, width='stretch')
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -353,7 +353,7 @@ with tab_batting:
         display_bat.columns = ["Player", "Pos", "PA", "AVG", "OBP", "SLG",
                                "OPS", "wOBA", "ISO", "HR", "K%", "BB%", "WAR/600", "WAR", "BABIP"]
 
-        st.dataframe(display_bat, use_container_width=True, hide_index=True,
+        st.dataframe(display_bat, width='stretch', hide_index=True,
                      height=min(35 * len(display_bat) + 40, 500),
                      column_config={
                          "AVG": st.column_config.NumberColumn(format="%.3f"),
@@ -385,7 +385,7 @@ with tab_batting:
             if not lucky.empty:
                 lucky.columns = ["Player", "BABIP", "AVG", "OPS", "WAR", "Meta"]
                 st.dataframe(lucky.sort_values("BABIP", ascending=False),
-                             use_container_width=True, hide_index=True,
+                             width='stretch', hide_index=True,
                              column_config={"BABIP": st.column_config.NumberColumn(format="%.3f"),
                                            "AVG": st.column_config.NumberColumn(format="%.3f"),
                                            "OPS": st.column_config.NumberColumn(format="%.3f")})
@@ -396,7 +396,7 @@ with tab_batting:
             if not unlucky.empty:
                 unlucky.columns = ["Player", "BABIP", "AVG", "OPS", "WAR", "Meta"]
                 st.dataframe(unlucky.sort_values("BABIP"),
-                             use_container_width=True, hide_index=True,
+                             width='stretch', hide_index=True,
                              column_config={"BABIP": st.column_config.NumberColumn(format="%.3f"),
                                            "AVG": st.column_config.NumberColumn(format="%.3f"),
                                            "OPS": st.column_config.NumberColumn(format="%.3f")})
@@ -418,7 +418,7 @@ with tab_pitching:
         display_pit.columns = ["Player", "Role", "IP", "ERA", "FIP", "ERA-FIP",
                                "WHIP", "K%", "BB%", "K-BB%", "WAR/200", "WAR"]
 
-        st.dataframe(display_pit, use_container_width=True, hide_index=True,
+        st.dataframe(display_pit, width='stretch', hide_index=True,
                      height=min(35 * len(display_pit) + 40, 500),
                      column_config={
                          "ERA": st.column_config.NumberColumn(format="%.2f"),
@@ -444,7 +444,7 @@ with tab_pitching:
             if not lucky_p.empty:
                 lucky_p.columns = ["Player", "Role", "ERA", "FIP", "Gap", "IP"]
                 st.dataframe(lucky_p.sort_values("Gap"),
-                             use_container_width=True, hide_index=True,
+                             width='stretch', hide_index=True,
                              column_config={"ERA": st.column_config.NumberColumn(format="%.2f"),
                                            "FIP": st.column_config.NumberColumn(format="%.2f"),
                                            "Gap": st.column_config.NumberColumn(format="%.2f")})
@@ -457,7 +457,7 @@ with tab_pitching:
             if not unlucky_p.empty:
                 unlucky_p.columns = ["Player", "Role", "ERA", "FIP", "Gap", "IP"]
                 st.dataframe(unlucky_p.sort_values("Gap", ascending=False),
-                             use_container_width=True, hide_index=True,
+                             width='stretch', hide_index=True,
                              column_config={"ERA": st.column_config.NumberColumn(format="%.2f"),
                                            "FIP": st.column_config.NumberColumn(format="%.2f"),
                                            "Gap": st.column_config.NumberColumn(format="%.2f")})
@@ -554,7 +554,7 @@ with tab_player:
                     plot_bgcolor=BG, paper_bgcolor=BG,
                     margin=dict(t=10, b=30, l=100, r=40),
                 )
-                st.plotly_chart(fig_pct, use_container_width=True)
+                st.plotly_chart(fig_pct, width='stretch')
 
             # Meta vs actual
             if row.get("meta") and row["meta"] > 0:
@@ -585,7 +585,7 @@ with tab_player:
                 fig_trend.update_layout(height=280, showlegend=False,
                                        plot_bgcolor=BG, paper_bgcolor=BG,
                                        margin=dict(t=40, b=30, l=40, r=20))
-                st.plotly_chart(fig_trend, use_container_width=True)
+                st.plotly_chart(fig_trend, width='stretch')
 
         if is_pitcher:
             row = pit_df[pit_df["player_name"] == selected].iloc[0]
@@ -650,7 +650,7 @@ with tab_player:
                     plot_bgcolor=BG, paper_bgcolor=BG,
                     margin=dict(t=10, b=30, l=80, r=40),
                 )
-                st.plotly_chart(fig_pct, use_container_width=True)
+                st.plotly_chart(fig_pct, width='stretch')
 
             # Luck assessment
             gap = row["ERA-FIP"]
@@ -687,7 +687,7 @@ with tab_player:
                                        plot_bgcolor=BG, paper_bgcolor=BG,
                                        margin=dict(t=40, b=30, l=40, r=20))
                 fig_trend.update_yaxes(autorange="reversed", row=1, col=1)
-                st.plotly_chart(fig_trend, use_container_width=True)
+                st.plotly_chart(fig_trend, width='stretch')
 
         if not is_batter and not is_pitcher:
             st.warning(f"No qualifying stats for {selected} (need {MIN_PA}+ PA or {MIN_IP}+ IP).")
@@ -792,7 +792,7 @@ with tab_meta:
                 fig_meta.add_annotation(x=mid_meta + 30, y=mid_perf + 80, text="⭐ As Advertised",
                                        font=dict(color=GOLD, size=10), showarrow=False)
 
-                st.plotly_chart(fig_meta, use_container_width=True)
+                st.plotly_chart(fig_meta, width='stretch')
         else:
             st.info("No batters with both meta scores and in-game stats. Make sure cards are linked to roster.")
 
@@ -841,7 +841,7 @@ with tab_meta:
                     xaxis=dict(gridcolor=GRID), yaxis=dict(gridcolor=GRID),
                     margin=dict(t=20, b=40, l=50, r=20),
                 )
-                st.plotly_chart(fig_mp, use_container_width=True)
+                st.plotly_chart(fig_mp, width='stretch')
 
     # ── Per-position calibration table (Tier-2 #8) ──
     # The scatters above answer "does meta predict performance" *globally* —
@@ -923,7 +923,7 @@ with tab_meta:
             st.markdown("**Batting positions**")
             if not _bat_df.empty:
                 st.dataframe(
-                    _bat_df, use_container_width=True, hide_index=True,
+                    _bat_df, width='stretch', hide_index=True,
                     column_config={
                         "Position": st.column_config.TextColumn(width="small"),
                         "r": st.column_config.NumberColumn(
@@ -942,7 +942,7 @@ with tab_meta:
             st.markdown("**Pitching roles**")
             if not _pit_df.empty:
                 st.dataframe(
-                    _pit_df, use_container_width=True, hide_index=True,
+                    _pit_df, width='stretch', hide_index=True,
                     column_config={
                         "Position": st.column_config.TextColumn(width="small"),
                         "r": st.column_config.NumberColumn(
@@ -1009,7 +1009,7 @@ with tab_meta:
 
         cal_col1, cal_col2 = st.columns([1, 3])
         with cal_col1:
-            if st.button("🔄 Run Calibration", type="primary", use_container_width=True,
+            if st.button("🔄 Run Calibration", type="primary", width='stretch',
                          help="Analyze your team's performance data to find better meta weights"):
                 with st.spinner("Analyzing card ratings vs in-game performance..."):
                     result = auto_calibrate_weights(conn)
@@ -1092,7 +1092,7 @@ with tab_meta:
                         "Current": round(current, 2),
                         "Δ": round(current - default, 2),
                     })
-                st.dataframe(pd.DataFrame(bat_w_data), use_container_width=True, hide_index=True,
+                st.dataframe(pd.DataFrame(bat_w_data), width='stretch', hide_index=True,
                              height=320)
 
             with w_col2:
@@ -1110,7 +1110,7 @@ with tab_meta:
                         "RP": round(rp_val, 2),
                         "Combined": round(combined, 2),
                     })
-                st.dataframe(pd.DataFrame(pit_w_data), use_container_width=True, hide_index=True,
+                st.dataframe(pd.DataFrame(pit_w_data), width='stretch', hide_index=True,
                              height=280)
                 st.caption(
                     "SP / RP columns come from separate calibration runs — the "

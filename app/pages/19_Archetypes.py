@@ -92,7 +92,7 @@ st.dataframe(
         "avg_mix": "Avg mix-score",
         "avg_elite_ratings": "Avg elite ratings (>=80)",
     }),
-    use_container_width=True,
+    width='stretch',
     hide_index=True,
 )
 
@@ -158,7 +158,7 @@ st.dataframe(
         "position_name": "Pos",
         "pitcher_role_name": "P Role",
     }),
-    use_container_width=True,
+    width='stretch',
     hide_index=True,
     height=400,
 )
@@ -268,7 +268,7 @@ else:
             "position_name": "Pos",
             "pitcher_role_name": "P Role",
         }),
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         height=400,
     )

@@ -233,6 +233,11 @@ FILE_PATTERNS = {
     # currently a noop — league_team_stats doesn't have standings columns yet
     # and adding them is a migration we can defer until a consumer exists.
     "team_standings": "team_statistics___info_-_sortable_stats_default",
+    # Team-level "history" view = per-team multi-year record (Yrs, PO, DIV_1,
+    # CHAMP, last-year G/W/L/%/POS/GB). Recognized-noop — both active leagues
+    # are in year 1 so the columns are all zeros/dashes; wire up a handler
+    # once a league has real historical data to exploit.
+    "team_stats_history": "team_statistics___info_-_sortable_stats_history",
     # League-wide player DEFAULT view — this is the only export that carries
     # the TM (short team name) + LG columns needed for card-ownership
     # attribution. Paired row-for-row with stats_batting_ratings /

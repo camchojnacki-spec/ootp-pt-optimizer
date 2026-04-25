@@ -142,7 +142,7 @@ if search and len(search.strip()) >= 2:
             table_df = df[valid_cols].copy()
             table_df = table_df.rename(columns={c: col_labels.get(c, c) for c in valid_cols})
 
-            st.dataframe(table_df, use_container_width=True, hide_index=True)
+            st.dataframe(table_df, width='stretch', hide_index=True)
 
             # --- Cross-League Comparison ---
             unique_leagues = df["league_id"].dropna().unique()
@@ -169,7 +169,7 @@ if search and len(search.strip()) >= 2:
                             summary["Avg OPS"] = round(ops_vals.mean(), 3)
                     league_summary.append(summary)
 
-                st.dataframe(pd.DataFrame(league_summary), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(league_summary), width='stretch', hide_index=True)
 
     except Exception as e:
         st.error(f"Error looking up player: {e}")
@@ -197,7 +197,7 @@ try:
                 display.columns = ["Player", "Pos", "Old Meta", "New Meta", "Change", "% Change"]
                 display["Change"] = display["Change"].apply(lambda x: f"+{x:.1f}")
                 display["% Change"] = display["% Change"].apply(lambda x: f"+{x:.1f}%")
-                st.dataframe(display, use_container_width=True, hide_index=True)
+                st.dataframe(display, width='stretch', hide_index=True)
             else:
                 st.caption("No risers in this period.")
 
@@ -209,7 +209,7 @@ try:
                 display.columns = ["Player", "Pos", "Old Meta", "New Meta", "Change", "% Change"]
                 display["Change"] = display["Change"].apply(lambda x: f"{x:.1f}")
                 display["% Change"] = display["% Change"].apply(lambda x: f"{x:.1f}%")
-                st.dataframe(display, use_container_width=True, hide_index=True)
+                st.dataframe(display, width='stretch', hide_index=True)
             else:
                 st.caption("No fallers in this period.")
 
@@ -250,7 +250,7 @@ try:
                 display["Old Price"] = pr_df["price_old"].apply(lambda x: f"{x:,.0f}")
                 display["New Price"] = pr_df["price_new"].apply(lambda x: f"{x:,.0f}")
                 display["Meta"] = display["Meta"].apply(lambda x: f"{x:.0f}")
-                st.dataframe(display, use_container_width=True, hide_index=True)
+                st.dataframe(display, width='stretch', hide_index=True)
             else:
                 st.caption("No price risers detected.")
 
@@ -267,7 +267,7 @@ try:
                 display["Old Price"] = pf_df["price_old"].apply(lambda x: f"{x:,.0f}")
                 display["New Price"] = pf_df["price_new"].apply(lambda x: f"{x:,.0f}")
                 display["Meta"] = display["Meta"].apply(lambda x: f"{x:.0f}")
-                st.dataframe(display, use_container_width=True, hide_index=True)
+                st.dataframe(display, width='stretch', hide_index=True)
 
                 # Flag buy opportunities: high meta + falling price
                 buys = pf_df[pf_df["meta_score"] >= 200]
@@ -323,7 +323,7 @@ try:
             export_data.append(row)
 
         export_df = pd.DataFrame(export_data)
-        st.dataframe(export_df, use_container_width=True, hide_index=True)
+        st.dataframe(export_df, width='stretch', hide_index=True)
 
         st.caption(f"Total exports: {len(exports)}")
 

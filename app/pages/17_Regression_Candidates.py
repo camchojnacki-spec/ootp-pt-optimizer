@@ -91,7 +91,7 @@ else:
     } for c in cands])
 
     st.dataframe(
-        df, use_container_width=True, hide_index=True,
+        df, width='stretch', hide_index=True,
         column_config={
             '': st.column_config.TextColumn(width=30),
             'Dir': st.column_config.TextColumn(width='small'),

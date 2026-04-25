@@ -110,7 +110,7 @@ with ratings_col:
             "vs LHB": [v or 0 for v in pitch_vl],
             "vs RHB": [v or 0 for v in pitch_vr],
         })
-        st.dataframe(pitch_df, use_container_width=True, hide_index=True)
+        st.dataframe(pitch_df, width='stretch', hide_index=True)
 
         # Extra pitching info
         extra_cols = st.columns(3)
@@ -173,7 +173,7 @@ with ratings_col:
             "vs LHP": [v or 0 for v in bat_vl],
             "vs RHP": [v or 0 for v in bat_vr],
         })
-        st.dataframe(bat_df, use_container_width=True, hide_index=True)
+        st.dataframe(bat_df, width='stretch', hide_index=True)
 
         if card['meta_score_batting']:
             # Compute split-aware metas for the tooltip. Overall is the canonical
@@ -250,7 +250,7 @@ with ratings_col:
                 ])
                 st.dataframe(
                     _comp_df,
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True,
                     column_config={
                         "Rating": st.column_config.TextColumn(width="medium"),
@@ -433,7 +433,7 @@ with market_col:
             yaxis_title="Price (PP)",
             showlegend=False,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
         # Price momentum
         if len(prices) >= 3:
@@ -467,7 +467,7 @@ with market_col:
             } for s in snapshots]
             st.dataframe(
                 pd.DataFrame(snap_data),
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
                 column_config={
                     "Buy High": st.column_config.NumberColumn(

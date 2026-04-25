@@ -675,11 +675,11 @@ def ingest_box_score(filepath: str, conn=None) -> dict:
             )
             cursor.execute(
                 """INSERT OR REPLACE INTO game_batting
-                   (game_id, player_name, card_id, team_name, position, batting_order,
+                   (game_id, league_id, player_name, card_id, team_name, position, batting_order,
                     ab, r, h, rbi, bb, k, lob,
                     season_avg, season_hr, season_rbi)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (parsed['game_id'], b['player_name'], card_id, b['team'],
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (parsed['game_id'], parsed.get('league_id'), b['player_name'], card_id, b['team'],
                  b['position'], b['batting_order'],
                  b['ab'], b['r'], b['h'], b['rbi'], b['bb'], b['k'], b['lob'],
                  b['season_avg'], b['season_hr'], b['season_rbi']),
@@ -692,12 +692,12 @@ def ingest_box_score(filepath: str, conn=None) -> dict:
             )
             cursor.execute(
                 """INSERT OR REPLACE INTO game_pitching
-                   (game_id, player_name, card_id, team_name, appearance_order,
+                   (game_id, league_id, player_name, card_id, team_name, appearance_order,
                     role_flag, role_number,
                     ip, h, r, er, bb, k, hr, pitches, strikes,
                     batters_faced, ground_outs, fly_outs, game_score, season_era)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (parsed['game_id'], p['player_name'], card_id, p['team'],
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (parsed['game_id'], parsed.get('league_id'), p['player_name'], card_id, p['team'],
                  p['appearance_order'], p['role_flag'], p['role_number'],
                  p['ip'], p['h'], p['r'], p['er'], p['bb'], p['k'], p['hr'],
                  p['pitches'], p['strikes'],
@@ -735,11 +735,11 @@ def ingest_box_score(filepath: str, conn=None) -> dict:
             )
             cursor.execute(
                 """INSERT INTO game_clutch_events
-                   (game_id, player_name, card_id, team_name, event_type,
+                   (game_id, league_id, player_name, card_id, team_name, event_type,
                     event_count, inning, context, opposing_pitcher,
                     season_count, raw_text)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (parsed['game_id'], ev['player_name'], cid,
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (parsed['game_id'], parsed.get('league_id'), ev['player_name'], cid,
                  ev.get('team_name'), ev['event_type'],
                  ev.get('event_count', 1), ev.get('inning'),
                  ev.get('context'), ev.get('opposing_pitcher'),
@@ -1185,6 +1185,24 @@ def ingest_game_log(filepath: str, conn=None) -> dict:
                     'reason': 'parse returned None'}
 
         cursor = conn.cursor()
+
+        # Ensure a parent `games` row exists before inserting at-bats. Raw
+        # game_log.html files don't carry team/date/score headers, so when
+        # the matching game_box.html isn't also ingested (missing export,
+        # OOTP skipped writing it, etc.) we'd previously leave orphan
+        # at-bats that violated the FK. Stub the row with just the game_id
+        # + source_file so downstream joins don't drop rows; a subsequent
+        # box-score ingest will `DELETE + INSERT` the full record.
+        existing = cursor.execute(
+            "SELECT 1 FROM games WHERE game_id = ?", (parsed['game_id'],)
+        ).fetchone()
+        if not existing:
+            cursor.execute(
+                """INSERT INTO games (game_id, league_id, source_file)
+                   VALUES (?, ?, ?)""",
+                (parsed['game_id'], parsed.get('league_id'), parsed.get('source_file')),
+            )
+
         cursor.execute("DELETE FROM game_log_at_bats WHERE game_id = ?",
                        (parsed['game_id'],))
 
@@ -1206,12 +1224,13 @@ def ingest_game_log(filepath: str, conn=None) -> dict:
 
             cursor.execute(
                 """INSERT INTO game_log_at_bats
-                   (game_id, inning, half_inning, pitcher, pitcher_hand,
+                   (game_id, league_id, inning, half_inning, pitcher, pitcher_hand,
                     pitcher_card_id, batter, batter_hand, batter_card_id,
                     outcome, batted_ball_type, location, exit_velocity,
                     pitches_seen, strikeout_type)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (parsed['game_id'], ab['inning'], ab['half_inning'],
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (parsed['game_id'], parsed.get('league_id'),
+                 ab['inning'], ab['half_inning'],
                  ab['pitcher'], ab['pitcher_hand'], pitcher_cid,
                  ab['batter'], ab['batter_hand'], batter_cid,
                  ab['outcome'], ab['batted_ball_type'], ab['location'],

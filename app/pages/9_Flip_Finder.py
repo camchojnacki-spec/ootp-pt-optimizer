@@ -75,7 +75,7 @@ with tab_spread:
 
         total_profit = sum(d['Profit'] for d in spread_data)
         st.markdown(f"**{len(spread_data)} opportunities — total potential profit: {total_profit:,} PP**")
-        st.dataframe(pd.DataFrame(spread_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(spread_data), width='stretch', hide_index=True)
     else:
         st.info("No spread flip opportunities found. Try lowering the thresholds.")
 
@@ -101,7 +101,7 @@ with tab_vol:
             })
 
         st.markdown(f"**{len(vol_data)} high-volatility cards**")
-        st.dataframe(pd.DataFrame(vol_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(vol_data), width='stretch', hide_index=True)
         st.caption("These cards have wide price swings. Set buy orders near Est. Low and sell orders near Est. High.")
     else:
         st.info("No volatility plays found with current filter.")
@@ -126,7 +126,7 @@ with tab_trend:
             })
 
         st.markdown(f"**{len(trend_data)} cards trading below historical average**")
-        st.dataframe(pd.DataFrame(trend_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(trend_data), width='stretch', hide_index=True)
     else:
         st.info("Need multiple market imports over time to detect price trends. Keep importing regularly!")
 
@@ -149,7 +149,7 @@ with tab_live:
             })
 
         st.markdown(f"**{len(live_data)} Live cards with upgrade signals**")
-        st.dataframe(pd.DataFrame(live_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(live_data), width='stretch', hide_index=True)
         st.caption("Buy these before OOTP updates ratings. Run Live Card Tracker analysis first to populate this data.")
     else:
         st.info("No live card flip data. Go to **Live Card Tracker** and run analysis first — results will appear here.")
@@ -179,7 +179,7 @@ with tab_matchup:
                 })
 
             st.markdown(f"**{len(match_data)} cards with upcoming matchup advantage**")
-            st.dataframe(pd.DataFrame(match_data), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(match_data), width='stretch', hide_index=True)
         else:
             st.info("No matchup flip data available. This requires the MLB Stats API to fetch upcoming schedules.")
     else:
@@ -206,7 +206,7 @@ with tab_hot:
             })
 
         st.markdown(f"**{len(hot_data)} hot streak cards — market hasn't priced in yet**")
-        st.dataframe(pd.DataFrame(hot_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(hot_data), width='stretch', hide_index=True)
         st.caption("Price Lag < 1.2x means the buy orders haven't spiked relative to recent sales — market is slow to react.")
     else:
         st.info("No hot streak flips found. Run **Live Card Tracker** analysis first to populate upgrade signals.")

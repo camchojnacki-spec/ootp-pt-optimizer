@@ -79,7 +79,7 @@ def _render_meta_explainer(exp: dict, key_prefix: str = ""):
             for c in exp['components']
         ])
         st.dataframe(
-            comp_df, use_container_width=True, hide_index=True,
+            comp_df, width='stretch', hide_index=True,
             column_config={
                 "Raw": st.column_config.NumberColumn(format="%.0f", width="small"),
                 "Weight": st.column_config.NumberColumn(format="%.2f", width="small"),
@@ -733,7 +733,7 @@ with tab_invest:
             })
         st.dataframe(
             pd.DataFrame(free_data),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             column_config={
                 "Meta": st.column_config.ProgressColumn(
@@ -923,7 +923,7 @@ with tab_invest:
                 legend=dict(orientation="h", y=1.15),
                 yaxis=dict(visible=False),
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
 # ============================================================
 # TAB: Position Gaps
@@ -974,7 +974,7 @@ with tab_gaps:
             xaxis_title="Meta Score",
             yaxis=dict(autorange='reversed'),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
         # Gap table
         gap_table = []
@@ -1003,7 +1003,7 @@ with tab_gaps:
 
         st.dataframe(
             pd.DataFrame(gap_table),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             column_config={
                 "Meta": st.column_config.NumberColumn(
@@ -1087,7 +1087,7 @@ with tab_browse:
 
         st.dataframe(
             pd.DataFrame(data),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             height=min(35 * len(data) + 40, 560),
             column_config={
@@ -1170,7 +1170,7 @@ with tab_browse:
             xaxis_title="Price (PP)",
             yaxis_title="Meta Score",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
     else:
         st.info("No cards found. Try increasing the budget slider.")
 
@@ -1235,7 +1235,7 @@ with tab_perf:
 
         st.dataframe(
             pd.DataFrame(pit_data),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             column_config={
                 "Meta": st.column_config.ProgressColumn(
@@ -1316,7 +1316,7 @@ with tab_perf:
 
         st.dataframe(
             pd.DataFrame(bat_data),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             column_config={
                 "Meta": st.column_config.ProgressColumn(

@@ -56,7 +56,7 @@ PRESETS = {
 preset_cols = st.columns(len(PRESETS))
 for i, (preset_name, preset_vals) in enumerate(PRESETS.items()):
     with preset_cols[i]:
-        if st.button(preset_name, use_container_width=True, key=f"preset_{i}"):
+        if st.button(preset_name, width='stretch', key=f"preset_{i}"):
             st.session_state['preset_batting'] = preset_vals['batting']
             st.session_state['preset_pitching'] = preset_vals['pitching']
             st.rerun()
@@ -193,7 +193,7 @@ if triggered:
             "Current": f"{t['current_price']:,}" if t['current_price'] else "--",
             "Triggered": str(t['triggered_at'])[:16] if t['triggered_at'] else "--",
         })
-    st.dataframe(pd.DataFrame(trig_data), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(trig_data), width='stretch', hide_index=True)
 
 st.divider()
 
@@ -301,7 +301,7 @@ if watch_path and watch_path.exists():
         # Import button with progress
         col_import, col_status = st.columns([1, 2])
         with col_import:
-            run_import = st.button("Import All", type="primary", use_container_width=True)
+            run_import = st.button("Import All", type="primary", width='stretch')
 
         if run_import:
             from app.core.ingestion import ingest_file
@@ -343,7 +343,7 @@ if watch_path and watch_path.exists():
                         {"File": r[1], "Type": r[2], "Rows": r[3]}
                         for r in sorted(ok_results, key=lambda x: x[2])
                     ])
-                    st.dataframe(import_df, use_container_width=True, hide_index=True)
+                    st.dataframe(import_df, width='stretch', hide_index=True)
 
             if err_results:
                 st.error(f"{len(err_results)} files failed:")
@@ -368,7 +368,7 @@ log_rows = conn.execute("""
 if log_rows:
     log_df = pd.DataFrame([dict(r) for r in log_rows])
     log_df.columns = ["Type", "File", "Rows", "Time"]
-    st.dataframe(log_df, use_container_width=True, hide_index=True, height=200)
+    st.dataframe(log_df, width='stretch', hide_index=True, height=200)
 else:
     st.caption("No import history yet.")
 

@@ -67,7 +67,7 @@ if roster:
             "Meta": round(r['meta_score'], 0) if r['meta_score'] else 0,
         })
     with st.expander("Full Roster", expanded=False):
-        st.dataframe(pd.DataFrame(roster_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(roster_data), width='stretch', hide_index=True)
 else:
     st.info("No roster data found. Import your roster first.")
 
@@ -123,7 +123,7 @@ if sells:
             "Est. Price": r['estimated_price'] or 0,
             "Reason": r['reason'] or '',
         })
-    st.dataframe(pd.DataFrame(sell_data), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(sell_data), width='stretch', hide_index=True)
 else:
     st.info("No sell recommendations.")
 
@@ -169,7 +169,7 @@ if buys:
             "Value": round(r['value_ratio'], 1) if r['value_ratio'] else 0,
             "Reason": r['reason'] or '',
         })
-    st.dataframe(pd.DataFrame(buy_data), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(buy_data), width='stretch', hide_index=True)
 else:
     st.info("No buy recommendations.")
 
@@ -217,7 +217,7 @@ try:
                     "Meta Gain": f"+{t['meta_gain']:.1f}",
                     "Cost": f"{t['price']:,} PP",
                 })
-            st.dataframe(pd.DataFrame(opt_data), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(opt_data), width='stretch', hide_index=True)
 
             # Store in session state for export
             st.session_state['optimizer_result'] = result
@@ -437,7 +437,7 @@ with dl_col1:
         file_name=f"roster_plan_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
         mime="text/plain",
         type="primary",
-        use_container_width=True,
+        width='stretch',
         on_click=_capture_plan_snapshot,
         key="dl_text",
     )
@@ -476,12 +476,12 @@ with dl_col2:
             data=csv_data,
             file_name=f"roster_plan_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width='stretch',
             on_click=_capture_plan_snapshot,
             key="dl_csv",
         )
     else:
-        st.button("Download as CSV", disabled=True, use_container_width=True,
+        st.button("Download as CSV", disabled=True, width='stretch',
                    help="No recommendations to export")
 
 # Manual save (no download) — for users who want to mark a plan as committed
@@ -489,7 +489,7 @@ with dl_col2:
 # acted today, want a fresh baseline".
 if st.button(
     "💾 Save Plan Snapshot (no download)",
-    use_container_width=False,
+    width='content',
     help="Persist this plan to history so a future import can show adherence.",
 ):
     _capture_plan_snapshot()
@@ -581,7 +581,7 @@ else:
                     })
                 st.dataframe(
                     pd.DataFrame(_sell_rows),
-                    use_container_width=True, hide_index=True,
+                    width='stretch', hide_index=True,
                     column_config={
                         "Status": st.column_config.TextColumn(width="small"),
                         "Price": st.column_config.NumberColumn(format="%d PP", width="small"),
@@ -611,7 +611,7 @@ else:
                     })
                 st.dataframe(
                     pd.DataFrame(_buy_rows),
-                    use_container_width=True, hide_index=True,
+                    width='stretch', hide_index=True,
                     column_config={
                         "Status": st.column_config.TextColumn(width="small"),
                         "Priority": st.column_config.TextColumn(width="small"),
@@ -645,7 +645,7 @@ else:
                     })
                 st.dataframe(
                     pd.DataFrame(_hist_rows),
-                    use_container_width=True, hide_index=True,
+                    width='stretch', hide_index=True,
                     column_config={
                         "Sell PP": st.column_config.NumberColumn(format="%d PP"),
                         "Buy PP": st.column_config.NumberColumn(format="%d PP"),

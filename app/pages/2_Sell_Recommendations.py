@@ -54,7 +54,7 @@ def _render_meta_explainer(exp: dict):
             for c in exp['components']
         ])
         st.dataframe(
-            comp_df, use_container_width=True, hide_index=True,
+            comp_df, width='stretch', hide_index=True,
             column_config={
                 "Raw": st.column_config.NumberColumn(format="%.0f", width="small"),
                 "Weight": st.column_config.NumberColumn(format="%.2f", width="small"),
@@ -167,7 +167,7 @@ if rows:
             })
         dup_pp = sum(d['Est. Price'] for d in dup_data)
         st.markdown(f"**Subtotal: {dup_pp:,} PP** from {len(dup_data)} duplicate sell(s)")
-        st.dataframe(pd.DataFrame(dup_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(dup_data), width='stretch', hide_index=True)
 
     # ── Consider Selling: Off-Roster ──
     if off_roster:
@@ -188,7 +188,7 @@ if rows:
         off_pp = sum(d['Est. Price'] for d in off_data)
         st.markdown(f"**Subtotal: {off_pp:,} PP** from {len(off_data)} off-roster sell(s)")
         st.dataframe(
-            pd.DataFrame(off_data), use_container_width=True, hide_index=True,
+            pd.DataFrame(off_data), width='stretch', hide_index=True,
             column_config={
                 "Meta": st.column_config.NumberColumn(
                     format="%d", width="small",
@@ -220,7 +220,7 @@ if rows:
         _meta_help = ("Overall meta — same number used everywhere in the app. "
                       "vs-LHP / vs-RHP splits are on Card Detail.")
         st.dataframe(
-            pd.DataFrame(out_data), use_container_width=True, hide_index=True,
+            pd.DataFrame(out_data), width='stretch', hide_index=True,
             column_config={
                 "Card Meta": st.column_config.NumberColumn(
                     format="%d", width="small", help=_meta_help),
@@ -271,7 +271,7 @@ if rows:
                 })
             st.dataframe(
                 pd.DataFrame(anom_data),
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
                 column_config={
                     "Card": st.column_config.TextColumn(width="large"),

@@ -163,7 +163,7 @@ with _top_btn_cols[0]:
         f"\U0001f4e5 Refresh All ({len(_top_importable)})",
         key="top_refresh_all",
         type="primary",
-        use_container_width=True,
+        width='stretch',
         disabled=len(_top_importable) == 0,
     )
 with _top_btn_cols[1]:
@@ -381,13 +381,13 @@ with btn_cols[0]:
     run_all = st.button(
         f"\U0001f4e5 Refresh All ({len(all_importable_paths)})",
         type="primary",
-        use_container_width=True,
+        width='stretch',
         disabled=len(all_importable_paths) == 0,
     )
 with btn_cols[1]:
     run_sel = st.button(
         f"Refresh Selected ({len(selected_paths)})",
-        use_container_width=True,
+        width='stretch',
         disabled=len(selected_paths) == 0,
     )
 

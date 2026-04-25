@@ -114,7 +114,7 @@ if st.button("Run Analysis", type="primary"):
                 row["Reasons"] = " | ".join(a['reasons'])
                 upgrade_data.append(row)
 
-            st.dataframe(pd.DataFrame(upgrade_data), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(upgrade_data), width='stretch', hide_index=True)
 
         # Downgrade warnings
         if downgrades:
@@ -151,7 +151,7 @@ if st.button("Run Analysis", type="primary"):
                 row["Reasons"] = " | ".join(a['reasons'])
                 downgrade_data.append(row)
 
-            st.dataframe(pd.DataFrame(downgrade_data), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(downgrade_data), width='stretch', hide_index=True)
 
         # Holds
         if holds:
@@ -169,7 +169,7 @@ if st.button("Run Analysis", type="primary"):
                         "Owned": "Yes" if card.get('owned', 0) > 0 else "",
                         "Notes": " | ".join(a['reasons']),
                     })
-                st.dataframe(pd.DataFrame(hold_data), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(hold_data), width='stretch', hide_index=True)
 
         # Cache results for recommendation engine integration
         cache_live_card_analysis(results)

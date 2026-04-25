@@ -725,6 +725,24 @@ def init_db() -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_roster_dedup "
         "ON roster (card_id, DATE(snapshot_date), lineup_role) "
         "WHERE card_id IS NOT NULL",
+
+        # Hot-query indexes added 2026-04-24 to speed up the Buy Recs /
+        # Roster Optimizer / overlay query paths. Added after verifying
+        # missing indexes left several common filters doing table scans.
+        "CREATE INDEX IF NOT EXISTS idx_roster_role_date ON roster(lineup_role, snapshot_date)",
+        "CREATE INDEX IF NOT EXISTS idx_bs_league_card_date ON batting_stats(league_id, card_id, snapshot_date)",
+        "CREATE INDEX IF NOT EXISTS idx_ps_league_card_date ON pitching_stats(league_id, card_id, snapshot_date)",
+        "CREATE INDEX IF NOT EXISTS idx_bat_adv_card_date ON batting_stats_adv(card_id, snapshot_date)",
+        "CREATE INDEX IF NOT EXISTS idx_pit_adv_card_date ON pitching_stats_adv(card_id, snapshot_date)",
+        "CREATE INDEX IF NOT EXISTS idx_recs_created ON recommendations(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_recs_card ON recommendations(card_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_ingest_log_date ON ingestion_log(ingested_at)",
+        "CREATE INDEX IF NOT EXISTS idx_meta_hist_card_date ON meta_history(card_id, snapshot_date)",
+        # Dedup guard for meta_history: re-running recalc on the same day
+        # with the same weights should refresh the existing row, not append
+        # a duplicate. Paired with INSERT OR REPLACE in snapshot_meta_scores.
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_meta_hist_dedup ON meta_history"
+        "(card_id, league_id, weights_version, DATE(snapshot_date))",
     ):
         try:
             cursor.execute(idx_sql)
@@ -1486,6 +1504,41 @@ def init_db() -> None:
 
     # --- Add league_id to batting_stats, pitching_stats, roster ---
     migrate_add_league_columns(cursor)
+
+    # --- Add jersey_number to batting_stats, pitching_stats, league_rosters ---
+    # Same card_id can appear on multiple teams in OOTP PT (e.g. Aranda owned
+    # by Vancouver #28, Toronto #8, EyeBeez #2). The league-wide CSV exposes
+    # the jersey `#` per row but we previously dropped it, leaving N rows
+    # per card with no way to disambiguate which team's instance is which.
+    # Adding jersey_number lets us:
+    #   * dedupe at insert time when needed,
+    #   * filter to a user's specific team instance (via league_rosters join),
+    #   * keep cross-team aggregates intact for portable card-level meta.
+    for _table in ('batting_stats', 'pitching_stats', 'league_rosters'):
+        try:
+            _cols = [r[1] for r in cursor.execute(f"PRAGMA table_info({_table})").fetchall()]
+            if _cols and 'jersey_number' not in _cols:
+                cursor.execute(f"ALTER TABLE {_table} ADD COLUMN jersey_number INTEGER")
+        except Exception:
+            pass  # Table may not exist on a fresh install
+
+    # Index on (card_id, league_id, jersey_number) so the team-specific
+    # lookup helper (get_user_team_card_stats) is O(1) instead of full scan.
+    try:
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_batting_stats_card_jersey "
+            "ON batting_stats(card_id, league_id, jersey_number)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pitching_stats_card_jersey "
+            "ON pitching_stats(card_id, league_id, jersey_number)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_league_rosters_card_team "
+            "ON league_rosters(card_id, league_id, team_name)"
+        )
+    except Exception:
+        pass
 
     # --- Stage 1c: partition batting_stats / pitching_stats by league_id ---
     #

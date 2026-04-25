@@ -65,19 +65,19 @@ st.subheader("Quick Analysis")
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    if st.button("\U0001f4ca Portfolio Analysis", type="primary", disabled=not has_key, use_container_width=True):
+    if st.button("\U0001f4ca Portfolio Analysis", type="primary", disabled=not has_key, width='stretch'):
         with st.spinner("AI is analyzing your portfolio..."):
             result = get_market_analysis(conn)
         _display_response(result, "ai_response_portfolio")
 
 with col2:
-    if st.button("\U0001f4b0 Flip Strategy", disabled=not has_key, use_container_width=True):
+    if st.button("\U0001f4b0 Flip Strategy", disabled=not has_key, width='stretch'):
         with st.spinner("AI is analyzing your portfolio..."):
             result = get_flip_strategy(conn)
         _display_response(result, "ai_response_flip")
 
 with col3:
-    show_custom = st.button("\u2753 Custom Question", disabled=not has_key, use_container_width=True)
+    show_custom = st.button("\u2753 Custom Question", disabled=not has_key, width='stretch')
     if show_custom:
         st.session_state["ai_show_custom"] = not st.session_state.get("ai_show_custom", False)
 
@@ -121,7 +121,7 @@ bs_col1, bs_col2, bs_col3 = st.columns(3)
 
 with bs_col1:
     if st.button("\U0001f3af Best single buy?", type="primary", disabled=not has_key,
-                 use_container_width=True, key="btn_buy_single"):
+                 width='stretch', key="btn_buy_single"):
         with st.spinner("Analyzing your roster + market..."):
             result = ask_advisor(
                 f"My budget is {pp_budget:,} PP. What is the single best card I can buy "
@@ -133,7 +133,7 @@ with bs_col1:
 
 with bs_col2:
     if st.button("\u2696\ufe0f 1 big vs 2 small?", disabled=not has_key,
-                 use_container_width=True, key="btn_buy_split"):
+                 width='stretch', key="btn_buy_split"):
         with st.spinner("Comparing investment strategies..."):
             result = ask_advisor(
                 f"I have {pp_budget:,} PP. Should I buy 1 expensive card or 2 cheaper cards? "
@@ -145,7 +145,7 @@ with bs_col2:
 
 with bs_col3:
     if st.button("\U0001f4c8 Long-term plan?", disabled=not has_key,
-                 use_container_width=True, key="btn_buy_plan"):
+                 width='stretch', key="btn_buy_plan"):
         with st.spinner("Building investment roadmap..."):
             result = ask_advisor(
                 f"I have {pp_budget:,} PP now. Build me a 3-step investment plan: "
@@ -178,13 +178,13 @@ card_name = st.text_input("Card name", placeholder="e.g. MLB 2026 Live Aaron Jud
 buy_col, sell_col = st.columns(2)
 
 with buy_col:
-    if st.button("\U0001f6d2 Should I Buy?", disabled=not has_key or not card_name, use_container_width=True, key="btn_buy"):
+    if st.button("\U0001f6d2 Should I Buy?", disabled=not has_key or not card_name, width='stretch', key="btn_buy"):
         with st.spinner("AI is analyzing your portfolio..."):
             result = get_trade_advice(card_name, "buy", conn)
         _display_response(result, "ai_response_card_buy")
 
 with sell_col:
-    if st.button("\U0001f4b8 Should I Sell?", disabled=not has_key or not card_name, use_container_width=True, key="btn_sell"):
+    if st.button("\U0001f4b8 Should I Sell?", disabled=not has_key or not card_name, width='stretch', key="btn_sell"):
         with st.spinner("AI is analyzing your portfolio..."):
             result = get_trade_advice(card_name, "sell", conn)
         _display_response(result, "ai_response_card_sell")

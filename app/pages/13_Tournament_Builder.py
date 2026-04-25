@@ -114,7 +114,7 @@ st.divider()
 
 build_col1, build_col2 = st.columns([3, 1])
 with build_col1:
-    build_clicked = st.button("Build Optimal Roster", type="primary", use_container_width=True)
+    build_clicked = st.button("Build Optimal Roster", type="primary", width='stretch')
 with build_col2:
     eligible_cards = get_eligible_cards(conn, constraints)
     st.metric("Eligible Cards", len(eligible_cards))
@@ -212,7 +212,7 @@ if build_clicked:
                         "Meta": 0, "Tier": "", "Bats": "",
                     })
 
-            st.dataframe(pd.DataFrame(lineup_data), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(lineup_data), width='stretch', hide_index=True)
 
             # Pitching staff
             st.markdown("**Pitching Staff**")
@@ -228,7 +228,7 @@ if build_clicked:
                         "Throws": p.get('throws', ''),
                     })
             if pitch_data:
-                st.dataframe(pd.DataFrame(pitch_data), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(pitch_data), width='stretch', hide_index=True)
 
             # Bench
             bench_players = [c for c in roster if c not in result.get('starters', roster)]
@@ -243,7 +243,7 @@ if build_clicked:
                         "Meta": round(b.get('meta_score', 0)),
                         "Tier": b.get('tier_name', ''),
                     })
-                st.dataframe(pd.DataFrame(bench_data), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(bench_data), width='stretch', hide_index=True)
 
             # Position coverage chart
             st.markdown("**Position Coverage**")
@@ -262,7 +262,7 @@ if build_clicked:
                 xaxis_title="Position", yaxis_title="Count",
                 showlegend=False,
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
         with tab_chemistry:
             st.subheader("Team Chemistry Analysis")
@@ -337,7 +337,7 @@ if build_clicked:
                         "+Meta": round(r.get('improvement', 0)),
                         "Reason": r.get('reason', ''),
                     })
-                st.dataframe(pd.DataFrame(rec_data), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rec_data), width='stretch', hide_index=True)
 
                 total_cost = sum(r.get('price', 0) for r in recs)
                 st.caption(f"Total acquisition cost: **{total_cost:,} PP** for top {len(recs)} upgrades")
@@ -507,7 +507,7 @@ if search_query:
                 "Bats": r['bats'] or '',
                 "Throws": r['throws'] or '',
             })
-        st.dataframe(pd.DataFrame(search_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(search_data), width='stretch', hide_index=True)
     else:
         st.info(f"No owned cards matching '{search_query}'")
 

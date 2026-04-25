@@ -10,6 +10,7 @@ from app.core.position_eligibility import (
     select_rating_columns,
     position_meta_penalty,
     format_position_annotation,
+    get_eligible_positions,
 )
 
 
@@ -383,14 +384,24 @@ def _boost_live_card_upgrades(conn):
 
 
 def _generate_sell_recs(conn):
-    """Generate categorized sell recommendations for owned cards."""
+    """Generate categorized sell recommendations for owned cards.
+
+    P2 #6 (2026-04-24): before flagging a batter as "Not on active roster",
+    check multi-position eligibility via ``get_eligible_positions``. If the
+    card would be a legitimate upgrade at any *secondary* position whose
+    current starter has lower meta, suppress the sell rec entirely — Van
+    Haltren-type utility cards belong on the bench, not the trade block.
+    """
     cursor = conn.cursor()
 
-    # Find owned cards that are not on the active roster
-    owned_cards = cursor.execute("""
+    # Pull pos_rating_* columns alongside the core fields so we can run
+    # multi-position eligibility checks without a second query per card.
+    rating_sql = select_rating_columns("c")
+    owned_cards = cursor.execute(f"""
         SELECT c.card_id, c.card_title, c.position_name, c.pitcher_role_name,
                COALESCE(c.meta_score_batting, c.meta_score_pitching) as meta_score,
-               c.last_10_price, c.sell_order_low, c.buy_order_high, c.tier_name, c.owned
+               c.last_10_price, c.sell_order_low, c.buy_order_high, c.tier_name, c.owned,
+               {rating_sql}
         FROM cards c
         WHERE c.owned > 0 AND c.last_10_price > 0
     """).fetchall()
@@ -431,6 +442,30 @@ def _generate_sell_recs(conn):
         # Off-roster / outclassed detection
         if not is_active and price > 50:
             starter_meta = roster_meta_by_pos.get(pos, 0)
+
+            # Multi-position eligibility check (P2 #6): for batters, see if
+            # this card beats ANY eligible position's starter by enough meta
+            # to be a legitimate bench contributor. If so, skip the sell rec.
+            is_pitcher = bool(card['pitcher_role_name'])
+            if not is_pitcher and meta > 0:
+                card_dict = dict(card)
+                eligible_positions = get_eligible_positions(card_dict)
+                # Small cushion: require beating the starter by ≥10 meta at
+                # the secondary position, matching the default upgrade gate
+                # used elsewhere. Guards against flagging a card that only
+                # barely qualifies defensively from being held as "bench".
+                legitimate_bench = False
+                for alt_pos in eligible_positions:
+                    if alt_pos == pos:
+                        continue
+                    alt_starter = roster_meta_by_pos.get(alt_pos, 0)
+                    penalty = position_meta_penalty(card_dict, alt_pos)
+                    effective_meta = meta - penalty
+                    if alt_starter > 0 and effective_meta >= alt_starter + 10:
+                        legitimate_bench = True
+                        break
+                if legitimate_bench:
+                    continue
 
             if starter_meta > 0 and meta < starter_meta:
                 # Outclassed at position

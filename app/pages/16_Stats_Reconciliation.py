@@ -139,7 +139,7 @@ else:
              for s, tt, rs in reco_rows]
         )
         st.dataframe(
-            df, use_container_width=True, hide_index=True,
+            df, width='stretch', hide_index=True,
             column_config={
                 "Team Total": st.column_config.NumberColumn(format="%d"),
                 "Roster Sum": st.column_config.NumberColumn(format="%d"),
@@ -216,7 +216,7 @@ bench_df = pres_df[pres_df['Role'] == 'bench']
 pc1, pc2 = st.columns([2, 1])
 with pc1:
     st.markdown(f"**Active Roster ({len(active_df)} players)**")
-    st.dataframe(active_df, use_container_width=True, hide_index=True)
+    st.dataframe(active_df, width='stretch', hide_index=True)
 with pc2:
     matched = int((active_df['In Stats?'] == '✅').sum())
     st.metric("Active players in stats", f"{matched}/{len(active_df)}")
@@ -224,7 +224,7 @@ with pc2:
 
 if bench_df.shape[0] > 0:
     with st.expander(f"Bench / collection ({len(bench_df)} cards)"):
-        st.dataframe(bench_df, use_container_width=True, hide_index=True)
+        st.dataframe(bench_df, width='stretch', hide_index=True)
 
 # ── 4. Departed-player drill-down ──
 st.markdown("## 🚶 Possibly Departed Players")
@@ -265,7 +265,7 @@ try:
                 })
         if departed_rows:
             st.dataframe(pd.DataFrame(departed_rows),
-                         use_container_width=True, hide_index=True)
+                         width='stretch', hide_index=True)
         else:
             st.info("No departed players identifiable from current history.")
     else:
@@ -296,7 +296,7 @@ if dup_rows:
     )
     dup_df = pd.DataFrame([{'Player': r['player_name'], 'Rows': r['n']} for r in dup_rows])
     with st.expander(f"See {len(dup_rows)} ambiguous names"):
-        st.dataframe(dup_df, use_container_width=True, hide_index=True)
+        st.dataframe(dup_df, width='stretch', hide_index=True)
 else:
     st.success("No duplicate-name cards detected in the latest league stats snapshot.")
 

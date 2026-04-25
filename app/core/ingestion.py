@@ -251,12 +251,14 @@ def ingest_market_data(filepath: str) -> dict:
     conn = get_connection()
     cursor = conn.cursor()
 
+    # snapshot_date = the day we ingested this market sample, NOT the
+    # CSV's per-card "last update" date. The market CSV's `date` column
+    # is per-row (each card's last refresh), so previously using
+    # `df['date'].iloc[0]` pinned every snapshot to whichever card
+    # happened to be first in the file — burning the dedup index and
+    # freezing all 2,789 rows on a single date for 42+ days. Always use
+    # today.
     snapshot_date = datetime.now().strftime("%Y-%m-%d")
-    # Try to get date from the CSV data (date-only for daily dedup)
-    if 'date' in df.columns and len(df) > 0:
-        csv_date = df['date'].iloc[0]
-        if pd.notna(csv_date) and str(csv_date).strip():
-            snapshot_date = str(csv_date).strip()[:10]
 
     count = 0
     for _, row in df.iterrows():
@@ -728,6 +730,94 @@ def _match_card_id(cursor, player_name: str, prefer_owned: bool = True) -> int |
     return card_row[0] if card_row else None
 
 
+def get_team_card_jersey(cursor, card_id: int, team_name: str,
+                         league_id: str) -> int | None:
+    """Return the jersey# this team uses for this card, or None if unknown.
+
+    Same card_id can be owned by multiple teams in OOTP PT — each team gives
+    it a different jersey#. ``league_rosters`` carries (card_id, team_name,
+    jersey_number) since the 2026-04-24 migration; older snapshots have
+    ``jersey_number = NULL`` so this helper returns None and callers should
+    fall back to cross-team aggregates.
+    """
+    if not card_id or not team_name or not league_id:
+        return None
+    row = cursor.execute(
+        """
+        SELECT jersey_number
+        FROM league_rosters
+        WHERE card_id = ? AND team_name = ? AND league_id = ?
+          AND jersey_number IS NOT NULL
+        ORDER BY snapshot_date DESC
+        LIMIT 1
+        """,
+        (card_id, team_name, league_id),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def get_team_specific_batting_stats(cursor, card_id: int, team_name: str,
+                                    league_id: str) -> dict | None:
+    """Return the batting_stats row for a SPECIFIC team's instance of a card.
+
+    Joins through ``league_rosters`` to find the team's jersey#, then matches
+    that against ``batting_stats.jersey_number``. Returns None when the
+    jersey# isn't known yet (pre-migration data) or no matching stats row
+    exists — callers should fall back to the cross-team aggregate via the
+    existing PA-weighted helpers in ``recalculate_all_meta_scores``.
+
+    Used by Cameron-team-specific overlays (Outlook, recent form on user's
+    own card instances) so other teams' usage of the same card doesn't
+    blend into the user's "is my card hot/cold?" answer.
+    """
+    jn = get_team_card_jersey(cursor, card_id, team_name, league_id)
+    if jn is None:
+        return None
+    row = cursor.execute(
+        """
+        SELECT *
+        FROM batting_stats
+        WHERE card_id = ? AND league_id = ? AND jersey_number = ?
+        ORDER BY snapshot_date DESC
+        LIMIT 1
+        """,
+        (card_id, league_id, jn),
+    ).fetchone()
+    if row is None:
+        return None
+    # row factory may or may not be Row; build a dict either way
+    try:
+        return dict(row)
+    except (TypeError, ValueError):
+        cols = [d[0] for d in cursor.description]
+        return dict(zip(cols, row))
+
+
+def get_team_specific_pitching_stats(cursor, card_id: int, team_name: str,
+                                     league_id: str) -> dict | None:
+    """Pitching counterpart to ``get_team_specific_batting_stats``."""
+    jn = get_team_card_jersey(cursor, card_id, team_name, league_id)
+    if jn is None:
+        return None
+    row = cursor.execute(
+        """
+        SELECT *
+        FROM pitching_stats
+        WHERE card_id = ? AND league_id = ? AND jersey_number = ?
+        ORDER BY snapshot_date DESC
+        LIMIT 1
+        """,
+        (card_id, league_id, jn),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        return dict(row)
+    except (TypeError, ValueError):
+        cols = [d[0] for d in cursor.description]
+        return dict(zip(cols, row))
+
+
 def ingest_stats_batting(filepath: str) -> dict:
     """Ingest sortable batting stats CSV into batting_stats table.
 
@@ -779,14 +869,20 @@ def ingest_stats_batting(filepath: str) -> dict:
         # they'll all get pinned to the user's own card_id.
         card_id = _match_card_id(cursor, name, prefer_owned=False)
 
+        # Jersey number — disambiguates same-card-id-on-multiple-teams instances
+        # (e.g. Aranda owned by Vancouver #28, Toronto #8, EyeBeez #2 all become
+        # 3 rows for the same card_id). 0/blank → NULL so the column reads as
+        # "unknown" rather than "jersey 0."
+        jersey_number = _safe_int(row.get('#', 0)) or None
+
         cursor.execute("""
             INSERT INTO batting_stats (
                 player_name, position, bats, throws,
                 games, pa, ab, hits, doubles, triples, hr, rbi, runs,
                 bb, ibb, hbp, k, gidp,
                 avg, obp, slg, iso, ops, ops_plus, babip, war,
-                sb, cs, card_id, snapshot_date, league_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                sb, cs, card_id, snapshot_date, league_id, jersey_number
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             name, pos, bats, throws,
             _safe_int(row.get('G', 0)),
@@ -816,6 +912,7 @@ def ingest_stats_batting(filepath: str) -> dict:
             card_id,
             snapshot_date,
             league_id,
+            jersey_number,
         ))
         count += 1
 
@@ -873,6 +970,10 @@ def ingest_stats_pitching(filepath: str) -> dict:
         # they'll all get pinned to the user's own card_id.
         card_id = _match_card_id(cursor, name, prefer_owned=False)
 
+        # Jersey number — disambiguates same-card-id-on-multiple-teams instances.
+        # See ingest_stats_batting for the rationale.
+        jersey_number = _safe_int(row.get('#', 0)) or None
+
         cursor.execute("""
             INSERT INTO pitching_stats (
                 player_name, position, bats, throws,
@@ -882,8 +983,8 @@ def ingest_stats_pitching(filepath: str) -> dict:
                 era, avg_against, babip, whip,
                 hr_per_9, bb_per_9, k_per_9, k_per_bb,
                 era_plus, fip, war,
-                card_id, snapshot_date, league_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                card_id, snapshot_date, league_id, jersey_number
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             name, pos, bats, throws,
             _safe_int(row.get('G', 0)),
@@ -914,6 +1015,7 @@ def ingest_stats_pitching(filepath: str) -> dict:
             card_id,
             snapshot_date,
             league_id,
+            jersey_number,
         ))
         count += 1
 
@@ -969,187 +1071,32 @@ def ingest_roster_pitching_stats(filepath: str) -> dict:
 
 
 def _ingest_batting_stats_standard(df: pd.DataFrame, file_type: str) -> dict:
-    """Shared logic for ingesting standard batting stats (team-scoped).
+    """Noop — team-file batting stats are deprecated.
 
-    Called for team-file paths (e.g. ``toronto_dark_knights_..._batting_stats``),
-    which represent the user's OWN team and are authoritative for their
-    pitchers'/batters' performance. Rows are written with ``league_id=NULL``
-    and upserted keyed on ``(card_id, snapshot_date)``. The owned-preferred
-    ``_match_card_id`` ensures we pin to the user's card_id even when other
-    teams in the league own cards with the same player name.
+    Team CSVs (``toronto_dark_knights_..._batting_stats``) used to write rows
+    with ``league_id=NULL`` as a workaround for the old name-disambiguation
+    problem. That problem is now solved by ``league_rosters`` (Phase 0-5,
+    2026-04-18), and the league-wide ``sortable_stats_batting_stats`` CSV
+    already carries the same rows with the proper ``league_id``. Keeping the
+    NULL-league insert active caused overlay queries that pick the latest
+    snapshot per card (``MAX(snapshot_date)`` without a league filter) to
+    silently prefer the NULL-league row, contaminating the meta formula's
+    OPS+/OBP/ISO/BABIP overlays (2026-04-24 quality cleanup).
     """
-    conn = get_connection()
-    cursor = conn.cursor()
-    snapshot_date = datetime.now().strftime("%Y-%m-%d")
-
-    count = 0
-    for _, row in df.iterrows():
-        name = _safe_str(row.get('Name', '')).strip()
-        if not name or name.lower() in ('total', 'totals', 'team'):
-            continue
-
-        pos = _safe_str(row.get('POS', '')).strip()
-        bats = _safe_str(row.get('B', '')).strip()
-        throws = _safe_str(row.get('T', '')).strip()
-        card_id = _match_card_id(cursor, name, prefer_owned=True)
-
-        # Upsert keyed on (card_id, date) within the team-scoped partition
-        # (league_id IS NULL). Fall back to player_name if card_id is unknown.
-        existing = None
-        if card_id is not None:
-            existing = cursor.execute(
-                "SELECT id FROM batting_stats "
-                "WHERE card_id = ? AND DATE(snapshot_date) = ? AND league_id IS NULL",
-                (card_id, snapshot_date),
-            ).fetchone()
-        if existing is None:
-            existing = cursor.execute(
-                "SELECT id FROM batting_stats "
-                "WHERE player_name = ? AND DATE(snapshot_date) = ? AND league_id IS NULL",
-                (name, snapshot_date),
-            ).fetchone()
-
-        if existing:
-            cursor.execute("""
-                UPDATE batting_stats SET
-                    position=?, games=?, pa=?, ab=?, hits=?, doubles=?, triples=?,
-                    hr=?, rbi=?, runs=?, bb=?, ibb=?, hbp=?, k=?, gidp=?,
-                    avg=?, obp=?, slg=?, iso=?, ops=?, ops_plus=?, babip=?, war=?,
-                    sb=?, cs=?, card_id=?
-                WHERE id=?
-            """, (
-                pos, _safe_int(row.get('G', 0)), _safe_int(row.get('PA', 0)),
-                _safe_int(row.get('AB', 0)), _safe_int(row.get('H', 0)),
-                _safe_int(row.get('2B', 0)), _safe_int(row.get('3B', 0)),
-                _safe_int(row.get('HR', 0)), _safe_int(row.get('RBI', 0)),
-                _safe_int(row.get('R', 0)), _safe_int(row.get('BB', 0)),
-                _safe_int(row.get('IBB', 0)), _safe_int(row.get('HP', 0)),
-                _safe_int(row.get('K', 0)), _safe_int(row.get('GIDP', 0)),
-                _safe_float(row.get('AVG', 0)), _safe_float(row.get('OBP', 0)),
-                _safe_float(row.get('SLG', 0)), _safe_float(row.get('ISO', 0)),
-                _safe_float(row.get('OPS', 0)), _safe_int(row.get('OPS+', 0)),
-                _safe_float(row.get('BABIP', 0)), _safe_float(row.get('WAR', 0)),
-                _safe_int(row.get('SB', 0)), _safe_int(row.get('CS', 0)),
-                card_id, existing[0],
-            ))
-        else:
-            cursor.execute("""
-                INSERT INTO batting_stats (
-                    player_name, position, bats, throws,
-                    games, pa, ab, hits, doubles, triples, hr, rbi, runs,
-                    bb, ibb, hbp, k, gidp,
-                    avg, obp, slg, iso, ops, ops_plus, babip, war,
-                    sb, cs, card_id, snapshot_date, league_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-            """, (
-                name, pos, bats, throws,
-                _safe_int(row.get('G', 0)), _safe_int(row.get('PA', 0)),
-                _safe_int(row.get('AB', 0)), _safe_int(row.get('H', 0)),
-                _safe_int(row.get('2B', 0)), _safe_int(row.get('3B', 0)),
-                _safe_int(row.get('HR', 0)), _safe_int(row.get('RBI', 0)),
-                _safe_int(row.get('R', 0)), _safe_int(row.get('BB', 0)),
-                _safe_int(row.get('IBB', 0)), _safe_int(row.get('HP', 0)),
-                _safe_int(row.get('K', 0)), _safe_int(row.get('GIDP', 0)),
-                _safe_float(row.get('AVG', 0)), _safe_float(row.get('OBP', 0)),
-                _safe_float(row.get('SLG', 0)), _safe_float(row.get('ISO', 0)),
-                _safe_float(row.get('OPS', 0)), _safe_int(row.get('OPS+', 0)),
-                _safe_float(row.get('BABIP', 0)), _safe_float(row.get('WAR', 0)),
-                _safe_int(row.get('SB', 0)), _safe_int(row.get('CS', 0)),
-                card_id, snapshot_date,
-            ))
-        count += 1
-
-    conn.commit()
-    conn.close()
-    return {"status": "success", "file_type": file_type, "rows": count}
+    return {"status": "skipped", "file_type": file_type, "rows": 0,
+            "reason": "team-file batting stats deprecated — see league-wide ingest"}
 
 
 def _ingest_pitching_stats_standard(df: pd.DataFrame, file_type: str) -> dict:
-    """Shared logic for ingesting standard pitching stats (team-scoped).
+    """Noop — team-file pitching stats are deprecated.
 
-    Called for team-file paths (e.g. ``toronto_dark_knights_..._pitching_stats``),
-    which represent the user's OWN team and are authoritative for their
-    pitchers' performance. Rows are written with ``league_id=NULL`` and
-    upserted keyed on ``(card_id, snapshot_date)``. The owned-preferred
-    ``_match_card_id`` ensures we pin to the user's card_id even when other
-    teams in the league own cards with the same player name.
+    See ``_ingest_batting_stats_standard`` for the rationale: team CSVs
+    used to write rows with ``league_id=NULL``, which contaminated the
+    latest-snapshot-per-card query used by meta overlays. League-wide
+    CSVs carry the same rows with the correct ``league_id``.
     """
-    conn = get_connection()
-    cursor = conn.cursor()
-    snapshot_date = datetime.now().strftime("%Y-%m-%d")
-
-    count = 0
-    for _, row in df.iterrows():
-        name = _safe_str(row.get('Name', '')).strip()
-        if not name or name.lower() in ('total', 'totals', 'team'):
-            continue
-
-        pos = _safe_str(row.get('POS', '')).strip()
-        bats = _safe_str(row.get('B', '')).strip()
-        throws = _safe_str(row.get('T', '')).strip()
-        card_id = _match_card_id(cursor, name, prefer_owned=True)
-
-        # Upsert keyed on (card_id, date) within the team-scoped partition
-        # (league_id IS NULL). Fall back to player_name if card_id is unknown.
-        existing = None
-        if card_id is not None:
-            existing = cursor.execute(
-                "SELECT id FROM pitching_stats "
-                "WHERE card_id = ? AND DATE(snapshot_date) = ? AND league_id IS NULL",
-                (card_id, snapshot_date),
-            ).fetchone()
-        if existing is None:
-            existing = cursor.execute(
-                "SELECT id FROM pitching_stats "
-                "WHERE player_name = ? AND DATE(snapshot_date) = ? AND league_id IS NULL",
-                (name, snapshot_date),
-            ).fetchone()
-
-        stat_vals = (
-            _safe_int(row.get('G', 0)), _safe_int(row.get('GS', 0)),
-            _safe_int(row.get('W', 0)), _safe_int(row.get('L', 0)),
-            _safe_int(row.get('SV', 0)), _safe_int(row.get('HLD', 0)),
-            _safe_float(row.get('IP', 0)), _safe_int(row.get('HA', 0)),
-            _safe_int(row.get('HR', 0)), _safe_int(row.get('R', 0)),
-            _safe_int(row.get('ER', 0)), _safe_int(row.get('BB', 0)),
-            _safe_int(row.get('K', 0)), _safe_int(row.get('HP', 0)),
-            _safe_float(row.get('ERA', 0)), _safe_float(row.get('AVG', 0)),
-            _safe_float(row.get('BABIP', 0)), _safe_float(row.get('WHIP', 0)),
-            _safe_float(row.get('HR/9', 0)), _safe_float(row.get('BB/9', 0)),
-            _safe_float(row.get('K/9', 0)), _safe_float(row.get('K/BB', 0)),
-            _safe_int(row.get('ERA+', 0)), _safe_float(row.get('FIP', 0)),
-            _safe_float(row.get('WAR', 0)), card_id,
-        )
-
-        if existing:
-            cursor.execute("""
-                UPDATE pitching_stats SET
-                    position=?,
-                    games=?, gs=?, wins=?, losses=?, saves=?, holds=?,
-                    ip=?, hits_allowed=?, hr_allowed=?, runs_allowed=?, er=?,
-                    bb=?, k=?, hbp=?, era=?, avg_against=?, babip=?, whip=?,
-                    hr_per_9=?, bb_per_9=?, k_per_9=?, k_per_bb=?,
-                    era_plus=?, fip=?, war=?, card_id=?
-                WHERE id=?
-            """, (pos,) + stat_vals + (existing[0],))
-        else:
-            cursor.execute("""
-                INSERT INTO pitching_stats (
-                    player_name, position, bats, throws,
-                    games, gs, wins, losses, saves, holds,
-                    ip, hits_allowed, hr_allowed, runs_allowed, er,
-                    bb, k, hbp,
-                    era, avg_against, babip, whip,
-                    hr_per_9, bb_per_9, k_per_9, k_per_bb,
-                    era_plus, fip, war,
-                    card_id, snapshot_date, league_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-            """, (name, pos, bats, throws) + stat_vals + (snapshot_date,))
-        count += 1
-
-    conn.commit()
-    conn.close()
-    return {"status": "success", "file_type": file_type, "rows": count}
+    return {"status": "skipped", "file_type": file_type, "rows": 0,
+            "reason": "team-file pitching stats deprecated — see league-wide ingest"}
 
 
 # ─── New handlers for additional file types ───────────────────────────
@@ -1294,6 +1241,15 @@ def ingest_league_default(filepath: str) -> dict:
         return {"status": "skipped", "file_type": "league_player_default",
                 "rows": 0, "reason": "could not detect league_id from filename"}
 
+    # Register the league if first sighting. Without this, leagues like
+    # lb122 are silently invisible to meta_history snapshots and any UI
+    # query that joins through `leagues`.
+    try:
+        from app.core.history import ensure_league_exists
+        ensure_league_exists(league_id)
+    except Exception as _e:
+        logger.debug("ensure_league_exists failed for %s: %s", league_id, _e)
+
     # Find companion ratings files in the same directory. OOTP exports them
     # atomically, so they always coexist — but handle a missing companion
     # gracefully rather than crashing the whole refresh.
@@ -1349,6 +1305,11 @@ def ingest_league_default(filepath: str) -> dict:
             # League's free-agent pool / unassigned — no team attribution.
             continue
         full_tm = resolve_full_name(short_tm, league_id, conn=conn) or short_tm
+
+        # Jersey number — disambiguates same-card-id-on-multiple-teams instances.
+        # Pairs with team_name to identify a specific PT team's copy of a card
+        # in batting_stats / pitching_stats.
+        jersey_number = _safe_int(dr.get("#", 0)) or None
 
         pos = _safe_str(dr.get("POS", "")).strip()
         ovr = _safe_int(dr.get("OVR", 0))
@@ -1406,13 +1367,13 @@ def ingest_league_default(filepath: str) -> dict:
             INSERT INTO league_rosters (league_id, team_name, player_name, card_id,
                 position, ovr, meta_score,
                 contact, gap_power, power, eye,
-                stuff, movement, control, p_hr)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                stuff, movement, control, p_hr, jersey_number)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             league_id, full_tm, name, card_id,
             pos, ovr, meta,
             contact, gap_power, power, eye,
-            stuff, movement, control, p_hr,
+            stuff, movement, control, p_hr, jersey_number,
         ))
         inserted += 1
 
@@ -1427,6 +1388,16 @@ def ingest_league_default(filepath: str) -> dict:
         refresh_team_cache()
     except Exception as _e:
         logger.debug("refresh_team_cache post-ingest failed: %s", _e)
+
+    # Seed team_aliases for this league (short -> full name mapping). Idempotent
+    # via INSERT OR IGNORE; runs every ingest so newly-discovered teams get
+    # picked up. Was previously a manual one-off — caused i76/lb122 to lack
+    # aliases and fail name-resolution on game logs.
+    try:
+        from app.core.team_aliases import seed_team_aliases
+        seed_team_aliases(str(dir_), league_id)
+    except Exception as _e:
+        logger.debug("seed_team_aliases post-ingest failed: %s", _e)
 
     return {
         "status": "success",
@@ -1621,21 +1592,20 @@ def ingest_batting_stats_adv(filepath: str) -> dict:
     and team partitions coexist.
     """
     df = parse_stats_batting_adv_csv(filepath)
+    league_id = detect_league_id(filepath)
+    if league_id is None:
+        # Team CSVs hit this path with no league prefix; NULL-league rows
+        # contaminate the latest-snapshot-per-card overlay query. Skip.
+        return {"status": "skipped", "file_type": "batting_stats_adv", "rows": 0,
+                "reason": "team-file adv stats deprecated — see league-wide ingest"}
     conn = get_connection()
     cursor = conn.cursor()
     snapshot_date = datetime.now().strftime("%Y-%m-%d")
-    league_id = detect_league_id(filepath)
 
-    if league_id is None:
-        cursor.execute(
-            "DELETE FROM batting_stats_adv WHERE DATE(snapshot_date) = ? AND league_id IS NULL",
-            (snapshot_date,),
-        )
-    else:
-        cursor.execute(
-            "DELETE FROM batting_stats_adv WHERE DATE(snapshot_date) = ? AND league_id = ?",
-            (snapshot_date, league_id),
-        )
+    cursor.execute(
+        "DELETE FROM batting_stats_adv WHERE DATE(snapshot_date) = ? AND league_id = ?",
+        (snapshot_date, league_id),
+    )
 
     count = 0
     for _, row in df.iterrows():
@@ -1693,21 +1663,18 @@ def ingest_pitching_stats_adv(filepath: str) -> dict:
     DELETE was unscoped so whichever ran second wiped the other.
     """
     df = parse_stats_pitching_adv_csv(filepath)
+    league_id = detect_league_id(filepath)
+    if league_id is None:
+        return {"status": "skipped", "file_type": "pitching_stats_adv", "rows": 0,
+                "reason": "team-file adv stats deprecated — see league-wide ingest"}
     conn = get_connection()
     cursor = conn.cursor()
     snapshot_date = datetime.now().strftime("%Y-%m-%d")
-    league_id = detect_league_id(filepath)
 
-    if league_id is None:
-        cursor.execute(
-            "DELETE FROM pitching_stats_adv WHERE DATE(snapshot_date) = ? AND league_id IS NULL",
-            (snapshot_date,),
-        )
-    else:
-        cursor.execute(
-            "DELETE FROM pitching_stats_adv WHERE DATE(snapshot_date) = ? AND league_id = ?",
-            (snapshot_date, league_id),
-        )
+    cursor.execute(
+        "DELETE FROM pitching_stats_adv WHERE DATE(snapshot_date) = ? AND league_id = ?",
+        (snapshot_date, league_id),
+    )
 
     count = 0
     for _, row in df.iterrows():
@@ -1779,6 +1746,60 @@ def recalculate_all_meta_scores() -> dict:
     cursor = conn.cursor()
 
     _, _, source = get_weights_with_source()
+
+    # ── Park factors per card (Epic C, 2026-04-24) ──
+    # Join cards.team → league_team_stats.team_name for the active league's
+    # latest snapshot. Each card gets its home park's pf_overall / pf_hr /
+    # pf_avg so the ISO + FIP + wOBA overlays can normalize observed stats
+    # to a neutral park. Park factor 1.0 (neutral) is the safe fallback when
+    # a card has no team assignment, no team_stats row, or implausible pf
+    # values (< 0.5 or > 2.0 — data hygiene guard).
+    park_factors_by_card: dict = {}
+    try:
+        cfg = load_config()
+        active_league = cfg.get('active_league')
+        if active_league:
+            latest = cursor.execute(
+                "SELECT MAX(snapshot_date) AS d FROM league_team_stats "
+                "WHERE league_id = ?",
+                (active_league,),
+            ).fetchone()
+            latest_date = latest['d'] if latest else None
+            if latest_date:
+                for r in cursor.execute("""
+                    SELECT c.card_id, lts.pf_overall, lts.pf_hr, lts.pf_avg,
+                           lts.pf_hr_l, lts.pf_hr_r, lts.pf_avg_l, lts.pf_avg_r,
+                           lts.park_name
+                    FROM cards c
+                    JOIN league_team_stats lts
+                      ON lts.team_name = c.team
+                    WHERE lts.league_id = ? AND lts.snapshot_date = ?
+                """, (active_league, latest_date)).fetchall():
+                    park_factors_by_card[r['card_id']] = dict(r)
+                logger.info("Loaded park factors for %d cards (league=%s date=%s)",
+                            len(park_factors_by_card), active_league, latest_date)
+    except Exception as _e:
+        logger.warning("park_factors fetch failed (park adjustment disabled): %s", _e)
+
+    def _inject_park_factors(d):
+        """Attach park factor keys to a card's row dict, neutral when unknown."""
+        pf = park_factors_by_card.get(d['card_id']) or {}
+        # Hygiene: clamp implausible values to neutral (1.0)
+        def _clean(v):
+            try:
+                v = float(v)
+                return v if 0.5 <= v <= 2.0 else 1.0
+            except (TypeError, ValueError):
+                return 1.0
+        d['_park_factor_overall'] = _clean(pf.get('pf_overall'))
+        d['_park_factor_hr'] = _clean(pf.get('pf_hr'))
+        d['_park_factor_avg'] = _clean(pf.get('pf_avg'))
+        # Keep the legacy `_park_factor_bat` / `_park_factor_pit` names the
+        # existing wOBA + SIERA overlays already reference — both fall back to
+        # pf_overall for now since the splits-by-handedness overlay doesn't
+        # yet discriminate.
+        d['_park_factor_bat'] = d['_park_factor_overall']
+        d['_park_factor_pit'] = d['_park_factor_overall']
 
     # ── Batch-fetch supplementary data for the multi-factor meta layers ──
     # These lookups feed platoon splits, position flexibility, arsenal
@@ -1950,6 +1971,34 @@ def recalculate_all_meta_scores() -> dict:
     # tier+league mean in each league, then weight by PA. This way i76
     # (higher-scoring) cards don't get inflated bonuses from a pooled
     # baseline. Feeds _calc_iso_overlay_batting (r=+0.580 w/ WAR/600).
+    # Observed defense (Epic B, 2026-04-24): games-weighted mean Zone Rating
+    # per card_id. zr is OOTP's UZR/DRS-equivalent — positive = runs saved
+    # above avg, negative = runs given back. A card playing multiple positions
+    # contributes each position's zr proportional to games there, so utility
+    # cards (e.g. CF-primary also playing LF/RF) get a fair defensive read.
+    # Feeds _calc_observed_defense_overlay_batting.
+    obs_def_batting = {}
+    try:
+        for r in cursor.execute("""
+            SELECT card_id, zr, games
+            FROM fielding_stats
+            WHERE card_id IS NOT NULL AND zr IS NOT NULL
+              AND games IS NOT NULL AND games > 0
+        """).fetchall():
+            cid = r['card_id']
+            zr = float(r['zr'])
+            g = float(r['games'])
+            entry = obs_def_batting.setdefault(cid, {'zr_wt': 0.0, 'games': 0.0})
+            entry['zr_wt'] += zr * g
+            entry['games'] += g
+        for cid, entry in obs_def_batting.items():
+            if entry['games'] > 0:
+                entry['zr'] = entry['zr_wt'] / entry['games']
+            else:
+                entry['zr'] = 0.0
+    except Exception as _e:
+        logger.warning("obs_def_batting fit failed (defense overlay disabled): %s", _e)
+
     obs_iso_batting = {}
     try:
         # Per-(league, tier) mean ISO as baselines
@@ -2294,6 +2343,44 @@ def recalculate_all_meta_scores() -> dict:
     except Exception as _e:
         logger.warning("obs_fip_pitching fit failed (FIP overlay disabled): %s", _e)
 
+    # Observed HR/9 delta per pitcher card_id, IP-weighted and league-adjusted.
+    # SP residual r=-0.614 with WAR/200 residuals after FIP overlay (n=1834,
+    # 2026-04-24). FIP weights HR but is diluted by K/BB; standalone HR rate
+    # has independent SP signal that the FIP overlay can't fully extract.
+    obs_hr9_pitching: dict = {}
+    try:
+        # Per-league HR/9 baselines (use min_ip 30 to avoid noisy short-stint
+        # fluctuations dominating the league average).
+        league_hr9_baseline = {}
+        for r in cursor.execute("""
+            SELECT league_id AS lg, AVG(hr_per_9) AS mean_hr9, COUNT(*) AS n
+            FROM pitching_stats
+            WHERE hr_per_9 IS NOT NULL AND ip >= 30 AND card_id IS NOT NULL
+            GROUP BY league_id HAVING COUNT(*) >= 30
+        """).fetchall():
+            league_hr9_baseline[r['lg']] = r['mean_hr9']
+
+        # IP-weighted delta per card
+        for r in cursor.execute("""
+            SELECT card_id, league_id AS lg, hr_per_9, ip
+            FROM pitching_stats
+            WHERE card_id IS NOT NULL AND hr_per_9 IS NOT NULL
+              AND ip IS NOT NULL AND ip > 0
+        """).fetchall():
+            baseline = league_hr9_baseline.get(r['lg'])
+            if baseline is None:
+                continue
+            ip_w = max(float(r['ip'] or 0), 0.1)
+            delta = float(r['hr_per_9']) - float(baseline)
+            entry = obs_hr9_pitching.setdefault(r['card_id'],
+                                                 {'dw': 0.0, 'ip': 0.0})
+            entry['dw'] += delta * ip_w
+            entry['ip'] += ip_w
+        for cid, entry in obs_hr9_pitching.items():
+            entry['hr9_delta'] = (entry['dw'] / entry['ip']) if entry['ip'] else 0.0
+    except Exception as _e:
+        logger.warning("obs_hr9_pitching fit failed (HR/9 overlay disabled): %s", _e)
+
     # Reliever discipline: inherited runners + scored per pitcher card_id
     reliever_discipline: dict = {}
     try:
@@ -2339,6 +2426,167 @@ def recalculate_all_meta_scores() -> dict:
     except Exception as _e:
         logger.warning("game-log pitching agg failed (pitcher EV/LD overlay disabled): %s", _e)
 
+    # ── Recent-form pre-scan (2026-04-24) ──
+    # Aggregates the LAST 30 DAYS of per-game stats (game_batting / game_pitching
+    # joined to games.game_date) per card_id. Feeds _calc_recent_form_overlay_*
+    # so the meta nudges toward what the card has been doing lately, not just
+    # the locked-in season totals.
+    #
+    # Window is per-league (each league's "30 days back from MAX(game_date)") so
+    # users with multiple leagues don't cross-contaminate. Aggregation is
+    # cross-team — a card owned by N teams contributes ALL its appearances,
+    # which is consistent with how every other observed-stat overlay treats
+    # multi-owner cards.
+    #
+    # Min sample: 25 PA (batters) / 10 IP (pitchers). Below that the signal is
+    # too noisy to nudge meta. Confidence saturates at 100 PA / 30 IP.
+    RECENT_FORM_WINDOW_DAYS = 30
+    recent_form_batting: dict = {}
+    recent_form_pitching: dict = {}
+
+    # Season baselines per card (PA-weighted OBP for batters, IP-weighted ERA
+    # for pitchers). Keyed by card_id; aggregated across all instances of the
+    # card (multi-team owners pool together — same as every other observed
+    # overlay). Used by the recent-form overlay to compute the delta.
+    season_obp_by_card: dict = {}
+    season_era_by_card: dict = {}
+    try:
+        for r in cursor.execute("""
+            SELECT card_id,
+                   SUM(COALESCE(obp * pa, 0)) * 1.0 / NULLIF(SUM(pa), 0) AS season_obp,
+                   SUM(pa) AS pa_total
+            FROM batting_stats
+            WHERE card_id IS NOT NULL AND obp IS NOT NULL AND pa > 0
+            GROUP BY card_id
+        """).fetchall():
+            if r['pa_total'] and r['pa_total'] > 0:
+                season_obp_by_card[r['card_id']] = float(r['season_obp'] or 0)
+        for r in cursor.execute("""
+            SELECT card_id,
+                   SUM(COALESCE(era * ip, 0)) * 1.0 / NULLIF(SUM(ip), 0) AS season_era,
+                   SUM(ip) AS ip_total
+            FROM pitching_stats
+            WHERE card_id IS NOT NULL AND era IS NOT NULL AND ip > 0
+            GROUP BY card_id
+        """).fetchall():
+            if r['ip_total'] and r['ip_total'] > 0:
+                season_era_by_card[r['card_id']] = float(r['season_era'] or 0)
+    except Exception as _e:
+        logger.warning("recent-form season baselines failed: %s", _e)
+
+    try:
+        # Per-league window cutoffs (so multi-league users get clean per-league
+        # windows). One pass to find the latest game_date per league.
+        per_league_cutoff: dict = {}
+        for r in cursor.execute("""
+            SELECT league_id, MAX(game_date) AS latest
+            FROM games
+            WHERE league_id IS NOT NULL AND game_date IS NOT NULL
+            GROUP BY league_id
+        """).fetchall():
+            try:
+                from datetime import datetime, timedelta
+                latest = datetime.strptime(r['latest'], '%Y-%m-%d')
+                cutoff = (latest - timedelta(days=RECENT_FORM_WINDOW_DAYS)).strftime('%Y-%m-%d')
+                per_league_cutoff[r['league_id']] = cutoff
+            except (ValueError, TypeError):
+                continue
+
+        if per_league_cutoff:
+            # Build a single OR-of-windows WHERE clause so we can do one pass
+            # per side instead of one query per league.
+            placeholders = ' OR '.join(
+                "(g.league_id = ? AND g.game_date >= ?)"
+                for _ in per_league_cutoff
+            )
+            params = []
+            for lg, cutoff in per_league_cutoff.items():
+                params.extend([lg, cutoff])
+
+            # Batting: aggregate per card across every recent appearance.
+            # We don't have per-game SLG (game_batting only carries h/ab/bb/k),
+            # so the recent signal is OBP-proxy = (h+bb)/(ab+bb) — robust at
+            # small samples and directly comparable to season OBP from
+            # batting_stats.
+            for r in cursor.execute(f"""
+                SELECT gb.card_id AS cid,
+                       SUM(COALESCE(gb.ab, 0))  AS ab,
+                       SUM(COALESCE(gb.h, 0))   AS h,
+                       SUM(COALESCE(gb.bb, 0))  AS bb,
+                       SUM(COALESCE(gb.k, 0))   AS k,
+                       COUNT(*)                 AS games
+                FROM game_batting gb
+                JOIN games g ON g.game_id = gb.game_id
+                WHERE gb.card_id IS NOT NULL
+                  AND ({placeholders})
+                GROUP BY gb.card_id
+            """, params).fetchall():
+                ab = int(r['ab'] or 0)
+                h = int(r['h'] or 0)
+                bb = int(r['bb'] or 0)
+                k = int(r['k'] or 0)
+                pa = ab + bb
+                if pa <= 0:
+                    continue
+                recent_form_batting[r['cid']] = {
+                    'pa': pa, 'ab': ab, 'h': h, 'bb': bb, 'k': k,
+                    'games': int(r['games'] or 0),
+                    'avg': h / ab if ab > 0 else 0.0,
+                    'obp_proxy': (h + bb) / pa,
+                    'k_rate': k / pa,
+                }
+
+            # Pitching: ER, BB, K, HR, BF — enough for ERA, K/9, BB/9, HR/9.
+            for r in cursor.execute(f"""
+                SELECT gp.card_id AS cid,
+                       SUM(COALESCE(gp.ip, 0))           AS ip,
+                       SUM(COALESCE(gp.er, 0))           AS er,
+                       SUM(COALESCE(gp.bb, 0))           AS bb,
+                       SUM(COALESCE(gp.k, 0))            AS k,
+                       SUM(COALESCE(gp.hr, 0))           AS hr,
+                       SUM(COALESCE(gp.batters_faced,0)) AS bf,
+                       COUNT(*)                          AS apps
+                FROM game_pitching gp
+                JOIN games g ON g.game_id = gp.game_id
+                WHERE gp.card_id IS NOT NULL
+                  AND ({placeholders})
+                GROUP BY gp.card_id
+            """, params).fetchall():
+                # game_pitching.ip is decimal innings (e.g. 7.1 = 7⅓). Convert
+                # the fractional .1/.2 to true thirds for accurate rate stats.
+                raw_ip = float(r['ip'] or 0)
+                whole = int(raw_ip)
+                frac = round((raw_ip - whole) * 10)
+                # Clamp .3+ to handle dirty data (shouldn't happen in OOTP)
+                if frac > 2:
+                    frac = 0
+                    whole += 1
+                true_ip = whole + (frac / 3.0)
+                if true_ip <= 0:
+                    continue
+                er = int(r['er'] or 0)
+                bb = int(r['bb'] or 0)
+                k = int(r['k'] or 0)
+                hr = int(r['hr'] or 0)
+                bf = int(r['bf'] or 0)
+                recent_form_pitching[r['cid']] = {
+                    'ip': true_ip, 'er': er, 'bb': bb, 'k': k, 'hr': hr,
+                    'bf': bf, 'apps': int(r['apps'] or 0),
+                    'era': (er * 9.0 / true_ip),
+                    'k_per_9': (k * 9.0 / true_ip),
+                    'bb_per_9': (bb * 9.0 / true_ip),
+                    'hr_per_9': (hr * 9.0 / true_ip),
+                }
+            logger.info(
+                "Recent-form pre-scan: %d batters / %d pitchers in last %d days "
+                "(per-league windows: %s)",
+                len(recent_form_batting), len(recent_form_pitching),
+                RECENT_FORM_WINDOW_DAYS,
+                ', '.join(f"{lg}>={d}" for lg, d in per_league_cutoff.items()),
+            )
+    except Exception as _e:
+        logger.warning("recent-form pre-scan failed (recent-form overlay disabled): %s", _e)
+
     # ── Recalc batting ──
     # Includes platoon splits, position flexibility, defense, speed, card_type bias
     batters = cursor.execute("""
@@ -2361,6 +2609,7 @@ def recalculate_all_meta_scores() -> dict:
         d['defense_score'] = calc_defense_score(d)
         d['speed_score'] = calc_speed_score(d)
         d['ovr'] = d.get('card_value', 0)
+        _inject_park_factors(d)
         # Merge advanced batting stats for performance overlay
         adv = adv_batting.get(d['card_id'])
         if adv:
@@ -2420,6 +2669,23 @@ def recalculate_all_meta_scores() -> dict:
         if isg and 'gap' in isg:
             d['_obs_iso_gap'] = isg['gap']
             d['_obs_iso_gap_pa'] = isg.get('pa') or 0
+        # Observed defense (Epic B): games-weighted mean Zone Rating.
+        # Feeds _calc_observed_defense_overlay_batting (±10 meta).
+        dfn = obs_def_batting.get(d['card_id'])
+        if dfn and 'zr' in dfn:
+            d['_obs_def_zr'] = dfn['zr']
+            d['_obs_def_games'] = dfn.get('games') or 0
+        # Recent-form (last 30 days) — feeds _calc_recent_form_overlay_batting.
+        # Pairs the recent OBP-proxy with the card's PA-weighted SEASON OBP
+        # baseline so the overlay sees a true delta.
+        rf = recent_form_batting.get(d['card_id'])
+        if rf:
+            d['_rf_pa'] = rf.get('pa') or 0
+            d['_rf_obp_proxy'] = rf.get('obp_proxy')
+            d['_rf_avg'] = rf.get('avg')
+            d['_rf_k_rate'] = rf.get('k_rate')
+            d['_rf_games'] = rf.get('games') or 0
+            d['_rf_season_obp'] = season_obp_by_card.get(d['card_id'])
         meta = calc_batting_meta(d)
         if meta and meta > 0:
             cursor.execute("UPDATE cards SET meta_score_batting = ? WHERE card_id = ?",
@@ -2448,6 +2714,7 @@ def recalculate_all_meta_scores() -> dict:
     for row in pitchers:
         d = dict(row)
         d['ovr'] = d.get('card_value', 0)
+        _inject_park_factors(d)
         # Merge arsenal data for diversity factor
         arsenal = arsenal_data.get(d['card_id'])
         if arsenal:
@@ -2481,6 +2748,12 @@ def recalculate_all_meta_scores() -> dict:
         if fip and 'fip_delta' in fip:
             d['_obs_fip_delta'] = fip['fip_delta']
             d['_obs_fip_bf'] = fip.get('bf') or 0
+        # Observed HR/9 delta — feeds the SP-only HR/9 overlay.
+        # SP residual r=-0.614 after FIP — independent signal worth its own term.
+        h9 = obs_hr9_pitching.get(d['card_id'])
+        if h9 and 'hr9_delta' in h9:
+            d['_obs_hr9_delta'] = h9['hr9_delta']
+            d['_obs_hr9_ip'] = h9.get('ip') or 0
         # ERA+ overperformance for over-performance overlay.
         op = overperf_pitching.get(d['card_id'])
         if op:
@@ -2491,6 +2764,18 @@ def recalculate_all_meta_scores() -> dict:
         if bb9 and 'bb9_delta' in bb9:
             d['_obs_bb9_delta'] = bb9['bb9_delta']
             d['_obs_bb9_bf'] = bb9.get('bf') or 0
+        # Recent-form (last 30 days) — feeds _calc_recent_form_overlay_pitching.
+        # Pairs the recent ERA/K9/BB9/HR9 with the season ERA baseline so the
+        # overlay can compute a recency delta on top of all the static signals.
+        rfp = recent_form_pitching.get(d['card_id'])
+        if rfp:
+            d['_rf_ip'] = rfp.get('ip') or 0
+            d['_rf_era'] = rfp.get('era')
+            d['_rf_k_per_9'] = rfp.get('k_per_9')
+            d['_rf_bb_per_9'] = rfp.get('bb_per_9')
+            d['_rf_hr_per_9'] = rfp.get('hr_per_9')
+            d['_rf_apps'] = rfp.get('apps') or 0
+            d['_rf_season_era'] = season_era_by_card.get(d['card_id'])
         meta = calc_pitching_meta(d)
         if meta and meta > 0:
             cursor.execute("UPDATE cards SET meta_score_pitching = ? WHERE card_id = ?",
@@ -2604,6 +2889,33 @@ def recalculate_all_meta_scores() -> dict:
     conn.commit()
     conn.close()
 
+    # Snapshot meta_history per league. Captures current meta values
+    # alongside the weights_version so we can later diff "how did Card X
+    # move when we calibrated weights?". Skipped silently if anything
+    # goes wrong — meta_history is observability, not correctness.
+    history_snapshot = None
+    try:
+        from app.core.history import snapshot_meta_scores
+        leagues_seen = []
+        try:
+            from app.core.database import get_connection as _gc
+            _hc = _gc()
+            try:
+                leagues_seen = [r[0] for r in _hc.execute(
+                    "SELECT DISTINCT league_id FROM leagues WHERE league_id IS NOT NULL"
+                ).fetchall()]
+            finally:
+                _hc.close()
+        except Exception:
+            pass
+        if not leagues_seen:
+            leagues_seen = [None]  # one global snapshot
+        history_snapshot = []
+        for lg in leagues_seen:
+            history_snapshot.append(snapshot_meta_scores(league_id=lg))
+    except Exception as _hist_err:
+        _logger.warning("meta_history snapshot failed: %s", _hist_err)
+
     return {
         "status": "success" if _roster_sync_error is None else "partial",
         "batters_updated": bat_count,
@@ -2611,6 +2923,7 @@ def recalculate_all_meta_scores() -> dict:
         "roster_synced": roster_synced,
         "roster_sync_error": _roster_sync_error,
         "weight_source": source,
+        "history_snapshot": history_snapshot,
         "message": (
             f"Recalculated {bat_count} batters + {pit_count} pitchers using "
             f"{source} weights. Synced {roster_synced} roster metas."

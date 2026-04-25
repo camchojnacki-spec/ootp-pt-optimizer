@@ -137,15 +137,26 @@ def snapshot_meta_scores(league_id: str = None, weights_version: str = None):
             )
             position = pos_name or str(pos_num)
 
+            # INSERT OR REPLACE against the UNIQUE dedup index
+            # (card_id, league_id, weights_version, DATE(snapshot_date)).
+            # Re-running recalc on the same day with same weights now
+            # refreshes the existing row's meta values instead of appending
+            # a duplicate. Bumps inserted count honestly by checking changes.
+            before = conn.execute(
+                "SELECT COUNT(*) FROM meta_history WHERE card_id=? AND league_id IS ? "
+                "AND weights_version=? AND DATE(snapshot_date)=DATE(?)",
+                (card_id, league_id, weights_version, now),
+            ).fetchone()[0]
             conn.execute(
-                "INSERT INTO meta_history "
+                "INSERT OR REPLACE INTO meta_history "
                 "(card_id, player_name, position, meta_score, "
                 " meta_vs_rhp, meta_vs_lhp, league_id, weights_version, snapshot_date) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (card_id, player_name, position, meta,
                  meta_vs_rhp, meta_vs_lhp, league_id, weights_version, now),
             )
-            inserted += 1
+            if before == 0:
+                inserted += 1
 
         conn.commit()
         return {"count": inserted, "weights_version": weights_version,

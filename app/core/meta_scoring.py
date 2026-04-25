@@ -401,6 +401,48 @@ _TIER_ISO_BASELINES = {
 }
 
 
+def _calc_observed_defense_overlay_batting(row):
+    """Adjust meta based on observed Zone Rating from fielding_stats (Epic B).
+
+    Rating-based defense has r≈0.046 with WAR — essentially noise. Observed
+    defensive range (OOTP's Zone Rating, `zr` in fielding_stats) is the
+    empirical equivalent of UZR/DRS and carries the real signal. A card
+    posting zr=+5 over 81 games has demonstrably added runs; zr=-5 has
+    given them back.
+
+    Aggregation (see ingestion.py): games-weighted mean zr across all
+    positions played, so a CF-primary who also plays some LF contributes
+    both his CF-zr and LF-zr proportional to games. This is fairer than
+    picking the primary position's zr alone, especially for utility types.
+
+    Inputs:
+        ``_obs_def_zr``    — games-weighted mean Zone Rating (runs above/below)
+        ``_obs_def_games`` — total defensive games (confidence)
+
+    Scale: zr=+5 × 1.0 × 81-game confidence = +5 meta. Capped ±10. That
+    keeps defense a genuine-but-modest meta contributor — consistent with
+    PT sims where offensive variance dominates short series.
+    """
+    zr = row.get('_obs_def_zr')
+    games = row.get('_obs_def_games') or 0
+    if zr is None or games is None:
+        return 0.0
+    try:
+        zr = float(zr)
+        games = float(games)
+    except (ValueError, TypeError):
+        return 0.0
+    if games < 20:
+        return 0.0  # too few games to trust
+
+    # Confidence saturates at 81 games (half a full season).
+    confidence = min(math.sqrt(games / 81.0), 1.0)
+    # Scale: zr=+5 × 1.0 × full confidence = +5 meta. A full-season +10
+    # zr elite defender (rare — top 1%) earns the +10 cap.
+    adjustment = zr * 1.0 * confidence
+    return max(-10.0, min(10.0, adjustment))
+
+
 def _calc_iso_overlay_batting(row):
     """Adjust meta based on observed Isolated Power (SLG - AVG).
 
@@ -408,6 +450,12 @@ def _calc_iso_overlay_batting(row):
     ISO has r=+0.580 with WAR/600 — stronger than OVR (r=+0.478) and
     stronger than any single rating. The signal is stable because ISO
     saturates quickly (200 PA is already meaningful power evidence).
+
+    **Park adjustment (Epic C, 2026-04-24):** ISO is a power stat — it
+    scales directly with the home-park HR factor. A .250 ISO in a hitter's
+    park (pf_hr=1.15) is really ~.217 in a neutral park. Dividing the
+    observed delta by ``_park_factor_hr`` neutralizes that environment
+    before the overlay fires. Neutral pf=1.0 → no change (safe default).
 
     This is fully additive to rating-based power/gap_power because it's
     a directly-measured sample outcome, not a prediction.
@@ -419,8 +467,9 @@ def _calc_iso_overlay_batting(row):
     scoring-environment artifact.
 
     Inputs:
-        ``_obs_iso_delta`` — PA-weighted ISO delta vs league+tier mean
-        ``_obs_iso_pa``    — total PAs across all leagues
+        ``_obs_iso_delta``     — PA-weighted ISO delta vs league+tier mean
+        ``_obs_iso_pa``        — total PAs across all leagues
+        ``_park_factor_hr``    — home park HR factor (1.0 = neutral)
 
     Scales with sqrt(PA/300) confidence. Capped ±15.
     """
@@ -435,6 +484,20 @@ def _calc_iso_overlay_batting(row):
         return 0.0
     if pa < 100:
         return 0.0  # too few PA to trust
+
+    # Park-neutralize the ISO delta: divide by pf_hr so a hitter in a +15%
+    # HR park doesn't get over-credited for power he wouldn't maintain in
+    # a neutral park. Clamp the pf to [0.5, 2.0] for hygiene (implausible
+    # park factors treated as neutral).
+    pf_hr = row.get('_park_factor_hr') or 1.0
+    try:
+        pf_hr = float(pf_hr)
+        if pf_hr <= 0.5 or pf_hr >= 2.0:
+            pf_hr = 1.0
+    except (ValueError, TypeError):
+        pf_hr = 1.0
+    if pf_hr != 1.0:
+        delta = delta / pf_hr
 
     confidence = min(math.sqrt(pa / 300.0), 1.0)
 
@@ -946,6 +1009,108 @@ def _calc_overperformance_overlay_pitching(row):
     return max(-20.0, min(20.0, adjustment))
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# RECENT-FORM OVERLAYS (2026-04-24)
+#
+# All other overlays freeze at last ingest, blending the player's full season
+# (or career across owners) into one number. That means a card that's been
+# white-hot or ice-cold over the last 30 days carries the SAME meta as the
+# day before its hot/cold streak began. The Roster Optimizer can show a
+# "Recent Performance" panel and an Outlook (hot/cold) label, but neither
+# nudges meta — so a cold high-meta starter still ranks "Optimal" and locks
+# out genuine bench upgrades that have heated up.
+#
+# These overlays close the gap with a small, sample-weighted recency nudge:
+# observed last-30-day production minus the season baseline, scaled and
+# capped so it can shift meta within a band but never override the rating
+# foundation.
+#
+# Inputs come from `recent_form_batting` / `recent_form_pitching` aggregates
+# built in `recalculate_all_meta_scores`. Per-league windows are used so
+# multi-league users don't cross-contaminate.
+# ════════════════════════════════════════════════════════════════════════════
+
+# Sample-size gates for the recent-form overlay. Below these, the signal is
+# too noisy to nudge meta. Confidence saturates near these saturation points.
+_RECENT_FORM_MIN_PA = 25
+_RECENT_FORM_PA_SATURATION = 100
+_RECENT_FORM_MIN_IP = 10
+_RECENT_FORM_IP_SATURATION = 30
+
+
+def _calc_recent_form_overlay_batting(row):
+    """Nudge meta toward recent-30-day OBP performance vs season baseline.
+
+    Inputs (set by ingestion pre-scan):
+        ``_rf_pa``          — total PA in the last-30-day window
+        ``_rf_obp_proxy``   — (h+bb)/(ab+bb) over the window
+        ``_rf_season_obp``  — PA-weighted season OBP across all card instances
+
+    Why OBP-proxy and not OPS+: ``game_batting`` only carries ab/h/bb/k per
+    game (no doubles/triples/HR), so SLG can't be reconstructed at the game
+    level. OBP is robust at the small samples we typically see in 30 days
+    and directly comparable to season OBP.
+
+    Scale: 0.060 OBP swing × 200 × full-confidence = 12 meta. Cap ±15 so the
+    overlay can shift a borderline upgrade decision but never dominate
+    ratings + season-long observed signals.
+    """
+    pa = row.get('_rf_pa') or 0
+    rec_obp = row.get('_rf_obp_proxy')
+    season_obp = row.get('_rf_season_obp')
+    if not pa or rec_obp is None or season_obp is None:
+        return 0.0
+    try:
+        pa = float(pa)
+        rec_obp = float(rec_obp)
+        season_obp = float(season_obp)
+    except (ValueError, TypeError):
+        return 0.0
+    if pa < _RECENT_FORM_MIN_PA or season_obp <= 0:
+        return 0.0
+
+    confidence = min(math.sqrt(pa / _RECENT_FORM_PA_SATURATION), 1.0)
+    delta = rec_obp - season_obp
+    adjustment = delta * 200.0 * confidence
+    return max(-15.0, min(15.0, adjustment))
+
+
+def _calc_recent_form_overlay_pitching(row):
+    """Nudge meta toward recent-30-day ERA performance vs season baseline.
+
+    Inputs (set by ingestion pre-scan):
+        ``_rf_ip``         — innings pitched in the last-30-day window
+        ``_rf_era``        — ERA over the window
+        ``_rf_season_era`` — IP-weighted season ERA across all card instances
+
+    Sign convention: positive adjustment when recent ERA is BETTER (lower)
+    than season — a guy turning a corner gets meta nudged up, a guy melting
+    down gets nudged down. ERA is noisy at low IP, so the gate is 10 IP
+    minimum and confidence saturates at 30 IP.
+
+    Scale: 1.50 ERA gap × 6 × full-confidence = 9 meta. Cap ±15.
+    """
+    ip = row.get('_rf_ip') or 0
+    rec_era = row.get('_rf_era')
+    season_era = row.get('_rf_season_era')
+    if not ip or rec_era is None or season_era is None:
+        return 0.0
+    try:
+        ip = float(ip)
+        rec_era = float(rec_era)
+        season_era = float(season_era)
+    except (ValueError, TypeError):
+        return 0.0
+    if ip < _RECENT_FORM_MIN_IP or season_era <= 0:
+        return 0.0
+
+    confidence = min(math.sqrt(ip / _RECENT_FORM_IP_SATURATION), 1.0)
+    # Positive delta = recent better than season.
+    delta = season_era - rec_era
+    adjustment = delta * 6.0 * confidence
+    return max(-15.0, min(15.0, adjustment))
+
+
 def _calc_stamina_bonus_pitching(row):
     """Linear stamina bonus for starters.
 
@@ -1040,21 +1205,106 @@ def _calc_fip_overlay_pitching(row):
     if bf < 100:
         return 0.0
 
+    # Park adjustment (Epic C, 2026-04-24): FIP is HR-weighted (13×HR in
+    # the formula), so a pitcher at a hitter-friendly park (pf_hr > 1.0)
+    # has their FIP inflated by environment. Multiply the delta by pf_hr
+    # to neutralize — a pitcher who posted 3.80 FIP in a +15% HR park is
+    # really putting up ~3.30 FIP-neutral, which should register as a
+    # bigger gap below league (-0.70 vs observed -0.20). Clamp to [0.5,
+    # 2.0] for hygiene.
+    pf_hr = row.get('_park_factor_hr') or 1.0
+    try:
+        pf_hr = float(pf_hr)
+        if pf_hr <= 0.5 or pf_hr >= 2.0:
+            pf_hr = 1.0
+    except (ValueError, TypeError):
+        pf_hr = 1.0
+    if pf_hr != 1.0:
+        delta = delta * pf_hr
+
     confidence = min(math.sqrt(bf / 300.0), 1.0)
 
-    # Scale: 1.0 FIP below league avg × -30 × 1.0 confidence = +30 meta.
+    # Scale: 1.0 FIP below league avg × scale × 1.0 confidence.
     # Negative coefficient because lower FIP is better. Scale history:
     #   v1: 15  → residual still −0.324, undersized.
     #   v2: 25  → residual dropped to −0.30 post-overlay.
-    #   v3: 30  (2026-04-18) — pitching chip was stuck at r=0.40 combined
-    #            largely because RP ratings don't predict WAR cleanly.
-    #            FIP is the best observation-based signal available for RPs,
-    #            so a 1.2× bump absorbs more of the remaining residual
-    #            without crossing into the double-count risk zone with the
-    #            SIERA/wOBA overlays (which weight K/BB, not HR).
-    # Cap ±40 (was ±35) to let high-BF outliers earn their signal.
-    adjustment = -delta * 30.0 * confidence
-    return max(-40.0, min(40.0, adjustment))
+    #   v3: 30  (2026-04-18) — bumped for combined pitching r=0.40 ceiling.
+    #   v4: SP-specific 45, RP-specific 30 (2026-04-24) — SP residual analysis
+    #       (n=1834) found FIP_obs r=-0.644 vs WAR/200 residuals AFTER all
+    #       prior overlays. SPs face 28 BF/start so 5+ starts saturates the
+    #       confidence weight; the prior cap at ±40 was being hit on tail
+    #       cases without clearing enough of the residual. SPs get 50% more
+    #       FIP weight + a wider cap; RPs unchanged because their FIP
+    #       residual is much smaller and the existing pair-interaction
+    #       overlay already extracts the role-specific signal.
+    role = (row.get('pitcher_role_name') or '').upper()
+    is_sp_role = role.startswith('SP')
+    # SP FIP scale bumped 45 → 65 after first-pass measure showed residual
+    # only fell from -0.644 to -0.611 (+0.029 project-wide r). Raising scale
+    # absorbs more remaining FIP signal; cap also bumped 60 → 80 so true
+    # outlier FIP gaps (1.5+ above league) don't get clipped.
+    scale = 65.0 if is_sp_role else 30.0
+    cap = 80.0 if is_sp_role else 40.0
+    adjustment = -delta * scale * confidence
+    return max(-cap, min(cap, adjustment))
+
+
+def _calc_hr9_overlay_pitching(row):
+    """SP HR/9 overlay — captures HR-rate signal beyond what FIP absorbs.
+
+    SP residual analysis (2026-04-24, n=1834): observed HR/9 still has
+    r=-0.614 with WAR/200 residuals AFTER the FIP overlay fires. FIP
+    weights HR at 13× but is diluted by K/BB; in OOTP PT the gap between
+    a 0.7 HR/9 and 1.5 HR/9 SP is wider than FIP captures because lineups
+    cycle 3+ times and the second-time-through power penalty compounds.
+
+    Inputs (computed in the recent-form pre-scan and reused here):
+        ``_obs_hr9_delta`` — IP-weighted HR/9 delta vs league baseline
+        ``_obs_hr9_ip``    — total IP across all instances
+
+    SP-only because:
+      - RP HR/9 already absorbed by `_calc_pair_interaction_overlay_pitching`
+        and `_calc_reliever_discipline_overlay_pitching`
+      - RP samples are tiny (avg 50 IP) so HR/9 is too noisy to act on
+      - SP-specific residual analysis showed the signal concentrates on SPs
+
+    Scale: 0.50 HR/9 above league × -8 × 1.0 = -4 meta. Cap ±20 so it can
+    matter without dominating FIP.
+    """
+    role = (row.get('pitcher_role_name') or '').upper()
+    if not role.startswith('SP'):
+        return 0.0
+    delta = row.get('_obs_hr9_delta')
+    ip = row.get('_obs_hr9_ip') or 0
+    if delta is None or ip is None:
+        return 0.0
+    try:
+        delta = float(delta)
+        ip = float(ip)
+    except (ValueError, TypeError):
+        return 0.0
+    if ip < 30:
+        return 0.0
+
+    # Park adjustment — same rationale as FIP overlay. HR/9 is the cleanest
+    # signal in a homer-friendly park and we want to credit suppression
+    # achieved against environment, not get fooled by it.
+    pf_hr = row.get('_park_factor_hr') or 1.0
+    try:
+        pf_hr = float(pf_hr)
+        if pf_hr <= 0.5 or pf_hr >= 2.0:
+            pf_hr = 1.0
+    except (ValueError, TypeError):
+        pf_hr = 1.0
+    if pf_hr != 1.0:
+        delta = delta * pf_hr
+
+    confidence = min(math.sqrt(ip / 100.0), 1.0)
+    # Scale 12 (was 8 in v1, bumped after first-pass results showed HR/9
+    # residual only dropped -0.614 → -0.583). 0.50 HR/9 above league × -12
+    # × 1.0 = -6 meta. Cap ±25 (was ±20).
+    adjustment = -delta * 12.0 * confidence
+    return max(-25.0, min(25.0, adjustment))
 
 
 def _calc_pair_interaction_overlay_pitching(row):
@@ -1238,6 +1488,15 @@ def _r2_gate_for(cal_type: str) -> float:
     return MIN_PITCHING_R2
 
 
+def _active_league_id() -> str | None:
+    """Return the active league from config, or None if unreadable."""
+    try:
+        from app.core.database import load_config
+        return load_config().get('active_league')
+    except Exception:
+        return None
+
+
 def _load_calibration_row(cal_type: str):
     """Read the latest row for a calibration_type and gate it.
 
@@ -1246,11 +1505,28 @@ def _load_calibration_row(cal_type: str):
     ``LAST_WEIGHT_LOAD_DIAGNOSTICS[cal_type]`` with the reason so the UI
     can surface it.
 
+    **Cross-league lookup (Epic G, 2026-04-24):** if an active league is
+    configured, this tries ``{cal_type}:{league}`` first (league-specific
+    fit) and falls back to ``{cal_type}`` (pooled fit) when the
+    league-specific row is missing or fails the gate. This resolves the
+    opposite-sign residuals between lb124 and i76 by letting each league
+    carry its own weight profile when sample size supports it.
+
     Gate logic (either suffices):
         CV R² ≥ _r2_gate_for(cal_type), OR
         Pearson correlation ≥ MIN_CALIBRATION_CORR
     """
     import sqlite3 as _sqlite3
+    # Build the lookup order: league-specific first if active league
+    # exists, then the pooled fallback. The diagnostics dict is keyed on
+    # `cal_type` (the caller's requested key) so the UI still shows the
+    # right chip even after a league fallback.
+    active = _active_league_id()
+    lookup_types = []
+    if active:
+        lookup_types.append(f"{cal_type}:{active}")
+    lookup_types.append(cal_type)
+
     try:
         db_path = get_db_path()
         conn = _sqlite3.connect(db_path, timeout=30.0)
@@ -1259,13 +1535,26 @@ def _load_calibration_row(cal_type: str):
         except Exception:
             pass
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT weights_json, r_squared, correlation, sample_size "
-            "FROM meta_calibration WHERE calibration_type = ? "
-            "ORDER BY created_at DESC LIMIT 1",
-            (cal_type,),
-        )
-        row = cursor.fetchone()
+        row = None
+        source_type = None
+        for lt in lookup_types:
+            cursor.execute(
+                "SELECT weights_json, r_squared, correlation, sample_size "
+                "FROM meta_calibration WHERE calibration_type = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (lt,),
+            )
+            r = cursor.fetchone()
+            if r and r[0]:
+                # Gate-check each candidate; if league-specific fails the gate
+                # we fall through to pooled.
+                threshold = _r2_gate_for(cal_type)
+                r2_ok = r[1] is not None and r[1] >= threshold
+                corr_ok = r[2] is not None and r[2] >= MIN_CALIBRATION_CORR
+                if r2_ok or corr_ok:
+                    row = r
+                    source_type = lt
+                    break
         conn.close()
     except Exception as e:
         LAST_WEIGHT_LOAD_DIAGNOSTICS[cal_type] = {
@@ -1321,12 +1610,16 @@ def _load_calibration_row(cal_type: str):
         reason_parts.append(f"CV R²={r_squared} ≥ {threshold}")
     if corr_ok:
         reason_parts.append(f"Pearson r={correlation} ≥ {MIN_CALIBRATION_CORR}")
+    # Note which calibration row actually got picked — league-specific or
+    # pooled — so the UI can show "used lb124 weights" vs "used pooled weights".
+    scope_note = f" [scope={source_type}]" if source_type and source_type != cal_type else ""
     LAST_WEIGHT_LOAD_DIAGNOSTICS[cal_type] = {
         "status": "used",
         "r_squared": r_squared,
         "correlation": correlation,
         "sample_size": sample_size,
-        "reason": "calibration passed: " + " and ".join(reason_parts),
+        "source_type": source_type,
+        "reason": "calibration passed: " + " and ".join(reason_parts) + scope_note,
     }
     return parsed
 
@@ -1723,6 +2016,21 @@ def calc_batting_meta(row: dict, weights: dict = None) -> float:
         # without enough defensive game sample (≥20 games).
         meta += _calc_error_overlay_batting(row)
 
+        # ── Observed defense (Zone Rating) overlay — Epic B ──
+        # Games-weighted mean zr from fielding_stats. The rating-based
+        # defense term (calc_defense_score above) has r≈0 with WAR; this
+        # observed term adds a small ±10 adjustment based on actual range
+        # demonstrated in-game. Zero when the card has <20 defensive games.
+        meta += _calc_observed_defense_overlay_batting(row)
+
+        # ── Recent-form (last 30 days) overlay — 2026-04-24 ──
+        # All other observed overlays freeze at last ingest, blending the
+        # full season into one number. A cold high-meta starter still ranks
+        # "Optimal" because the static meta hides the streak. This nudges
+        # meta toward the last 30 days of OBP — capped ±15 so it can shift
+        # borderline upgrade decisions without overruling the foundation.
+        meta += _calc_recent_form_overlay_batting(row)
+
         # Positional value bonus — fWAR ladder (SS > C > CF > ... > 1B > DH)
         pos = row.get('position') or row.get('Position') or 0
         if isinstance(pos, str):
@@ -1856,6 +2164,13 @@ def calc_pitching_meta(row: dict, weights: dict = None) -> float:
         # with residuals is the biggest single pitching prediction gap).
         meta += _calc_fip_overlay_pitching(row)
 
+        # ── SP HR/9 overlay (2026-04-24) ──
+        # SP residual analysis (n=1834) found HR/9 still has r=-0.614 with
+        # WAR/200 residuals AFTER FIP. FIP dilutes HR with K/BB; OOTP PT
+        # third-time-through penalties make standalone HR rate matter more
+        # for SPs specifically. RPs no-op.
+        meta += _calc_hr9_overlay_pitching(row)
+
         # ── BB/9 overlay (observed walk rate) ──
         # Post-FIP residual r=-0.34 for bb_per_9 — walks still undercharged.
         meta += _calc_bb9_overlay_pitching(row)
@@ -1885,6 +2200,13 @@ def calc_pitching_meta(row: dict, weights: dict = None) -> float:
         # SP residuals for the same pairs are ~0, so the overlay is
         # role-gated inside the function. No-op for SPs.
         meta += _calc_pair_interaction_overlay_pitching(row)
+
+        # ── Recent-form (last 30 days) overlay — 2026-04-24 ──
+        # Mirrors the batting overlay: nudge meta toward the last 30 days of
+        # ERA vs season ERA. Captures cold starters (Guzman 7+ ERA recent /
+        # acceptable full-season) the static overlays miss, and rewards
+        # heaters. ±15 cap keeps it advisory, not dominant.
+        meta += _calc_recent_form_overlay_pitching(row)
 
         # ── Card-type systematic bias (2026-04-17 residual analysis) ──
         # See PITCHING_CARD_TYPE_OFFSET. Pitching has stronger card_type
@@ -2200,6 +2522,21 @@ def explain_batting_meta(row: dict, weights: dict = None) -> dict:
         else:
             penalties.append({"label": label, "points": round(err_adj, 1)})
 
+    # Recent-form (last 30 days) overlay — 2026-04-24
+    rf_adj = _calc_recent_form_overlay_batting(row)
+    if abs(rf_adj) > 0.5:
+        rf_pa = row.get('_rf_pa') or 0
+        rec_obp = row.get('_rf_obp_proxy') or 0
+        season_obp = row.get('_rf_season_obp') or 0
+        delta = (rec_obp - season_obp)
+        sign = '+' if delta >= 0 else ''
+        label = (f"Recent form (30d OBP {rec_obp:.3f} vs season {season_obp:.3f}, "
+                 f"{sign}{delta:.3f} over {rf_pa} PA)")
+        if rf_adj > 0:
+            bonuses.append({"label": label, "points": round(rf_adj, 1)})
+        else:
+            penalties.append({"label": label, "points": round(rf_adj, 1)})
+
     pos = row.get('position') or row.get('Position') or 0
     if isinstance(pos, str):
         pos_map = {"C": 2, "1B": 3, "2B": 4, "3B": 5, "SS": 6,
@@ -2397,6 +2734,33 @@ def explain_pitching_meta(row: dict, weights: dict = None) -> dict:
             bonuses.append({"label": label, "points": round(rd_adj, 1)})
         else:
             penalties.append({"label": label, "points": round(rd_adj, 1)})
+
+    # SP HR/9 overlay (SPs only — RPs no-op)
+    hr9_adj = _calc_hr9_overlay_pitching(row)
+    if abs(hr9_adj) > 0.5:
+        delta = row.get('_obs_hr9_delta') or 0
+        ip = row.get('_obs_hr9_ip') or 0
+        sign = '+' if delta >= 0 else ''
+        label = f"SP HR/9 vs league ({sign}{delta:.2f} HR/9 over {ip:.0f} IP)"
+        if hr9_adj > 0:
+            bonuses.append({"label": label, "points": round(hr9_adj, 1)})
+        else:
+            penalties.append({"label": label, "points": round(hr9_adj, 1)})
+
+    # Recent-form (last 30 days) overlay — 2026-04-24
+    p_rf_adj = _calc_recent_form_overlay_pitching(row)
+    if abs(p_rf_adj) > 0.5:
+        rf_ip = row.get('_rf_ip') or 0
+        rec_era = row.get('_rf_era') or 0
+        season_era = row.get('_rf_season_era') or 0
+        delta = (season_era - rec_era)
+        sign = '+' if delta >= 0 else ''
+        label = (f"Recent form (30d ERA {rec_era:.2f} vs season {season_era:.2f}, "
+                 f"{sign}{delta:.2f} over {rf_ip:.1f} IP)")
+        if p_rf_adj > 0:
+            bonuses.append({"label": label, "points": round(p_rf_adj, 1)})
+        else:
+            penalties.append({"label": label, "points": round(p_rf_adj, 1)})
 
     if bonuses and any('x' in b['label'].lower() for b in bonuses):
         notes.append("Pitching is non-additive — interaction terms reflect SIERA-style synergy.")

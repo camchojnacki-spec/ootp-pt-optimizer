@@ -66,7 +66,7 @@ def _render_meta_explainer(exp: dict):
             for c in exp['components']
         ])
         st.dataframe(
-            comp_df, use_container_width=True, hide_index=True,
+            comp_df, width='stretch', hide_index=True,
             column_config={
                 "Raw": st.column_config.NumberColumn(format="%.0f", width="small"),
                 "Weight": st.column_config.NumberColumn(format="%.2f", width="small"),
@@ -85,6 +85,137 @@ def _render_meta_explainer(exp: dict):
         st.markdown("---")
         for n in exp['notes']:
             st.caption(f"\U0001f4dd {n}")
+
+
+def _team_meta_correlation(side: str, role_filter: str | None = None) -> tuple[float | None, int]:
+    """Compute Pearson r between meta and observed WAR rate for the user's
+    active roster (vs league-wide calibration which uses every card in the DB).
+
+    The league-wide chip can read "High r=0.54" while the user's specific
+    13-player roster has r=0.49 — the user's fit can diverge meaningfully
+    from the population fit because his roster isn't a random sample. This
+    helper lets the chip surface the user-team-specific number alongside.
+
+    side: 'batting' or 'pitching'
+    role_filter: optional 'SP' / 'RP' subset for pitching
+    Returns ``(r, n)`` or ``(None, 0)`` when sample is too small.
+    """
+    cfg_team = load_config().get('team_name')
+    active_lg = load_config().get('active_league')
+    if not cfg_team or not active_lg:
+        return None, 0
+    is_pit = (side == 'pitching')
+
+    # Sample-size gates — too low and a single 8-IP / 15-PA outlier dominates
+    # the correlation. 15 IP / 50 PA cuts out spot starts and pinch-hit-only
+    # appearances without losing players who are actually being used. TDK
+    # measurement showed gate=5 IP gave r=0.23 (n=12, noise-dominated) while
+    # gate=15 IP gave r=0.49 (n=10) — same population, more honest answer.
+    if is_pit:
+        # Latest IP-weighted stats per pitcher card on the user's team via jersey#.
+        sql = """
+            SELECT c.meta_score_pitching AS meta, ps.ip, ps.war,
+                   c.pitcher_role_name
+            FROM league_rosters lr
+            JOIN cards c ON c.card_id = lr.card_id
+            JOIN pitching_stats ps ON ps.card_id = lr.card_id
+                AND ps.league_id = lr.league_id
+                AND ps.jersey_number = lr.jersey_number
+            WHERE lr.team_name = ? AND lr.league_id = ?
+              AND lr.jersey_number IS NOT NULL
+              AND c.meta_score_pitching IS NOT NULL
+              AND ps.ip >= 15
+              AND ps.snapshot_date = (
+                  SELECT MAX(snapshot_date) FROM pitching_stats ps2
+                  WHERE ps2.card_id = lr.card_id AND ps2.league_id = lr.league_id
+                    AND ps2.jersey_number = lr.jersey_number
+              )
+        """
+    else:
+        sql = """
+            SELECT c.meta_score_batting AS meta, bs.pa, bs.war
+            FROM league_rosters lr
+            JOIN cards c ON c.card_id = lr.card_id
+            JOIN batting_stats bs ON bs.card_id = lr.card_id
+                AND bs.league_id = lr.league_id
+                AND bs.jersey_number = lr.jersey_number
+            WHERE lr.team_name = ? AND lr.league_id = ?
+              AND lr.jersey_number IS NOT NULL
+              AND c.meta_score_batting IS NOT NULL
+              AND bs.pa >= 50
+              AND bs.snapshot_date = (
+                  SELECT MAX(snapshot_date) FROM batting_stats bs2
+                  WHERE bs2.card_id = lr.card_id AND bs2.league_id = lr.league_id
+                    AND bs2.jersey_number = lr.jersey_number
+              )
+        """
+    try:
+        rows = conn.execute(sql, (cfg_team, active_lg)).fetchall()
+    except Exception:
+        return None, 0
+    pairs = []
+    for r in rows:
+        meta = float(r['meta'] or 0)
+        if is_pit:
+            ip = float(r['ip'] or 0)
+            if ip <= 0: continue
+            if role_filter == 'SP' and (r['pitcher_role_name'] or '').upper() != 'SP':
+                continue
+            if role_filter == 'RP' and (r['pitcher_role_name'] or '').upper() not in ('RP', 'CL'):
+                continue
+            war_rate = float(r['war'] or 0) * 200.0 / ip
+        else:
+            pa = float(r['pa'] or 0)
+            if pa <= 0: continue
+            war_rate = float(r['war'] or 0) * 600.0 / pa
+        pairs.append((meta, war_rate))
+    if len(pairs) < 5:
+        return None, len(pairs)
+    n = len(pairs)
+    m_avg = sum(p[0] for p in pairs) / n
+    w_avg = sum(p[1] for p in pairs) / n
+    cov = sum((p[0]-m_avg)*(p[1]-w_avg) for p in pairs)
+    m_var = sum((p[0]-m_avg)**2 for p in pairs)
+    w_var = sum((p[1]-w_avg)**2 for p in pairs)
+    if m_var * w_var <= 0:
+        return None, n
+    return cov / (m_var * w_var) ** 0.5, n
+
+
+def _team_confidence_chip(side: str, role_filter: str | None = None,
+                          display_name: str | None = None) -> str:
+    """Render a chip showing the user's team-specific meta-WAR correlation.
+
+    Color thresholds mirror ``get_meta_confidence`` so the visual language is
+    consistent: green ≥0.45, amber ≥0.30, red below.
+    """
+    r, n = _team_meta_correlation(side, role_filter)
+    if r is None:
+        tip = (f"Team-specific meta-vs-WAR correlation needs at least 5 cards "
+               f"with stable samples (PA ≥20 / IP ≥5). Currently n={n}.")
+        return (
+            f'<span title="{tip}" style="display:inline-block; padding:2px 8px; '
+            f'border-radius:10px; background:#888; color:#fff; '
+            f'font-size:0.78em; font-weight:600; margin-left:8px;">'
+            f'⚪ Your team: insufficient sample (n={n})</span>'
+        )
+    if r >= 0.45:
+        color = '#2e7d32'; emoji = '✅'; label = 'High'
+    elif r >= 0.30:
+        color = '#f9a825'; emoji = '⚠'; label = 'Medium'
+    else:
+        color = '#c62828'; emoji = '⚠'; label = 'Low'
+    prefix = f"{display_name} " if display_name else ""
+    tip = (f"Pearson r between meta and observed WAR rate on YOUR active "
+           f"roster (n={n}). Compares to the league-wide chip on the left "
+           f"— a big gap means your roster's fit isn't typical of the "
+           f"population.")
+    return (
+        f'<span title="{tip}" style="display:inline-block; padding:2px 8px; '
+        f'border-radius:10px; background:{color}; color:#fff; '
+        f'font-size:0.78em; font-weight:600; margin-left:8px;">'
+        f'{emoji} Your team {prefix}({n}): r={r:.2f} {label}</span>'
+    )
 
 
 def _meta_confidence_chip(category: str, display_name: str | None = None) -> str:
@@ -140,6 +271,25 @@ def _fit_for(card_id):
     if not card_id:
         return {}
     return _archetypes_by_card.get(card_id, {}) or {}
+
+
+# Fit-triggered upgrade threshold (Epic A — attribute-mix promotion).
+# A market candidate with Δfit ≥ this much vs the current starter qualifies
+# for the Market Upgrade column even when meta_delta falls below the
+# `min_improvement` sidebar threshold. fit_score is per-cluster normalized
+# 0–100; Δfit of +15 is a "meaningfully better mix" signal while staying
+# above adjacent-cluster noise.
+MIN_FIT_DELTA = 15.0
+
+
+def _archetype_role_for(pos_value, is_pitching):
+    """Map a roster position to the card_archetypes.role value to query."""
+    if not is_pitching:
+        return 'batting'
+    if pos_value == 'SP':
+        return 'SP'
+    # RP and CL share the same cluster set.
+    return 'RP'
 
 # ── Sidebar controls ──
 with st.sidebar:
@@ -433,47 +583,178 @@ _perf_bat = {}
 _perf_pit = {}
 _perf_bat_by_card = {}
 _perf_pit_by_card = {}
-_latest_snap = conn.execute(
-    "SELECT MAX(snapshot_date) as d FROM batting_stats WHERE league_id IS NULL"
-).fetchone()
-if _latest_snap and _latest_snap['d']:
-    # Lowered the PA gate from 50 → 5 so freshly-pinned starters (e.g.
-    # Kluttz/Al Dark just moved into the lineup with 4-8 PA) still get a
-    # Status cell. The Status renderer marks anything <50 PA as "small
-    # sample" so the reader knows the OPS reading is noisy, but at least
-    # it's VISIBLE instead of a confusing blank cell.
-    for r in conn.execute(
-        """SELECT player_name, card_id, pa, ab, hits, hr, k, bb, war, ops, ops_plus, babip, iso,
-                  CASE WHEN pa > 0 THEN war * 600.0 / pa ELSE 0 END as war600
-           FROM batting_stats
-           WHERE snapshot_date = ? AND league_id IS NULL AND pa >= 5 AND ab > 0""",
-        (_latest_snap['d'],),
-    ).fetchall():
-        d = dict(r)
-        _perf_bat[r['player_name']] = d
-        if r['card_id'] is not None:
-            _perf_bat_by_card[r['card_id']] = d
-_latest_psnap = conn.execute(
-    "SELECT MAX(snapshot_date) as d FROM pitching_stats WHERE league_id IS NULL"
-).fetchone()
-if _latest_psnap and _latest_psnap['d']:
-    # IP gate lowered from 10 → 1 so relievers with only a few innings
-    # (e.g. Dicky Lovelady with 4 IP on current team but 159 pooled) still
-    # surface a Status cell. The Status renderer tags ``< 20 IP`` as a
-    # small-sample warning so the reader knows the ERA is noisy.
-    for r in conn.execute(
-        """SELECT player_name, card_id, ip, era, era_plus, fip, war, babip, whip,
-                  k_per_9, bb_per_9, hr_per_9,
-                  CASE WHEN ip > 0 THEN war * 200.0 / ip ELSE 0 END as war200
-           FROM pitching_stats
-           WHERE snapshot_date = ? AND league_id IS NULL AND ip >= 1
-             AND (k > 0 OR era > 0 OR hits_allowed > 0)""",
-        (_latest_psnap['d'],),
-    ).fetchall():
-        d = dict(r)
-        _perf_pit[r['player_name']] = d
-        if r['card_id'] is not None:
-            _perf_pit_by_card[r['card_id']] = d
+
+# Where per-player batting/pitching stats live (2026-04-24 fix):
+#   - Historically, `toronto_dark_knights_lineups_-_overview_batting_stats_*.csv`
+#     (13 rows = Cameron's lineup) was ingested to `league_id IS NULL` and drove
+#     the Status column's hot/cold rate stats.
+#   - Post-2026-04-24 data dump the NULL partition is empty — those team-lineup
+#     rows now land under `league_id = active_league` alongside the league-wide
+#     file. The old "IS NULL only" query produced a universal "no stats yet"
+#     regression across every batter and pitcher slot.
+# Fix: try NULL first (back-compat), fall back to the active league partition.
+# When multiple rows exist per player under the same league (pooled season +
+# recent-team entries), prefer the row with the larger sample (MAX(pa) /
+# MAX(ip)) so per-player rate stats reflect the full season, not a 13-game
+# subset.
+def _load_latest_perf_stats(active_league):
+    """Return (bat_rows, pit_rows, bat_snap_date, pit_snap_date).
+
+    Same card_id can appear N times in batting_stats / pitching_stats — once
+    per PT team that owns it (e.g. Aranda owned by Vancouver, Toronto, and
+    EyeBeez gives 3 distinct rows under the same league+snapshot, each with
+    a different jersey# and stat line).
+
+    Prior behavior used MAX(pa) / MAX(ip) to pick "the dominant row," which
+    happened to surface the user's instance only when the user was the
+    heaviest user of that card. For backups (e.g. TDK's Buster Posey #10
+    with 16 PA while another team's #30 has 565 PA), MAX(pa) returned the
+    OTHER team's row — turning Outlook labels into "this card is cold"
+    when Cameron's actual instance is performing fine.
+
+    Post 2026-04-24 fix: prefer the row whose jersey# matches the user's
+    team in ``league_rosters``. Fall back to MAX(pa)/MAX(ip) only when
+    jersey# isn't known yet (pre-migration data, or a card with no
+    league_rosters entry like a fresh acquisition).
+    """
+    user_team = load_config().get('team_name')
+
+    # --- Batting ---
+    bat_null = conn.execute(
+        "SELECT MAX(snapshot_date) as d FROM batting_stats WHERE league_id IS NULL"
+    ).fetchone()
+    bat_snap = bat_null['d'] if bat_null else None
+    bat_sql = """
+        SELECT player_name, card_id, pa, ab, hits, hr, k, bb, war, ops, ops_plus,
+               babip, iso,
+               CASE WHEN pa > 0 THEN war * 600.0 / pa ELSE 0 END as war600
+        FROM batting_stats
+        WHERE snapshot_date = ? AND league_id IS NULL AND pa >= 5 AND ab > 0
+    """
+    bat_rows = conn.execute(bat_sql, (bat_snap,)).fetchall() if bat_snap else []
+    if not bat_rows and active_league:
+        # Fall back: league-tagged partition. Prefer the user-team's instance
+        # via jersey#; otherwise fall back to MAX(pa) (legacy behavior).
+        bat_league_snap = conn.execute(
+            "SELECT MAX(snapshot_date) as d FROM batting_stats WHERE league_id = ?",
+            (active_league,),
+        ).fetchone()
+        bat_snap = bat_league_snap['d'] if bat_league_snap else None
+        if bat_snap:
+            bat_rows = conn.execute("""
+                SELECT bs.player_name, bs.card_id, bs.pa, bs.ab, bs.hits, bs.hr,
+                       bs.k, bs.bb, bs.war, bs.ops, bs.ops_plus, bs.babip, bs.iso,
+                       CASE WHEN bs.pa > 0 THEN bs.war * 600.0 / bs.pa ELSE 0 END as war600
+                FROM batting_stats bs
+                WHERE bs.snapshot_date = ? AND bs.league_id = ?
+                  AND bs.pa >= 5 AND bs.ab > 0
+                  AND (
+                    -- Prefer the user-team jersey# row when it exists.
+                    bs.jersey_number = (
+                        SELECT lr.jersey_number FROM league_rosters lr
+                        WHERE lr.card_id = bs.card_id
+                          AND lr.team_name = ?
+                          AND lr.league_id = bs.league_id
+                          AND lr.jersey_number IS NOT NULL
+                        ORDER BY lr.snapshot_date DESC LIMIT 1
+                    )
+                    -- Fall back to MAX(pa) for cards not in user's league_rosters
+                    OR (
+                        NOT EXISTS (
+                            SELECT 1 FROM league_rosters lr
+                            WHERE lr.card_id = bs.card_id
+                              AND lr.team_name = ?
+                              AND lr.league_id = bs.league_id
+                              AND lr.jersey_number IS NOT NULL
+                        )
+                        AND bs.pa = (SELECT MAX(pa) FROM batting_stats bs2
+                                     WHERE bs2.player_name = bs.player_name
+                                       AND bs2.snapshot_date = bs.snapshot_date
+                                       AND bs2.league_id = bs.league_id)
+                    )
+                  )
+            """, (bat_snap, active_league, user_team, user_team)).fetchall()
+    # --- Pitching ---
+    pit_null = conn.execute(
+        "SELECT MAX(snapshot_date) as d FROM pitching_stats WHERE league_id IS NULL"
+    ).fetchone()
+    pit_snap = pit_null['d'] if pit_null else None
+    pit_sql = """
+        SELECT player_name, card_id, ip, era, era_plus, fip, war, babip, whip,
+               k_per_9, bb_per_9, hr_per_9,
+               CASE WHEN ip > 0 THEN war * 200.0 / ip ELSE 0 END as war200
+        FROM pitching_stats
+        WHERE snapshot_date = ? AND league_id IS NULL AND ip >= 1
+          AND (k > 0 OR era > 0 OR hits_allowed > 0)
+    """
+    pit_rows = conn.execute(pit_sql, (pit_snap,)).fetchall() if pit_snap else []
+    if not pit_rows and active_league:
+        pit_league_snap = conn.execute(
+            "SELECT MAX(snapshot_date) as d FROM pitching_stats WHERE league_id = ?",
+            (active_league,),
+        ).fetchone()
+        pit_snap = pit_league_snap['d'] if pit_league_snap else None
+        if pit_snap:
+            pit_rows = conn.execute("""
+                SELECT ps.player_name, ps.card_id, ps.ip, ps.era, ps.era_plus,
+                       ps.fip, ps.war, ps.babip, ps.whip,
+                       ps.k_per_9, ps.bb_per_9, ps.hr_per_9,
+                       CASE WHEN ps.ip > 0 THEN ps.war * 200.0 / ps.ip ELSE 0 END as war200
+                FROM pitching_stats ps
+                WHERE ps.snapshot_date = ? AND ps.league_id = ? AND ps.ip >= 1
+                  AND (ps.k > 0 OR ps.era > 0 OR ps.hits_allowed > 0)
+                  AND (
+                    ps.jersey_number = (
+                        SELECT lr.jersey_number FROM league_rosters lr
+                        WHERE lr.card_id = ps.card_id
+                          AND lr.team_name = ?
+                          AND lr.league_id = ps.league_id
+                          AND lr.jersey_number IS NOT NULL
+                        ORDER BY lr.snapshot_date DESC LIMIT 1
+                    )
+                    OR (
+                        NOT EXISTS (
+                            SELECT 1 FROM league_rosters lr
+                            WHERE lr.card_id = ps.card_id
+                              AND lr.team_name = ?
+                              AND lr.league_id = ps.league_id
+                              AND lr.jersey_number IS NOT NULL
+                        )
+                        AND ps.ip = (SELECT MAX(ip) FROM pitching_stats ps2
+                                     WHERE ps2.player_name = ps.player_name
+                                       AND ps2.snapshot_date = ps.snapshot_date
+                                       AND ps2.league_id = ps.league_id)
+                    )
+                  )
+            """, (pit_snap, active_league, user_team, user_team)).fetchall()
+    return bat_rows, pit_rows, bat_snap, pit_snap
+
+
+_bat_rows, _pit_rows, _latest_snap_d, _latest_psnap_d = _load_latest_perf_stats(
+    _active_league_id,
+)
+# Lowered the PA gate from 50 → 5 so freshly-pinned starters (e.g.
+# Kluttz/Al Dark just moved into the lineup with 4-8 PA) still get a
+# Status cell. The Status renderer marks anything <50 PA as "small
+# sample" so the reader knows the OPS reading is noisy, but at least
+# it's VISIBLE instead of a confusing blank cell.
+for r in _bat_rows:
+    d = dict(r)
+    _perf_bat[r['player_name']] = d
+    if r['card_id'] is not None:
+        _perf_bat_by_card[r['card_id']] = d
+# IP gate lowered from 10 → 1 so relievers with only a few innings
+# (e.g. Dicky Lovelady with 4 IP on current team but 159 pooled) still
+# surface a Status cell. The Status renderer tags ``< 20 IP`` as a
+# small-sample warning so the reader knows the ERA is noisy.
+for r in _pit_rows:
+    d = dict(r)
+    _perf_pit[r['player_name']] = d
+    if r['card_id'] is not None:
+        _perf_pit_by_card[r['card_id']] = d
+# Preserve legacy variable names so downstream callers don't break.
+_latest_snap = {'d': _latest_snap_d} if _latest_snap_d else None
+_latest_psnap = {'d': _latest_psnap_d} if _latest_psnap_d else None
 
 # League-wide averages for the same snapshot — used by _analyze_perf_driver()
 # to decide whether a player's BABIP / rate stats are outliers vs the league.
@@ -815,6 +1096,83 @@ def _perf_meta_batter(war600: float, ops_plus: float | None, pa: int) -> float:
     return ops_w * ops_meta + war_w * war_meta
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _compute_league_meta_offset(active_league_id: str | None) -> tuple[float, float, int, int]:
+    """Compute the per-league meta calibration offset from current DB residuals.
+
+    Returns ``(batting_offset, pitching_offset, n_bat, n_pit)``:
+        * Positive offset = meta UNDER-predicts (cards in this league
+          OUTPERFORM what their meta says — i76's documented +0.33 WAR/600).
+        * Negative offset = meta OVER-predicts (lb124's documented -0.33).
+        * Zero with n=0 = insufficient data, no adjustment applied.
+
+    Why dynamic: the project memory pinned lb124 ~ -33 / i76 ~ +33 from
+    historical analysis, but those numbers drift as calibration weights
+    evolve. Computing live keeps the Outlook label honest without anyone
+    having to remember to update a constant. Cached 10 min so the page
+    doesn't recompute on every interaction.
+
+    The offset is applied to the comparison `gap = perf_meta - card_meta`
+    by replacing card_meta with `card_meta + offset`. So in lb124 (offset
+    around -33), a 686 Posey effectively gates against ~653 — bringing the
+    "Cold real" gap closer to reality and stopping false-cold labels for
+    players who are simply playing in a tougher-than-meta-predicts league.
+    """
+    if not active_league_id:
+        return 0.0, 0.0, 0, 0
+
+    bat_offset = 0.0; n_bat = 0
+    try:
+        bat_residuals = conn.execute("""
+            SELECT bs.pa, bs.war, bs.ops_plus, c.meta_score_batting AS meta
+            FROM batting_stats bs
+            JOIN cards c ON c.card_id = bs.card_id
+            WHERE bs.league_id = ? AND bs.pa >= 200
+              AND c.meta_score_batting IS NOT NULL
+              AND c.position IS NOT NULL AND c.pitcher_role IS NULL
+        """, (active_league_id,)).fetchall()
+        if len(bat_residuals) >= 30:
+            total = 0.0
+            for r in bat_residuals:
+                pa = max(int(r['pa'] or 0), 1)
+                war600 = (float(r['war'] or 0)) * 600.0 / pa
+                perf_meta = _perf_meta_batter(war600, r['ops_plus'], pa)
+                total += (perf_meta - float(r['meta']))
+            n_bat = len(bat_residuals)
+            bat_offset = total / n_bat
+    except Exception:
+        pass
+
+    pit_offset = 0.0; n_pit = 0
+    try:
+        pit_residuals = conn.execute("""
+            SELECT ps.ip, ps.war, ps.era_plus, c.meta_score_pitching AS meta
+            FROM pitching_stats ps
+            JOIN cards c ON c.card_id = ps.card_id
+            WHERE ps.league_id = ? AND ps.ip >= 30
+              AND c.meta_score_pitching IS NOT NULL
+              AND c.pitcher_role IS NOT NULL
+        """, (active_league_id,)).fetchall()
+        if len(pit_residuals) >= 20:
+            total = 0.0
+            for r in pit_residuals:
+                ip = max(float(r['ip'] or 0), 0.1)
+                war200 = (float(r['war'] or 0)) * 200.0 / ip
+                perf_meta = _perf_meta_pitcher(war200, r['era_plus'], ip)
+                total += (perf_meta - float(r['meta']))
+            n_pit = len(pit_residuals)
+            pit_offset = total / n_pit
+    except Exception:
+        pass
+
+    return round(bat_offset, 1), round(pit_offset, 1), n_bat, n_pit
+
+
+_LEAGUE_BAT_OFFSET, _LEAGUE_PIT_OFFSET, _LEAGUE_BAT_N, _LEAGUE_PIT_N = (
+    _compute_league_meta_offset(_active_league_id)
+)
+
+
 def _analyze_perf_driver(player_name: str, current_meta: float, is_pitcher: bool) -> dict | None:
     """Diagnose why a player is over- or under-performing their card meta.
 
@@ -853,14 +1211,19 @@ def _analyze_perf_driver(player_name: str, current_meta: float, is_pitcher: bool
         perf_meta = round(_perf_meta_batter(war_full, ops_plus, pa))
 
     current_meta_int = round(current_meta or 0)
-    gap = perf_meta - current_meta_int
+    # Apply per-league calibration offset to the comparison so a tough league
+    # like lb124 (meta historically over-predicts by ~33) doesn't paint every
+    # average performer as "Cold." Effective meta = card meta + offset.
+    league_offset = _LEAGUE_PIT_OFFSET if is_pitcher else _LEAGUE_BAT_OFFSET
+    effective_meta_int = round(current_meta_int + league_offset)
+    gap = perf_meta - effective_meta_int
 
     # Hybrid threshold: flag as hot/cold only if BOTH absolute and relative
     # thresholds are cleared. An 80-point gap on a 200-meta filler card is
     # meaningful (40%); an 80-point gap on an 800-meta ace is noise (10%).
     # Using OR produced universal "cold" labels because even healthy cards
     # routinely have 50-meta differences against their card score.
-    pct_gap = (abs(gap) / current_meta_int) if current_meta_int > 0 else 0.0
+    pct_gap = (abs(gap) / effective_meta_int) if effective_meta_int > 0 else 0.0
     if abs(gap) < _DRIVER_GAP or pct_gap < _DRIVER_GAP_PCT:
         return {
             'perf_meta': perf_meta, 'gap': gap,
@@ -878,10 +1241,13 @@ def _analyze_perf_driver(player_name: str, current_meta: float, is_pitcher: bool
     # shouldn't tag them cold. Prevents Bellinger/Pierre-style false cold flags
     # on WAR-positive but OPS+-average players.
     if gap < 0:
-        expected_war_rate = max(0.0, (current_meta_int - 400) / 100.0)
+        # Use the league-calibrated effective meta so the WAR expectation
+        # matches what the league actually delivers (lb124 meta is hot — a
+        # 600-meta card here doesn't really expect 2.0 WAR/600).
+        expected_war_rate = max(0.0, (effective_meta_int - 400) / 100.0)
         if is_pitcher:
             # Pitchers: slightly higher expectation per meta point (slope 0.011 vs 0.014)
-            expected_war_rate = max(0.0, (current_meta_int - 400) / 90.0)
+            expected_war_rate = max(0.0, (effective_meta_int - 400) / 90.0)
         # A 10% tolerance around expected — being slightly below shouldn't save
         # them from cold either.
         if war_full >= expected_war_rate * 0.90:
@@ -1524,27 +1890,48 @@ def find_owned_upgrades(pos_value, current_meta, is_pitching, exclude_names=None
     return combined[:limit]
 
 
-def find_market_upgrades(pos_value, current_meta, is_pitching, exclude_ids=None, limit=5):
+def find_market_upgrades(pos_value, current_meta, is_pitching, exclude_ids=None,
+                         limit=5, current_fit=None):
     """Find unowned market cards that upgrade the slot.
 
     Batting uses multi-position eligibility (primary position OR
     pos_rating_{slot} >= threshold) with a small penalty for non-primary
     assignments. Pitching keeps strict role matching.
 
-    Budget note: instead of the hard ``last_10_price <= budget`` filter
-    that silently hid aspirational upgrades, we now split results into
-    two buckets and return both — in-budget cards first (ranked by meta),
+    **Dual-signal gate (Epic A, 2026-04-24):** A candidate qualifies if EITHER
+    its meta_delta clears ``min_improvement`` OR its fit_delta (attribute-mix
+    score from ``card_archetypes``) clears ``MIN_FIT_DELTA``. This promotes
+    bargain mix-aligned cards (e.g. Tom Hughes at 129 PP with fit +25) to the
+    primary Market Upgrade column instead of leaving them stranded in the Mix
+    Analysis expander. When ``current_fit`` is None (empty slot, missing
+    archetype row), the gate falls back to meta-only.
+
+    Candidates are ranked by ``max(meta_delta / min_improvement,
+    fit_delta / MIN_FIT_DELTA)`` — a normalized "upgrade strength" that lets
+    a +25 fit card outrank a +12 meta card. Each returned dict carries
+    ``trigger_signal`` ∈ {'meta', 'fit', 'both'} so the render layer can
+    annotate why the card made the cut.
+
+    Budget note: we split results into two buckets — in-budget cards first,
     then "save up" cards up to 2× budget. The caller tags them via
-    ``aspirational=True`` so the display layer can render a
-    "Save Up" badge rather than pretending they don't exist.
+    ``aspirational=True`` so the display layer can render a "Save Up" badge.
     """
     exclude_ids = exclude_ids or set()
     meta_col = "meta_score_pitching" if is_pitching else "meta_score_batting"
     pos_col = "pitcher_role_name" if is_pitching else "position_name"
     max_price = max_spend if max_spend > 0 else 999999999
-    # Aspirational cap: 2× budget. Catches genuine "save up" targets
-    # without flooding the list with 10× cards the user will never buy.
     aspirational_cap = max_price * 2
+    arch_role = _archetype_role_for(pos_value, is_pitching)
+
+    # Widen the meta floor so fit-triggered candidates aren't pre-filtered.
+    # When fit gating is active we only require meta >= current (no regressions
+    # on meta), and let the dual-signal gate below decide. When fit is
+    # unavailable we keep the original meta+min_improvement floor.
+    if current_fit is not None:
+        meta_floor = current_meta
+    else:
+        meta_floor = current_meta + min_improvement
+    fetch_limit = limit + len(exclude_ids) + 20
 
     if is_pitching:
         # Pitching retains strict role matching.
@@ -1555,8 +1942,7 @@ def find_market_upgrades(pos_value, current_meta, is_pitching, exclude_ids=None,
             WHERE {pos_col} = ? AND owned = 0 AND last_10_price > 0
                 AND last_10_price <= ? AND {meta_col} > ?
             ORDER BY {meta_col} DESC LIMIT ?
-        """, (pos_value, aspirational_cap, current_meta + min_improvement,
-              limit + len(exclude_ids) + 10)).fetchall()
+        """, (pos_value, aspirational_cap, meta_floor, fetch_limit)).fetchall()
         rows = []
         for r in results:
             d = dict(r)
@@ -1578,30 +1964,72 @@ def find_market_upgrades(pos_value, current_meta, is_pitching, exclude_ids=None,
                 AND pitcher_role IS NULL
                 AND last_10_price <= ? AND {meta_col} > ?
             ORDER BY {meta_col} DESC LIMIT ?
-        """, (*where_params, aspirational_cap, current_meta,
-              limit + len(exclude_ids) + 15)).fetchall()
+        """, (*where_params, aspirational_cap, meta_floor, fetch_limit)).fetchall()
 
         rows = []
         for r in results:
             d = dict(r)
             penalty = position_meta_penalty(d, pos_value)
             effective = (d.get('raw_meta') or 0) - penalty
-            if effective <= current_meta + min_improvement:
-                continue
             d['meta_score'] = effective
             d['position_penalty'] = round(penalty, 1)
             d['position_annotation'] = format_position_annotation(d, pos_value)
             d['aspirational'] = (d.get('last_10_price') or 0) > max_price
             rows.append(d)
 
-    filtered = [r for r in rows if r['card_id'] not in exclude_ids]
-    # Rank: in-budget first (by meta), then aspirational (by meta).
-    # This keeps the default list buyable while still surfacing the
-    # "save up" targets below.
-    affordable = [r for r in filtered if not r['aspirational']]
-    aspirational = [r for r in filtered if r['aspirational']]
-    affordable.sort(key=lambda x: -(x['meta_score'] or 0))
-    aspirational.sort(key=lambda x: -(x['meta_score'] or 0))
+    # ── Dual-signal gate + rank ──
+    # min_improvement can be 0 (user slider) — use a floor of 1 when
+    # normalizing so we don't divide by zero.
+    meta_norm = max(int(min_improvement), 1)
+    fit_norm = MIN_FIT_DELTA
+
+    scored = []
+    for d in rows:
+        if d['card_id'] in exclude_ids:
+            continue
+        arch = _archetypes_by_card.get(d['card_id']) or {}
+        # Only trust archetype data when the role matches — a batter's
+        # batting-cluster fit shouldn't count toward a pitching slot and
+        # vice versa.
+        if arch.get('role') != arch_role:
+            arch = {}
+        cand_fit = arch.get('fit_score')
+        meta_delta = (d['meta_score'] or 0) - current_meta
+        fit_delta = None
+        if current_fit is not None and cand_fit is not None:
+            fit_delta = cand_fit - current_fit
+
+        meta_ok = meta_delta >= min_improvement
+        fit_ok = fit_delta is not None and fit_delta >= MIN_FIT_DELTA
+        if not (meta_ok or fit_ok):
+            continue
+
+        if meta_ok and fit_ok:
+            trigger = 'both'
+        elif fit_ok:
+            trigger = 'fit'
+        else:
+            trigger = 'meta'
+
+        rank_score = max(
+            meta_delta / meta_norm,
+            (fit_delta / fit_norm) if fit_delta is not None else 0.0,
+        )
+
+        d['fit_score'] = cand_fit
+        d['fit_delta'] = round(fit_delta, 1) if fit_delta is not None else None
+        d['archetype_name'] = arch.get('archetype_name')
+        d['archetype_war'] = arch.get('archetype_war')
+        d['trigger_signal'] = trigger
+        d['rank_score'] = rank_score
+        scored.append(d)
+
+    # In-budget first (ranked), then aspirational (ranked). Keeps the
+    # default list buyable while still surfacing "save up" targets below.
+    affordable = [r for r in scored if not r['aspirational']]
+    aspirational = [r for r in scored if r['aspirational']]
+    affordable.sort(key=lambda x: -x['rank_score'])
+    aspirational.sort(key=lambda x: -x['rank_score'])
     return (affordable + aspirational)[:limit]
 
 
@@ -1700,20 +2128,161 @@ for _pos_key, _players in active_by_pos.items():
         _all_active_names.add(_p['player_name'])
 
 
+# Build a card-id → position-eligibility map for the displacement-cost helper.
+# Pulls all batting cards' pos_rating_* in one shot so the per-rec lookups
+# don't hit the DB. Cards with no rating data fall back to "primary only."
+_card_eligibility_cache: dict[int, dict] = {}
+try:
+    for _r in conn.execute("""
+        SELECT card_id, position_name,
+               pos_rating_c, pos_rating_1b, pos_rating_2b, pos_rating_3b,
+               pos_rating_ss, pos_rating_lf, pos_rating_cf, pos_rating_rf
+        FROM cards
+        WHERE position_name IS NOT NULL AND pitcher_role IS NULL
+    """).fetchall():
+        _card_eligibility_cache[_r['card_id']] = dict(_r)
+except Exception:
+    pass
+
+
+def _displacement_cost(displaced_card_id: int | None, displaced_meta: float,
+                       freed_slot: str) -> tuple[float, str]:
+    """Compute the team-meta cost of displacing a starter from `freed_slot`.
+
+    Returns ``(cost, landing_label)`` where:
+      * cost = 0 — displaced player has eligibility at an OPEN slot (no
+        current starter) and slots in clean
+      * cost = meta_of_weakest_active_at_eligible_slot — displaced player
+        bumps a weaker active starter, who in turn goes to bench (we lose
+        the weaker starter's contribution)
+      * cost = displaced_meta — no fit at any other slot, displaced player
+        sits on the bench and we lose his contribution entirely
+
+    `landing_label` is a short human string for the UI tooltip:
+      "fills CF (open)", "displaces Pierre at CF", "no fit — sits on bench".
+
+    Pitching slots are not modeled (returns 0/empty) — pitchers don't share
+    eligibility across roles in the way batters do.
+
+    Why this exists: prior to 2026-04-24, recommendations evaluated each
+    slot in isolation. A "+68 upgrade at DH" could in fact lose -500 net
+    team meta if the displaced DH was a Gold CF-only card with nowhere
+    else to go. Cameron caught this looking at Rodriguez (CF-only,
+    ~Meta 569) being recommended out of the DH slot for a 1B.
+    """
+    if not displaced_card_id or freed_slot in ('SP', 'RP', 'CL'):
+        return 0.0, ''
+    card = _card_eligibility_cache.get(displaced_card_id)
+    if not card:
+        return 0.0, ''
+
+    # Eligible positions for the displaced card. Mirror of position_eligibility
+    # but inlined to avoid a fresh import + DB hit per rec.
+    primary = (card.get('position_name') or '').upper()
+    pos_to_col = {
+        'C': 'pos_rating_c', '1B': 'pos_rating_1b', '2B': 'pos_rating_2b',
+        '3B': 'pos_rating_3b', 'SS': 'pos_rating_ss',
+        'LF': 'pos_rating_lf', 'CF': 'pos_rating_cf', 'RF': 'pos_rating_rf',
+    }
+    eligible = set()
+    if primary in pos_to_col:
+        eligible.add(primary)
+    # DH is universal for non-pitchers
+    eligible.add('DH')
+    for pos, col in pos_to_col.items():
+        rating = card.get(col) or 0
+        if rating >= 30:
+            eligible.add(pos)
+    eligible.discard(freed_slot)
+    if not eligible:
+        return float(displaced_meta or 0), 'no fit — sits on bench'
+
+    # Active lineup: which slots have a starter? (DH always counted as occupied
+    # if there's a current starter; LF/CF/RF treated independently.)
+    occupied_starters: dict[str, dict] = {}
+    for sp_pos, sp_card in starters.items():
+        if sp_pos in ('SP', 'RP', 'CL', 'P'):
+            continue
+        if sp_pos == freed_slot:
+            continue  # we just freed this slot, don't count it
+        occupied_starters[sp_pos] = sp_card
+
+    open_slots = [s for s in eligible if s not in occupied_starters]
+    if open_slots:
+        # Pick the most-eligible open slot (by pos_rating value) for label
+        landing = max(open_slots,
+                      key=lambda s: card.get(pos_to_col.get(s), 0) or 0)
+        return 0.0, f'fills {landing} (open)'
+
+    # All eligible slots occupied. Find the weakest starter we could bump.
+    bumpable = [(s, occupied_starters[s]) for s in eligible
+                if s in occupied_starters]
+    if not bumpable:
+        return float(displaced_meta or 0), 'no fit — sits on bench'
+    weakest_slot, weakest_card = min(
+        bumpable, key=lambda sc: sc[1].get('meta_score') or 0
+    )
+    weakest_meta = float(weakest_card.get('meta_score') or 0)
+
+    # If the displaced player isn't actually better than the weakest current
+    # at his eligible slots, displaced player sits — full cost.
+    if displaced_meta <= weakest_meta:
+        return float(displaced_meta or 0), 'no fit (worse than every alternative)'
+
+    # Cascade: displaced bumps weakest. Weakest goes to bench (1-step model;
+    # we don't recurse further — keeps UI snappy and good enough for the
+    # vast majority of cases).
+    #
+    # Cost math (the math bug fixed 2026-04-24): the team meta change at
+    # the chain-end slot Y is `displaced.meta - weakest.meta` (positive =
+    # net gain because we put a stronger player there). Our convention has
+    # cost = team meta LOST from the swap, so cost = `weakest - displaced`
+    # (negative when the chain adds team meta beyond the gross).
+    #
+    # Example: Frisch (590) at 2B replaced by Johnson (gross +72). Frisch
+    # bumps Rodriguez (569) at DH. Rodriguez → bench. Team change:
+    #   (Johnson - Frisch) + (Frisch - Rodriguez) = 72 + 21 = +93
+    # Old buggy cost = Rodriguez.meta = 569 → net = 72 - 569 = -497 (wrong)
+    # New cost = Rodriguez.meta - Frisch.meta = -21 → net = 72 - (-21) = +93 ✓
+    weakest_name = weakest_card.get('player_name') or '?'
+    return (weakest_meta - displaced_meta,
+            f'bumps {weakest_name} ({weakest_meta:.0f}) to bench via {weakest_slot}')
+
+
 def _build_slot(pos_label, current_name, current_ovr, current_meta, owned_ups, market_ups,
                 bats_hand='?', current_card_id=None):
     """Build one upgrade-plan entry with both owned and market stored separately."""
     bo = owned_ups[0] if owned_ups else None
     bm = market_ups[0] if market_ups else None
 
-    # Owned upgrade: delta vs current
+    # Owned upgrade: gross delta vs current
     owned_meta = round(bo['meta_score']) if bo else None
-    owned_delta = round(bo['meta_score'] - current_meta) if bo else 0
+    owned_gross_delta = round(bo['meta_score'] - current_meta) if bo else 0
 
-    # Market upgrade: delta vs the owned upgrade if one exists, else vs current
+    # Market upgrade: gross delta vs the owned upgrade if one exists, else vs current
     baseline_for_market = bo['meta_score'] if bo else current_meta
     market_meta = round(bm['meta_score']) if bm else None
-    market_delta = round(bm['meta_score'] - baseline_for_market) if bm else 0
+    market_gross_delta = round(bm['meta_score'] - baseline_for_market) if bm else 0
+
+    # Displacement cost — what does the team lose when the current player is
+    # bumped? CF-only Rodriguez bumped from DH has nowhere to go but bench
+    # (cost = his full meta). A flexible player like a 1B/3B utility moves
+    # cleanly to an open spot (cost = 0). The cost applies ONCE per slot
+    # being freed: the owned promotion pays it; the market upgrade
+    # incremental-over-owned does NOT pay it again.
+    displ_cost, displ_label = _displacement_cost(
+        current_card_id, float(current_meta or 0), pos_label
+    )
+
+    # Net deltas:
+    #   * owned_delta  = (owned vs current) minus displacement
+    #   * market_delta = if owned exists: (market vs owned), no further displ
+    #                    else:           (market vs current) minus displ
+    owned_delta = owned_gross_delta - round(displ_cost) if bo else 0
+    if bm:
+        market_delta = market_gross_delta if bo else (market_gross_delta - round(displ_cost))
+    else:
+        market_delta = 0
 
     # Track used IDs to prevent duplicates
     if bo:
@@ -1733,8 +2302,16 @@ def _build_slot(pos_label, current_name, current_ovr, current_meta, owned_ups, m
     cur_fit = cur_arch.get('fit_score')
     owned_fit_delta = (owned_arch.get('fit_score') - cur_fit) \
         if (owned_arch.get('fit_score') is not None and cur_fit is not None) else None
-    market_fit_delta = (market_arch.get('fit_score') - cur_fit) \
-        if (market_arch.get('fit_score') is not None and cur_fit is not None) else None
+    # Prefer the role-validated fit_delta from find_market_upgrades (which
+    # zeroes out role-mismatched archetype rows — batting fit vs SP slot);
+    # fall back to the cross-role lookup for older callers that don't thread
+    # current_fit yet.
+    if bm and 'fit_delta' in bm:
+        market_fit_delta = bm.get('fit_delta')
+    else:
+        market_fit_delta = (market_arch.get('fit_score') - cur_fit) \
+            if (market_arch.get('fit_score') is not None and cur_fit is not None) else None
+    market_trigger = bm.get('trigger_signal') if bm else None
 
     return {
         'pos': pos_label,
@@ -1767,14 +2344,20 @@ def _build_slot(pos_label, current_name, current_ovr, current_meta, owned_ups, m
         'market_fit': market_arch.get('fit_score'),
         'market_fit_delta': market_fit_delta,
         'market_archetype': market_arch.get('archetype_name'),
+        'market_trigger': market_trigger,
+        # Displacement (2026-04-24): where the current player lands when
+        # bumped + how much team meta is lost. UI surfaces this in the
+        # tooltip + as a warning badge when cost is large.
+        'displacement_cost': round(displ_cost),
+        'displacement_label': displ_label,
+        'owned_gross_delta': owned_gross_delta,
+        'market_gross_delta': market_gross_delta,
         # For detail expanders
         '_owned_upgrades': owned_ups,
         '_market_upgrades': market_ups,
-        # Best overall delta (for sorting priorities)
-        'best_delta': max(
-            round(bo['meta_score'] - current_meta) if bo else 0,
-            round(bm['meta_score'] - current_meta) if bm else 0,
-        ),
+        # Best overall delta — now uses NET deltas (displacement-aware) so a
+        # +68 gross / -500 net "upgrade" no longer looks like a top priority.
+        'best_delta': max(owned_delta, market_delta),
     }
 
 
@@ -1792,7 +2375,8 @@ for pos in show_positions:
             sp = sp_players[i]
             m = sp['meta_score'] or 0
             ow = find_owned_upgrades('SP', m, True, list(used_names), 3, current_player_name=sp['player_name'])
-            mk = find_market_upgrades('SP', m, True, used_market_ids, 3)
+            _cf = _fit_for(sp.get('card_id')).get('fit_score')
+            mk = find_market_upgrades('SP', m, True, used_market_ids, 3, current_fit=_cf)
             entry = _build_slot(f"SP{i+1}", sp['player_name'], sp['ovr'], m, ow, mk,
                                 current_card_id=sp.get('card_id'))
             if entry['owned_name']:
@@ -1818,7 +2402,8 @@ for pos in show_positions:
             rp = rp_players[i]
             m = rp['meta_score'] or 0
             ow = find_owned_upgrades('RP', m, True, list(used_names), 3, current_player_name=rp['player_name'])
-            mk = find_market_upgrades('RP', m, True, used_market_ids, 3)
+            _cf = _fit_for(rp.get('card_id')).get('fit_score')
+            mk = find_market_upgrades('RP', m, True, used_market_ids, 3, current_fit=_cf)
             label = slot_names[i] if i < len(slot_names) else f"RP{i+1}"
             entry = _build_slot(label, rp['player_name'], rp['ovr'], m, ow, mk,
                                 current_card_id=rp.get('card_id'))
@@ -1889,7 +2474,8 @@ for pos in show_positions:
             active_names = list(_all_active_names) + list(used_owned_titles)
             # DH upgrades search ALL batting positions — anyone can DH
             ow = find_owned_upgrades('DH', m, False, active_names, 3, current_player_name=player['player_name'])
-            mk = find_market_upgrades('DH', m, False, used_market_ids, 3)
+            _cf = _fit_for(player.get('card_id')).get('fit_score')
+            mk = find_market_upgrades('DH', m, False, used_market_ids, 3, current_fit=_cf)
             entry = _build_slot('DH', player['player_name'], player['ovr'], m, ow, mk, bats_hand=bh,
                                 current_card_id=player.get('card_id'))
             entry['is_platoon'] = False
@@ -1952,7 +2538,8 @@ for pos in show_positions:
     # substring exclusions.
     active_names = list(_all_active_names) + [p['player_name'] for p in active_players] + list(used_owned_titles)
     ow = find_owned_upgrades(pos, m, is_pitching, active_names, 3, current_player_name=player['player_name'])
-    mk = find_market_upgrades(pos, m, is_pitching, used_market_ids, 3)
+    _cf = _fit_for(player.get('card_id')).get('fit_score')
+    mk = find_market_upgrades(pos, m, is_pitching, used_market_ids, 3, current_fit=_cf)
     entry = _build_slot(pos, player['player_name'], player['ovr'], m, ow, mk, bats_hand=bh,
                         current_card_id=player.get('card_id'))
     entry['is_platoon'] = False
@@ -2480,7 +3067,7 @@ def _render_managers_eye(slot, ua):
                         "Value": s.get("value", 3),
                         "Reason": s.get("reason", ""),
                     } for s in _sliders]
-                    st.dataframe(pd.DataFrame(_slider_rows), use_container_width=True,
+                    st.dataframe(pd.DataFrame(_slider_rows), width='stretch',
                                  hide_index=True,
                                  column_config={
                                      "Category": st.column_config.TextColumn(width="small"),
@@ -2883,21 +3470,41 @@ def build_chain_rows(positions_list, show_bats=False, show_perf=False,
             partner = ai_pick.get('platoon_partner', '')
             owned_action = (f"{emoji} \U0001f91d {card}"
                             + (f" + {short_name(partner, 15)}" if partner else ""))
+        # Displacement context (2026-04-24) — owned_delta is NET (gross
+        # minus what we lose when the current player is bumped). When the
+        # current player has nowhere else to play (CF-only Rodriguez bumped
+        # from DH), the displacement cost equals his full meta and the rec
+        # is suppressed below as "Optimal" rather than misleadingly shown as
+        # "+68" when it actually loses 500+ team meta.
         elif u['owned_name']:
             _d = u.get('owned_delta') or 0
-            # Surface the position annotation (e.g. "as LF") when the
-            # owned upgrade is assigned to a non-primary slot, so the user
-            # immediately knows why a CF card is listed under LF/RF.
+            _displ_cost = u.get('displacement_cost') or 0
+            _displ_label = u.get('displacement_label') or ''
+            _is_bench_dump = ('sits on bench' in _displ_label
+                              or 'no fit' in _displ_label)
+            # Surface position annotation (e.g. "as LF") when the owned
+            # upgrade is assigned to a non-primary slot.
             _first_owned = (u.get('_owned_upgrades') or [None])[0] or {}
             _pos_note = _first_owned.get('position_annotation') or ''
-            # Compact the annotation into "[as LF r32]" form for the table.
             _note_badge = ''
             if _pos_note:
-                # position_annotation returns e.g. " (played as LF, rating 32)"
-                # Convert to "[LF r32]" for space.
                 _inner = _pos_note.strip(' ()').replace('played as ', '').replace(', rating ', ' r')
                 _note_badge = f" [{_inner}]"
-            owned_action = f"\U0001f4e6 +{_d} · {short_name(u['owned_name'], 25)}{_note_badge}"
+            # Displacement suffix — surface trade-off inline.
+            _displ_suffix = ''
+            if _is_bench_dump and _displ_cost >= 100:
+                _displ_suffix = f" \u26a0 -{_displ_cost} bench"
+            elif _displ_cost > 0:
+                _displ_suffix = f" \u21bb -{_displ_cost}"
+            # Suppress when the swap is a net team loss — a "+68 gross /
+            # -500 net" rec is worse than leaving the lineup as-is.
+            if _d <= 0:
+                owned_action = "\u2705 Optimal" + _optimal_suffix
+            else:
+                _sign = '+' if _d >= 0 else ''
+                owned_action = (f"\U0001f4e6 {_sign}{_d} · "
+                                f"{short_name(u['owned_name'], 25)}"
+                                f"{_note_badge}{_displ_suffix}")
         else:
             owned_action = "\u2705 Optimal" + _optimal_suffix
 
@@ -2924,21 +3531,68 @@ def build_chain_rows(positions_list, show_bats=False, show_perf=False,
         elif u['market_name']:
             # Show if market option is meaningfully better than the best
             # owned option (or better than current when no owned upgrade).
+            # Dual-signal gate (Epic A): promote either meta-triggered OR
+            # fit-triggered upgrades. A bargain card whose attribute-mix
+            # says it outperforms the current holder surfaces here even
+            # when meta_delta is below min_improvement.
             _market_better = True
+            # Displacement guard (2026-04-24) — suppress whenever the net
+            # team-meta change is non-positive after accounting for what the
+            # displaced player loses. Catches both bench-dump cases (CF-only
+            # Rodriguez bumped from DH) and chain bumps (Pierre displacing
+            # Rodriguez to fill an open Pierre-CF slot, where Rodriguez goes
+            # to bench). A "+68 gross / -446 net" rec is actively bad advice.
+            _displ_label_m = u.get('displacement_label') or ''
+            _displ_cost_m = u.get('displacement_cost') or 0
+            _is_bench_dump_m = ('sits on bench' in _displ_label_m
+                                or 'no fit' in _displ_label_m)
+            _market_total_pre = (_market_d + (u.get('owned_delta') or 0)
+                                 if u.get('owned_name') else _market_d)
+            if _market_total_pre <= 0:
+                _market_better = False
+            _fit_d = u.get('market_fit_delta') or 0
+            _trigger = u.get('market_trigger')
             if u.get('owned_name'):
-                # Only show market if it beats owned by ≥ the configured
-                # min-meta-improvement threshold (from config.yaml's
-                # recommendations block, default 10).
                 try:
                     _min_delta = int((config.get('recommendations') or {}).get('min_meta_improvement', 10))
                 except (ValueError, TypeError, AttributeError):
                     _min_delta = 10
-                _market_better = _market_d >= _min_delta
+                _market_better = (_market_better and
+                                  (_market_d >= _min_delta
+                                   or _fit_d >= MIN_FIT_DELTA))
+            # ── Hot-player suppression (P2 #7) ──
+            # When the current starter is running hot (perf_meta > card_meta),
+            # a small market upgrade is probably noise — the hot player is
+            # outperforming their rating, so a +20 meta swap loses the
+            # overperformance. Suppress unless the upgrade is substantial
+            # (meta Δ ≥ 80 OR fit Δ ≥ MIN_FIT_DELTA OR the upgrade exceeds
+            # half the hot gap). Scales with how hot the player is — a player
+            # +236 over meta needs a bigger upgrade to justify swapping than
+            # a player only +20 over.
+            if _market_better and _pa and _pa.get('direction') == 'hot':
+                _hot_gap = max(_pa.get('gap') or 0, 0)
+                _hot_floor = max(80, int(_hot_gap * 0.5))
+                if _market_d < _hot_floor and _fit_d < MIN_FIT_DELTA:
+                    _market_better = False
+                    # Upgrade the "riding hot" suffix so the user sees we
+                    # deliberately held off on a buy rather than missed one.
+                    _optimal_suffix = (" · \U0001f525 riding hot "
+                                       f"(+{_hot_gap}, held)")
             if _market_better:
                 p = u['market_price'] or 0
                 cost = f"{p:,}" if p else "?"
-                delta_str = f"+{_market_total} · " if _market_total else ""
-                market_action = f"\U0001f6d2 {delta_str}{short_name(u['market_name'], 25)} · {cost}PP"
+                # Annotate the triggering signal so the user sees WHY a card
+                # made the cut. Fit-only triggers show "+NN fit" to flag that
+                # raw meta didn't move but the attribute-mix did.
+                if _trigger == 'fit':
+                    delta_str = f"+{int(_fit_d)} fit \u00b7 "
+                elif _trigger == 'both' and _fit_d >= MIN_FIT_DELTA:
+                    delta_str = f"+{_market_total} \u00b7 +{int(_fit_d)} fit \u00b7 "
+                elif _market_total:
+                    delta_str = f"+{_market_total} \u00b7 "
+                else:
+                    delta_str = ""
+                market_action = f"\U0001f6d2 {delta_str}{short_name(u['market_name'], 25)} \u00b7 {cost}PP"
             else:
                 market_action = "\u2705 Optimal" + _optimal_suffix
         else:
@@ -3232,7 +3886,7 @@ def _render_perf_outlook_expander(plan_entries, title, empty_hint):
         )
         st.dataframe(
             pd.DataFrame(rows),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             column_config={
                 "Pos": st.column_config.TextColumn(width="small"),
@@ -3436,7 +4090,7 @@ def _render_roster_moves_expander(plan_entries, title, empty_hint):
         )
         st.dataframe(
             pd.DataFrame(rows),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             column_config={
                 "Slot": st.column_config.TextColumn(width="small"),
@@ -3457,6 +4111,229 @@ def _render_roster_moves_expander(plan_entries, title, empty_hint):
         )
 
 
+# ── HOT/COLD TONIGHT PANEL — last-7-day form on user's active roster ──
+# Recent form already affects meta via the recent-form overlay (2026-04-24),
+# but that overlay is sample-weighted and capped ±15. A 30-PA hot streak nudges
+# meta but doesn't shout — and a manager picking tonight's lineup wants the
+# shout. This panel surfaces the top hot bats and cold arms over the last 7
+# days so the streak is visible at a glance without having to scan the chain
+# tables row-by-row.
+@st.cache_data(ttl=300, show_spinner=False)
+def _compute_hot_cold_panel(active_league_id: str | None, user_team: str | None,
+                            window_days: int = 10) -> dict:
+    """Pull last-N-day per-card stats for the user's active roster.
+
+    Returns dict with 'hot_bats', 'cold_bats', 'hot_arms', 'cold_arms', each
+    a list of {name, card_id, sample, recent_metric, season_metric, delta}.
+    """
+    if not active_league_id or not user_team:
+        return {'hot_bats': [], 'cold_bats': [], 'hot_arms': [], 'cold_arms': [],
+                'window_label': '', 'cutoff': None}
+
+    last_g = conn.execute(
+        "SELECT MAX(game_date) FROM games WHERE league_id = ?",
+        (active_league_id,),
+    ).fetchone()
+    if not last_g or not last_g[0]:
+        return {'hot_bats': [], 'cold_bats': [], 'hot_arms': [], 'cold_arms': [],
+                'window_label': '', 'cutoff': None}
+    from datetime import datetime, timedelta
+    last_dt = datetime.strptime(last_g[0], '%Y-%m-%d')
+    cutoff = (last_dt - timedelta(days=window_days)).strftime('%Y-%m-%d')
+
+    # Active-roster card_ids for the user's team. Reuse league_rosters since
+    # it's the only stable card_id <-> team mapping we have at the moment.
+    card_ids = [r[0] for r in conn.execute(
+        """
+        SELECT DISTINCT card_id FROM league_rosters
+        WHERE team_name = ? AND league_id = ? AND card_id IS NOT NULL
+          AND snapshot_date >= datetime('now', '-7 days')
+        """,
+        (user_team, active_league_id),
+    ).fetchall()]
+    if not card_ids:
+        return {'hot_bats': [], 'cold_bats': [], 'hot_arms': [], 'cold_arms': [],
+                'window_label': f'last {window_days} days', 'cutoff': cutoff}
+    placeholders = ','.join('?' * len(card_ids))
+
+    # Batting recent vs season — compare recent OPS-proxy to season OPS+.
+    bat_recent = conn.execute(f"""
+        SELECT gb.card_id,
+               SUM(COALESCE(gb.ab,0)) AS ab,
+               SUM(COALESCE(gb.h,0))  AS h,
+               SUM(COALESCE(gb.bb,0)) AS bb,
+               SUM(COALESCE(gb.k,0))  AS k,
+               COUNT(*) AS games
+        FROM game_batting gb
+        JOIN games g ON g.game_id = gb.game_id
+        WHERE gb.card_id IN ({placeholders})
+          AND g.league_id = ?
+          AND g.game_date >= ?
+        GROUP BY gb.card_id
+        HAVING SUM(gb.ab) >= 10
+    """, (*card_ids, active_league_id, cutoff)).fetchall()
+
+    bats = []
+    for r in bat_recent:
+        cid, ab, h, bb, k, games = r
+        ab = ab or 0; h = h or 0; bb = bb or 0
+        if ab <= 0:
+            continue
+        rec_obp = (h + bb) / (ab + bb) if (ab + bb) > 0 else 0
+        rec_avg = h / ab
+        # Season comparison: PA-weighted season OBP for this card_id.
+        season = conn.execute("""
+            SELECT SUM(COALESCE(obp*pa,0))*1.0/NULLIF(SUM(pa),0)
+            FROM batting_stats WHERE card_id = ? AND obp IS NOT NULL AND pa > 0
+        """, (cid,)).fetchone()
+        season_obp = (season[0] or 0) if season else 0
+        if season_obp <= 0:
+            continue
+        meta = conn.execute(
+            "SELECT card_title, meta_score_batting FROM cards WHERE card_id = ?",
+            (cid,),
+        ).fetchone()
+        if not meta:
+            continue
+        title, mscore = meta
+        # Display-friendly short name from title (drop card-set prefix).
+        short = (title or '').strip().split('  ', 1)[-1].split('  ')[0] if title else ''
+        bats.append({
+            'card_id': cid,
+            'name': short or '?',
+            'sample': f"{games}G · {ab}AB",
+            'recent_avg': rec_avg,
+            'recent_obp': rec_obp,
+            'season_obp': season_obp,
+            'delta_obp': rec_obp - season_obp,
+            'meta': mscore,
+        })
+
+    bats.sort(key=lambda b: b['delta_obp'], reverse=True)
+    hot_bats = [b for b in bats if b['delta_obp'] >= 0.040][:5]
+    cold_bats = [b for b in bats if b['delta_obp'] <= -0.040][-5:]
+    cold_bats.reverse()  # show worst first
+
+    # Pitching recent vs season — compare recent ERA to season ERA.
+    pit_recent = conn.execute(f"""
+        SELECT gp.card_id,
+               SUM(COALESCE(gp.ip,0))           AS ip_raw,
+               SUM(COALESCE(gp.er,0))           AS er,
+               SUM(COALESCE(gp.k,0))            AS k,
+               SUM(COALESCE(gp.bb,0))           AS bb,
+               COUNT(*)                         AS apps
+        FROM game_pitching gp
+        JOIN games g ON g.game_id = gp.game_id
+        WHERE gp.card_id IN ({placeholders})
+          AND g.league_id = ?
+          AND g.game_date >= ?
+        GROUP BY gp.card_id
+        HAVING SUM(gp.ip) >= 3
+    """, (*card_ids, active_league_id, cutoff)).fetchall()
+
+    arms = []
+    for r in pit_recent:
+        cid, raw_ip, er, k, bb, apps = r
+        raw_ip = float(raw_ip or 0)
+        # OOTP IP fractional .1/.2 -> thirds
+        whole = int(raw_ip); frac = round((raw_ip - whole) * 10)
+        if frac > 2:
+            frac = 0; whole += 1
+        true_ip = whole + frac / 3.0
+        if true_ip <= 0:
+            continue
+        rec_era = (er or 0) * 9.0 / true_ip
+        season = conn.execute("""
+            SELECT SUM(COALESCE(era*ip,0))*1.0/NULLIF(SUM(ip),0)
+            FROM pitching_stats WHERE card_id = ? AND era IS NOT NULL AND ip > 0
+        """, (cid,)).fetchone()
+        season_era = (season[0] or 0) if season else 0
+        if season_era <= 0:
+            continue
+        meta = conn.execute(
+            "SELECT card_title, meta_score_pitching FROM cards WHERE card_id = ?",
+            (cid,),
+        ).fetchone()
+        if not meta:
+            continue
+        title, mscore = meta
+        short = (title or '').strip().split('  ', 1)[-1].split('  ')[0] if title else ''
+        arms.append({
+            'card_id': cid,
+            'name': short or '?',
+            'sample': f"{apps}G · {true_ip:.1f}IP",
+            'recent_era': rec_era,
+            'season_era': season_era,
+            'delta_era': rec_era - season_era,
+            'meta': mscore,
+        })
+
+    arms.sort(key=lambda a: a['delta_era'])
+    hot_arms = [a for a in arms if a['delta_era'] <= -0.50][:5]
+    cold_arms = [a for a in arms if a['delta_era'] >= 1.00][-5:]
+    cold_arms.reverse()
+
+    return {
+        'hot_bats': hot_bats, 'cold_bats': cold_bats,
+        'hot_arms': hot_arms, 'cold_arms': cold_arms,
+        'window_label': f'last {window_days} days',
+        'cutoff': cutoff,
+    }
+
+
+_hc = _compute_hot_cold_panel(_active_league_id, _cfg_team_name)
+if any([_hc['hot_bats'], _hc['cold_bats'], _hc['hot_arms'], _hc['cold_arms']]):
+    with st.expander(
+        f"🔥 Tonight's Hot/Cold ({_hc['window_label']}, since {_hc['cutoff']})",
+        expanded=True,
+    ):
+        col1, col2 = st.columns(2)
+        with col1:
+            if _hc['hot_bats']:
+                st.markdown("**🔥 Hot bats**")
+                for b in _hc['hot_bats']:
+                    st.markdown(
+                        f"- **{b['name']}** · {b['sample']} · "
+                        f"recent OBP **{b['recent_obp']:.3f}** vs season "
+                        f"{b['season_obp']:.3f} (Δ +{b['delta_obp']:.3f})"
+                    )
+            if _hc['cold_bats']:
+                st.markdown("**❄ Cold bats**")
+                for b in _hc['cold_bats']:
+                    st.markdown(
+                        f"- **{b['name']}** · {b['sample']} · "
+                        f"recent OBP {b['recent_obp']:.3f} vs season "
+                        f"{b['season_obp']:.3f} (Δ {b['delta_obp']:+.3f})"
+                    )
+            if not _hc['hot_bats'] and not _hc['cold_bats']:
+                st.caption("No batting form signals (need 10+ recent ABs to flag).")
+        with col2:
+            if _hc['hot_arms']:
+                st.markdown("**🔥 Hot arms**")
+                for a in _hc['hot_arms']:
+                    st.markdown(
+                        f"- **{a['name']}** · {a['sample']} · "
+                        f"recent ERA **{a['recent_era']:.2f}** vs season "
+                        f"{a['season_era']:.2f} (Δ {a['delta_era']:+.2f})"
+                    )
+            if _hc['cold_arms']:
+                st.markdown("**❄ Cold arms**")
+                for a in _hc['cold_arms']:
+                    st.markdown(
+                        f"- **{a['name']}** · {a['sample']} · "
+                        f"recent ERA {a['recent_era']:.2f} vs season "
+                        f"{a['season_era']:.2f} (Δ +{a['delta_era']:.2f})"
+                    )
+            if not _hc['hot_arms'] and not _hc['cold_arms']:
+                st.caption("No pitching form signals (need 3+ recent IP to flag).")
+        st.caption(
+            "Last 7 days of game_batting / game_pitching for your active "
+            "roster. Recent OBP / ERA computed from per-game logs; season "
+            "baselines from batting_stats / pitching_stats. The recent-form "
+            "meta overlay also moves cards by ±15 based on these signals."
+        )
+
+
 # ── TABBED LAYOUT — batting + pitching only; AI picks are threaded inline ──
 tab_bat, tab_pit = st.tabs(["⚾ Batting Lineup", "🎯 Pitching Staff"])
 
@@ -3467,9 +4344,23 @@ with tab_bat:
     # is useful — the chip turns that implicit claim into a visible input.
     st.markdown(
         f'<div style="margin-bottom: 6px;">Meta ordering reliability: '
-        f'{_meta_confidence_chip("batting")}</div>',
+        f'{_meta_confidence_chip("batting")}'
+        f'{_team_confidence_chip("batting")}</div>',
         unsafe_allow_html=True,
     )
+    # League-level calibration disclosure — meta is league-agnostic, but
+    # league environments differ. Showing the live computed offset stops the
+    # Outlook column from surprising users when nearly all their cards
+    # appear "Cold real" simply because lb124 plays harder than meta predicts.
+    if _LEAGUE_BAT_N >= 30 and abs(_LEAGUE_BAT_OFFSET) >= 5:
+        sign = "hot (over-predicts)" if _LEAGUE_BAT_OFFSET < 0 else "cool (under-predicts)"
+        st.caption(
+            f"⚖️ League calibration ({_active_league_id or '—'}): meta runs "
+            f"**{sign}** by {abs(_LEAGUE_BAT_OFFSET):.0f} pts on average "
+            f"(n={_LEAGUE_BAT_N}). Outlook labels here use the league-adjusted "
+            f"effective meta — a 700-meta card is judged against ~"
+            f"{700 + _LEAGUE_BAT_OFFSET:.0f}."
+        )
     bat_rows = build_chain_rows(bat_positions, show_bats=True, show_perf=True)
     # Batting lineup keeps its natural position order (C, 1B, 2B, ...) but
     # gets a Priority rank column so the weakest slot is easy to spot.
@@ -3741,7 +4632,7 @@ with tab_bat:
                 "Upgrade": action if action else "\u2705 Best available",
             })
 
-        st.dataframe(pd.DataFrame(bench_rows), use_container_width=True, hide_index=True,
+        st.dataframe(pd.DataFrame(bench_rows), width='stretch', hide_index=True,
                      column_config={
                          "Pos": st.column_config.TextColumn(width="small"),
                          "Player": st.column_config.TextColumn(width="medium"),
@@ -3792,7 +4683,7 @@ with tab_bat:
                     "Value": _p['card_value'] or 0,
                 })
             if _pool_display:
-                st.dataframe(pd.DataFrame(_pool_display[:25]), use_container_width=True, hide_index=True,
+                st.dataframe(pd.DataFrame(_pool_display[:25]), width='stretch', hide_index=True,
                              column_config={
                                  "Player": st.column_config.TextColumn(width="medium"),
                                  "Pos": st.column_config.TextColumn(width="small"),
@@ -3844,12 +4735,23 @@ with tab_pit:
     st.markdown(
         f'<div style="margin-bottom: 6px;">Meta ordering reliability: '
         f'{_meta_confidence_chip("pos:SP", "SP")}'
-        f'{_meta_confidence_chip("pos:RP", "RP")}</div>',
+        f'{_meta_confidence_chip("pos:RP", "RP")}'
+        f'{_team_confidence_chip("pitching", "SP", "SP")}'
+        f'{_team_confidence_chip("pitching", "RP", "RP")}</div>',
         unsafe_allow_html=True,
     )
     # One-line caption covering both "weakest-slot only" market-buy logic
     # and the bullpen-weakest-first sort. (Previously two captions said
     # overlapping things.)
+    # League calibration disclosure for pitching - see batting tab for rationale.
+    if _LEAGUE_PIT_N >= 20 and abs(_LEAGUE_PIT_OFFSET) >= 5:
+        sign = "hot (over-predicts)" if _LEAGUE_PIT_OFFSET < 0 else "cool (under-predicts)"
+        st.caption(
+            f"⚖️ League calibration ({_active_league_id or '-'}): "
+            f"pitching meta runs **{sign}** by {abs(_LEAGUE_PIT_OFFSET):.0f} pts "
+            f"on average (n={_LEAGUE_PIT_N}). Outlook labels here use the "
+            f"league-adjusted effective meta."
+        )
     st.caption(
         "SP1\u2192SP5 in depth-chart order · bullpen sorted by priority "
         "(weakest first). Market-buys surface on the weakest SP, weakest "
@@ -4128,7 +5030,7 @@ try:
         if _rows:
             st.dataframe(
                 pd.DataFrame(_rows),
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
                 height=min(35 * len(_rows) + 40, 450),
                 column_config={
@@ -4375,7 +5277,7 @@ if market_buys:
                 "Eff": round(eff, 3),
                 "AI": ai_note,
             })
-        st.dataframe(pd.DataFrame(mkt_rows), use_container_width=True, hide_index=True,
+        st.dataframe(pd.DataFrame(mkt_rows), width='stretch', hide_index=True,
                      column_config={
                          "Cost": st.column_config.NumberColumn(format="%d PP"),
                          "Eff": st.column_config.NumberColumn(format="%.2f meta/PP", help="Total meta gained per PP spent"),
@@ -4422,7 +5324,7 @@ with st.expander("Alternative Upgrade Options (per position)"):
                 "Source": source,
             })
         if alt_rows:
-            st.dataframe(pd.DataFrame(alt_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(alt_rows), width='stretch', hide_index=True)
 
 # AI Scouting
 with st.expander("\U0001f9e0 AI Scouting Reports"):

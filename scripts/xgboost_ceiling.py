@@ -152,7 +152,7 @@ print(f'  Current linear meta r:  {linear_r:+.4f}  (in-sample, all rows)')
 # Also compute LINEAR CV R² (comparable to XGBoost CV R²) for a fair benchmark
 from sklearn.linear_model import LinearRegression
 print()
-print('── Linear vs XGBoost CV R² (apples-to-apples comparison) ──')
+print('=== Linear vs XGBoost CV R^2 (apples-to-apples comparison) ===')
 for name, X_rows, feats, ys in [('BATTING', bat_rows, bat_features, bat_targets),
                                  ('PITCHING', pit_rows, pit_features, pit_targets)]:
     X = np.array([[_to_float(r[f]) for f in feats] for r in X_rows], dtype=float)

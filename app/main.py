@@ -136,7 +136,7 @@ if logs:
             "pages/0_Data_Refresh.py",
             label="Open Data Refresh",
             icon="\U0001f4e5",
-            use_container_width=True,
+            width='stretch',
         )
 else:
     st.info(
@@ -479,7 +479,7 @@ with tab_recs:
                     "Price": f"{b['estimated_price']:,}" if b['estimated_price'] else "\u2014",
                     "Value": f"{b['value_ratio']:.1f}" if b['value_ratio'] else "\u2014",
                 })
-            st.dataframe(pd.DataFrame(buy_data), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(buy_data), width='stretch', hide_index=True)
             st.page_link("pages/1_Buy_Recommendations.py", label="Browse all \u2192", icon="\U0001f6d2")
         else:
             st.info("No buy recommendations yet.")
@@ -504,7 +504,7 @@ with tab_recs:
                     "Price": f"{s['estimated_price']:,}" if s['estimated_price'] else "\u2014",
                     "Reason": s['reason'],
                 })
-            st.dataframe(pd.DataFrame(sell_data), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(sell_data), width='stretch', hide_index=True)
             st.page_link("pages/2_Sell_Recommendations.py", label="Browse all \u2192", icon="\U0001f4b0")
         else:
             st.info("No sell recommendations yet.")
@@ -576,7 +576,7 @@ with tab_roster:
             st.markdown("*Batting*")
             st.dataframe(
                 pd.DataFrame(bat_rows),
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
                 height=min(35 * len(bat_rows) + 38, 500),
             )
@@ -650,7 +650,7 @@ with tab_roster:
             st.markdown("*Pitching*")
             st.dataframe(
                 pd.DataFrame(pitch_rows),
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
                 height=min(35 * len(pitch_rows) + 38, 500),
             )
@@ -708,7 +708,7 @@ with tab_roster:
             bat_df = pd.DataFrame(batter_rows)
             bat_cols = ["Player", "Pos", "Role", "OVR", "Meta", "AVG", "OPS", "HR", "WAR"]
             bat_df = bat_df[[c for c in bat_cols if c in bat_df.columns]]
-            st.dataframe(bat_df, use_container_width=True, hide_index=True,
+            st.dataframe(bat_df, width='stretch', hide_index=True,
                 column_config={
                     "OVR": st.column_config.NumberColumn(format="%d"),
                     "WAR": st.column_config.NumberColumn(format="%.1f"),
@@ -719,7 +719,7 @@ with tab_roster:
             pit_df = pd.DataFrame(pitcher_rows)
             pit_cols = ["Player", "Pos", "Role", "OVR", "Meta", "ERA", "WHIP", "K", "WAR"]
             pit_df = pit_df[[c for c in pit_cols if c in pit_df.columns]]
-            st.dataframe(pit_df, use_container_width=True, hide_index=True,
+            st.dataframe(pit_df, width='stretch', hide_index=True,
                 column_config={
                     "OVR": st.column_config.NumberColumn(format="%d"),
                     "WAR": st.column_config.NumberColumn(format="%.1f"),
@@ -764,7 +764,7 @@ with tab_data:
             "Last Import": str(log['last_import'])[:16],
             "Rows": log['total_rows'],
         })
-    st.dataframe(pd.DataFrame(freshness_data), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(freshness_data), width='stretch', hide_index=True)
 
     # Import validation summary
     st.divider()
