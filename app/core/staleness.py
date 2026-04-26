@@ -146,6 +146,15 @@ class GroupStatus:
     relative_status: str            # same | lagging | fresh | missing
     relative_lag_h: Optional[float] # how much older than freshest group
     missing_types: list[str] = field(default_factory=list)
+    # Intra-group view-lag: catches the common case where a single file_type
+    # pattern matches multiple OOTP "view dropdown" variants (e.g. all
+    # `lineups_-_overview_*.csv` files share the `lineup_overview` file_type
+    # but represent different views — default, batting_ratings, position_ratings,
+    # fielding_*). If the user re-exports some views but forgets others, the
+    # group's newest_age_h still looks fresh; this field surfaces the spread.
+    view_lag_h: Optional[float] = None
+    stale_views: list[tuple[str, float]] = field(default_factory=list)
+                                              # [(filename, age_h), ...]
 
 
 @dataclass
@@ -178,14 +187,19 @@ def build_staleness_report(watch_dir: str) -> StalenessReport:
 
     descriptors = scan_watch_directory(watch_dir)
 
-    # Best per file_type (newest wins)
-    newest_by_type: dict[str, FileDescriptor] = {}
+    # Bucket EVERY descriptor by file_type (NOT just the newest). A single
+    # file_type pattern often matches multiple OOTP view-dropdown exports
+    # (e.g. lineups_-_overview matches default, batting_ratings,
+    # position_ratings, fielding_ratings, fielding_stats variants), so we
+    # need the full set to detect view-lag within a group.
+    by_type: dict[str, list[FileDescriptor]] = {}
     for d in descriptors:
         if not d.file_type:
             continue
-        if d.file_type not in newest_by_type \
-                or d.modified > newest_by_type[d.file_type].modified:
-            newest_by_type[d.file_type] = d
+        by_type.setdefault(d.file_type, []).append(d)
+    newest_by_type: dict[str, FileDescriptor] = {
+        ft: max(ds, key=lambda d: d.modified) for ft, ds in by_type.items()
+    }
 
     # Build group status
     groups: list[GroupStatus] = []
@@ -207,6 +221,42 @@ def build_staleness_report(watch_dir: str) -> StalenessReport:
             newest_age = None
             oldest_age = None
 
+        # View-lag: gather every descriptor in the group across all
+        # file_types and compute the spread. If the spread exceeds the
+        # relative-gap threshold, the user re-exported part of the group
+        # but missed at least one view — surface the lagging filenames.
+        #
+        # We restrict the comparison to descriptors matching the freshest
+        # file's league_id so cross-league residue (e.g. old `i76_*` files
+        # left over from a previous league) doesn't masquerade as a view
+        # mismatch in the active league. Files with no league prefix
+        # (team-specific exports like `toronto_dark_knights_*`) are
+        # always included.
+        all_descs: list[FileDescriptor] = []
+        for ft in gm['file_types']:
+            all_descs.extend(by_type.get(ft, []))
+        view_lag_h: Optional[float] = None
+        stale_views: list[tuple[str, float]] = []
+        if len(all_descs) >= 2:
+            freshest = min(all_descs, key=lambda d: d.age_hours)
+            active_league = freshest.league_id
+            in_scope = [
+                d for d in all_descs
+                if d.league_id is None or d.league_id == active_league
+            ]
+            if len(in_scope) >= 2:
+                youngest = min(d.age_hours for d in in_scope)
+                oldest = max(d.age_hours for d in in_scope)
+                spread = oldest - youngest
+                if spread >= RELATIVE_GAP_HOURS:
+                    view_lag_h = spread
+                    threshold = youngest + RELATIVE_GAP_HOURS
+                    stale_views = [
+                        (d.filename, d.age_hours)
+                        for d in sorted(in_scope, key=lambda d: -d.age_hours)
+                        if d.age_hours >= threshold
+                    ]
+
         absolute_status = _classify_age(newest_age)
         groups.append(GroupStatus(
             group_key=gk, label=gm['label'], hint=gm['hint'],
@@ -218,6 +268,8 @@ def build_staleness_report(watch_dir: str) -> StalenessReport:
             relative_status='same',  # filled below
             relative_lag_h=None,
             missing_types=missing_types,
+            view_lag_h=view_lag_h,
+            stale_views=stale_views,
         ))
 
     # Relative staleness: compare each group's newest age vs freshest group
@@ -249,11 +301,15 @@ def build_staleness_report(watch_dir: str) -> StalenessReport:
 
     # Missing wins, then stale, then lagging, then aging, then fresh
     status_rank = {'missing': 4, 'stale': 3, 'aging': 2, 'fresh': 0}
-    # relative lagging bumps one level
+    # relative lagging or view-lag bumps one level
     def worst_rank(g: GroupStatus) -> int:
         r = status_rank.get(g.absolute_status, 0)
         if g.relative_status == 'lagging' and r < 3:
             r = max(r, 2)  # at least aging
+        # Intra-group view-lag also escalates to "aging" — a fresh
+        # bucket where the canonical view is stale shouldn't read green.
+        if g.view_lag_h is not None and r < 3:
+            r = max(r, 2)
         return r
     worst = max(priority_groups, key=worst_rank) if priority_groups else None
     worst_rank_val = worst_rank(worst) if worst else 0
@@ -294,6 +350,23 @@ def build_staleness_report(watch_dir: str) -> StalenessReport:
         else:
             overall_label = (f"{worst.label} is {worst.relative_lag_h:.0f}h behind "
                              f"the rest of your exports — re-export to sync")
+    elif worst and worst.view_lag_h is not None:
+        # The bucket itself looks fresh (newest file < 6h) but at least one
+        # view inside it is much older — call it out by name.
+        overall_status = 'aging'
+        if worst.stale_views:
+            stale_basename = worst.stale_views[0][0]
+            stale_age = worst.stale_views[0][1]
+            overall_label = (
+                f"{worst.label}: \"{stale_basename}\" is {stale_age:.0f}h old "
+                f"while other views in this group are fresh — switch the OOTP "
+                f"view dropdown and re-export the missing variant"
+            )
+        else:
+            overall_label = (
+                f"{worst.label} has a {worst.view_lag_h:.0f}h spread between "
+                "view variants — re-export the older view from OOTP"
+            )
     elif worst_rank_val >= 2:
         overall_status = 'aging'
         overall_label = f"{worst.label} is {worst.newest_age_h:.0f}h old"

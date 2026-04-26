@@ -23,7 +23,8 @@ _HOME = ("main.py", "Dashboard", "\U0001f3e0")  # 🏠
 # else. Every session begins by running it, so it gets its own prominent
 # slot directly under Dashboard instead of being buried in Configure.
 _START = [
-    ("pages/0_Data_Refresh.py", "Data Refresh", "\U0001f4e5"),  # 📥
+    ("pages/0_Data_Refresh.py",     "Data Refresh",   "\U0001f4e5"),  # 📥
+    ("pages/20_Game_Coverage.py",   "Game Coverage",  "\U0001f5d3️"),  # 🗓️
 ]
 
 _DECIDE = [

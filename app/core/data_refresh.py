@@ -116,8 +116,15 @@ class FileDescriptor:
     modified: datetime
     league_id: str | None      # lb124, i76, etc. (None for non-league files)
     age_hours: float           # hours since modification (for freshness UI)
-    last_import: datetime | None = None  # from ingestion_log, populated by plan_refresh
+    last_import: datetime | None = None  # from ingestion_log per file_type
     last_row_count: int = 0
+    # Per-FILENAME last-import timestamp. Different from ``last_import``
+    # which is per-file_type. Multiple sibling files share a file_type
+    # (e.g. all _overview_*.csv → lineup_overview), so the per-type
+    # timestamp collapses them. The per-filename value tells us when
+    # exactly THIS file was last ingested. Used by the actionable
+    # filter so re-saving a single sibling triggers a re-ingest.
+    last_import_for_file: datetime | None = None
     is_core: bool = False      # True if file_type in CORE_FILE_TYPES
     will_skip: bool = False    # True if handler is a known noop (team_standings)
     skip_reason: str = ""
@@ -272,6 +279,41 @@ def get_last_ingestion_status(conn) -> dict[str, IngestionStatus]:
     return status
 
 
+def get_last_ingestion_per_filename(conn) -> dict[str, datetime]:
+    """Like ``get_last_ingestion_status`` but keyed on filename.
+
+    Each ``_overview_*.csv`` sibling shares ``file_type='lineup_overview'``,
+    so the per-type query collapses them and dedups all of them once any
+    one is imported. The UAT 2026-04-25 user feedback was specifically that
+    files weren't picking up because of this aggregation: re-saving
+    ``_default.csv`` after a sibling refresh kept it filtered out as
+    "already imported" via the type's last_import.
+
+    Returning per-file timestamps lets the actionable filter compare each
+    file's mtime against the last time THAT file was ingested. Re-saving
+    a single sibling now properly re-runs that one file.
+    """
+    cursor = conn.execute(
+        """
+        SELECT file_name, MAX(ingested_at) AS last_import
+        FROM ingestion_log
+        WHERE file_name IS NOT NULL
+        GROUP BY file_name
+        """
+    )
+    out: dict[str, datetime] = {}
+    for row in cursor.fetchall():
+        fn = row["file_name"]
+        raw = row["last_import"]
+        if not fn or not raw:
+            continue
+        try:
+            out[fn] = datetime.fromisoformat(str(raw).replace("T", " "))
+        except ValueError:
+            continue
+    return out
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Plan — scan + status + gap analysis → structured preview
 # ──────────────────────────────────────────────────────────────────────
@@ -315,13 +357,22 @@ def plan_refresh(watch_dir: str, conn) -> RefreshPlan:
     """
     descriptors = scan_watch_directory(watch_dir)
     status_map = get_last_ingestion_status(conn) if conn is not None else {}
+    file_status_map = (get_last_ingestion_per_filename(conn)
+                        if conn is not None else {})
 
-    # Join last-import info onto each descriptor
+    # Join last-import info onto each descriptor — both per-type
+    # (UI display) and per-filename (actionable filter).
     for d in descriptors:
         if d.file_type and d.file_type in status_map:
             s = status_map[d.file_type]
             d.last_import = s.last_import
             d.last_row_count = s.last_row_count
+        # Per-filename: catches sibling files (lineup_overview siblings,
+        # league stats variants) that share a file_type. ingestion_log's
+        # file_name field is the basename, not the absolute path, so we
+        # match on basename here.
+        if file_status_map:
+            d.last_import_for_file = file_status_map.get(d.filename)
 
     # Group by category (only recognized files — unrecognized go in their own bucket)
     categories: dict[str, list[FileDescriptor]] = {}

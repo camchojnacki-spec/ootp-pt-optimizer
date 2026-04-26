@@ -24,11 +24,279 @@ Public API:
 """
 from __future__ import annotations
 
+import json
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Iterable, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Factor-snapshot capture
+# ──────────────────────────────────────────────────────────────────────
+#
+# When the optimizer logs a rec, we also capture the full factor decomposition
+# that drove the projected meta — every component, bonus, and penalty the
+# explainer surfaced. Stream C's residual learner reads these snapshots to
+# regress (actual − projected) outcomes on each factor and learn which signals
+# systematically over- or under-predict. Capture failure must NEVER block the
+# rec write itself: the helpers degrade to None on any error.
+
+# Map explainer labels (free-text, change-prone) to stable keys (regression-
+# safe, intentionally narrow). Order matters — earlier patterns win — because
+# a label like "Game-log EV/LD% (EV 92, LD% 23 over 318 AB)" matches both
+# "Game-log" and "EV". Patterns are case-insensitive substrings.
+_LABEL_KEY_RULES: list[tuple[str, str]] = [
+    ("game-log ev/ld",          "superstat_ev"),
+    ("game-log contact allowed", "superstat_contact"),
+    ("woba performance",         "perf_woba"),
+    ("siera performance",        "perf_siera"),
+    ("performance adjustment",   "perf_generic"),
+    ("recent form",              "recent_form"),
+    ("clutch",                   "clutch"),
+    ("defensive errors",         "defensive_errors"),
+    ("inherited runners",        "reliever_discipline"),
+    ("sp hr/9",                  "sp_hr9"),
+    ("speed/stealing",           "speed_stealing"),
+    ("stamina/hold",             "stamina_hold"),
+    ("platoon split",            "platoon_pen"),
+    ("below floor",              "floor_pen"),
+    ("position scarcity",        "position_scarcity"),
+    ("card-type bias",           "card_type_offset"),
+    ("stuff x movement",         "stuff_x_movement"),
+    ("stuff x control",          "stuff_x_control"),
+    ("movement x control",       "movement_x_control"),
+]
+
+# Component labels are stable (mirror rating column names) so just lowercase +
+# strip non-alphanumerics for the key. Matches contact -> "contact",
+# "Gap Power" -> "gap_power", "Avoid K's" -> "avoid_ks", "HR Suppression" ->
+# "hr_suppression", etc.
+_COMPONENT_KEY_OVERRIDES = {
+    "avoid k's":     "avoid_ks",
+    "hr suppression": "p_hr",
+}
+
+
+def _slugify(label: str) -> str:
+    """Default fallback: lowercase + collapse non-alphanumerics to underscore."""
+    s = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
+    return s or "unknown"
+
+
+def _label_to_key(label: str, kind: str = "bonus") -> str:
+    """Return a stable regression key for an explainer label.
+
+    ``kind`` is one of 'component', 'bonus', or 'penalty'. Components mirror
+    rating column names and use a simpler slug rule; bonuses/penalties go
+    through the substring-match table because their labels embed live values
+    ("EV 92, LD% 23 over 318 AB") that would otherwise produce a different
+    slug per card.
+    """
+    if not label:
+        return "unknown"
+    low = label.lower()
+    if kind == "component":
+        if low in _COMPONENT_KEY_OVERRIDES:
+            return _COMPONENT_KEY_OVERRIDES[low]
+        return _slugify(label)
+    for needle, key in _LABEL_KEY_RULES:
+        if needle in low:
+            return key
+    return _slugify(label)
+
+
+# Columns the explainers may read. Pulling them in one shot keeps the helper
+# self-contained — the page emitter doesn't need to know which fields the
+# meta engine cares about. Transient overlay fields (``_gl_*``, ``_rf_*``,
+# ``_obs_*``) aren't stored on cards; the explainers no-op gracefully when
+# they're absent, so the captured snapshot reflects the rating-only meta —
+# which is what the rec write does at log time anyway (the engine reads the
+# already-stored meta_score_* off cards).
+_EXPLAINER_CARD_COLS = (
+    "card_id, card_title, position, position_name, pitcher_role, pitcher_role_name, "
+    "card_value, ovr, card_type, tier_name, "
+    "contact, gap_power, power, eye, avoid_ks, babip, "
+    "contact_vl, contact_vr, gap_vl, gap_vr, power_vl, power_vr, eye_vl, eye_vr, "
+    "speed, stealing, baserunning, "
+    "infield_range, infield_error, infield_arm, dp, "
+    "catcher_ability, catcher_frame, catcher_arm, "
+    "of_range, of_error, of_arm, "
+    "stuff, movement, control, p_hr, p_babip, "
+    "stuff_vl, stuff_vr, movement_vl, movement_vr, control_vl, control_vr, "
+    "p_hr_vl, p_hr_vr, stamina, hold, "
+    "meta_score_batting, meta_score_pitching"
+)
+
+
+def _load_card_for_explainer(card_id: int, conn) -> Optional[dict]:
+    """Load the full card row needed by ``explain_*_meta``.
+
+    A few columns referenced in the SELECT (``ovr``) don't exist on the cards
+    table — they're aliases the explainers also accept. We pull the canonical
+    ``card_value`` and the explainer's row.get() chain finds it.
+    """
+    sql = (
+        "SELECT card_id, card_title, position, position_name, "
+        "pitcher_role, pitcher_role_name, card_value, card_type, tier_name, "
+        "contact, gap_power, power, eye, avoid_ks, babip, "
+        "contact_vl, contact_vr, gap_vl, gap_vr, "
+        "power_vl, power_vr, eye_vl, eye_vr, "
+        "speed, stealing, baserunning, "
+        "infield_range, infield_error, infield_arm, dp, "
+        "catcher_ability, catcher_frame, catcher_arm, "
+        "of_range, of_error, of_arm, "
+        "stuff, movement, control, p_hr, p_babip, "
+        "stuff_vl, stuff_vr, movement_vl, movement_vr, "
+        "control_vl, control_vr, "
+        "stamina, hold, "
+        "meta_score_batting, meta_score_pitching "
+        "FROM cards WHERE card_id = ?"
+    )
+    row = conn.execute(sql, (card_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def extract_factor_snapshot(card_id: int,
+                            side: str,
+                            conn=None) -> Optional[dict]:
+    """Capture the rating-level factor decomposition for a card at rec time.
+
+    Returns the canonical snapshot the residual learner will regress on:
+    components (rating-driven points), bonuses (overlays/positional adds),
+    penalties (floors / platoon weakness / negative overlays), and the totals.
+    Each entry carries a stable ``key`` so Stream C can group across cards
+    without parsing free-text labels.
+
+    Wrapped in try/except — if anything fails (missing card, explainer
+    crash, DB error), returns None and the rec write proceeds without the
+    snapshot. Factor capture is forward-only: it's better to skip a snapshot
+    than block a recommendation.
+    """
+    try:
+        from app.core.database import get_connection
+        from app.core.meta_scoring import (
+            explain_batting_meta, explain_pitching_meta,
+        )
+        if conn is None:
+            conn = get_connection()
+        if not card_id or side not in ("batting", "pitching"):
+            return None
+        card = _load_card_for_explainer(int(card_id), conn)
+        if not card:
+            return None
+        if side == "batting":
+            exp = explain_batting_meta(card)
+        else:
+            exp = explain_pitching_meta(card)
+        if not exp:
+            return None
+
+        components = [
+            {
+                "label": c.get("label"),
+                "key":   _label_to_key(c.get("label") or "", kind="component"),
+                "raw":    c.get("raw"),
+                "weight": c.get("weight"),
+                "points": c.get("points"),
+            }
+            for c in (exp.get("components") or [])
+        ]
+        bonuses = [
+            {
+                "label":  b.get("label"),
+                "key":    _label_to_key(b.get("label") or "", kind="bonus"),
+                "points": b.get("points"),
+            }
+            for b in (exp.get("bonuses") or [])
+        ]
+        penalties = [
+            {
+                "label":  p.get("label"),
+                "key":    _label_to_key(p.get("label") or "", kind="penalty"),
+                "points": p.get("points"),
+            }
+            for p in (exp.get("penalties") or [])
+        ]
+        return {
+            "side":        side,
+            "card_id":     int(card_id),
+            "components":  components,
+            "bonuses":     bonuses,
+            "penalties":   penalties,
+            "total":       float(exp.get("total") or 0.0),
+            "captured_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    except Exception as e:
+        logger.debug("extract_factor_snapshot(%s, %s) failed: %s",
+                     card_id, side, e)
+        return None
+
+
+def compute_projected_war(card_id: int,
+                          side: str,
+                          conn=None) -> Optional[float]:
+    """Read the latest stat row for the card and return WAR/600 or WAR/200.
+
+    Scaled rates are what the rec UI shows ("WAR per 600 PA" for batters,
+    "WAR per 200 IP" for pitchers), so the residual learner sees the same
+    units the engine reasoned about. Returns None when no stats row exists
+    yet — Stream C's regression treats those as missing-projected, not zero.
+    """
+    try:
+        from app.core.database import get_connection
+        if conn is None:
+            conn = get_connection()
+        if not card_id or side not in ("batting", "pitching"):
+            return None
+        if side == "batting":
+            row = conn.execute(
+                """
+                SELECT war, pa FROM batting_stats
+                WHERE card_id = ?
+                ORDER BY snapshot_date DESC LIMIT 1
+                """,
+                (int(card_id),),
+            ).fetchone()
+            if not row or not row["pa"]:
+                return None
+            return round(float(row["war"] or 0.0) * 600.0 / float(row["pa"]), 3)
+        row = conn.execute(
+            """
+            SELECT war, ip FROM pitching_stats
+            WHERE card_id = ?
+            ORDER BY snapshot_date DESC LIMIT 1
+            """,
+            (int(card_id),),
+        ).fetchone()
+        if not row or not row["ip"]:
+            return None
+        return round(float(row["war"] or 0.0) * 200.0 / float(row["ip"]), 3)
+    except Exception as e:
+        logger.debug("compute_projected_war(%s, %s) failed: %s",
+                     card_id, side, e)
+        return None
+
+
+def _projected_meta_for(card_id: int, side: str, conn) -> Optional[float]:
+    """Read the engine's already-computed meta for the card. Used as the
+    projection baseline the residual learner subtracts observed performance
+    from. Falls back to the snapshot total when the card row is missing."""
+    if not card_id or side not in ("batting", "pitching"):
+        return None
+    col = "meta_score_batting" if side == "batting" else "meta_score_pitching"
+    try:
+        row = conn.execute(
+            f"SELECT {col} AS m FROM cards WHERE card_id = ?",
+            (int(card_id),),
+        ).fetchone()
+        if row and row["m"] is not None:
+            return float(row["m"])
+    except Exception:
+        pass
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -49,21 +317,50 @@ def log_recommendation(
     reasoning: Optional[str] = None,
     league_id: Optional[str] = None,
     data_version: Optional[int] = None,
+    side: Optional[str] = None,
+    factor_snapshot: Optional[dict] = None,
+    projected_meta: Optional[float] = None,
+    projected_war: Optional[float] = None,
 ) -> int:
-    """Insert a single recommendation. Returns the row id."""
+    """Insert a single recommendation. Returns the row id.
+
+    ``side``/``factor_snapshot``/``projected_meta``/``projected_war`` feed the
+    residual reinforcement loop — when ``side`` and ``player_card_id`` are
+    set but the snapshot/projections are missing, the writer auto-fills them
+    via :func:`extract_factor_snapshot` and :func:`compute_projected_war`. A
+    capture failure logs at DEBUG and persists the rec without it.
+    """
     from app.core.database import get_connection
     conn = get_connection()
+
+    if side and player_card_id:
+        if factor_snapshot is None:
+            factor_snapshot = extract_factor_snapshot(int(player_card_id), side, conn)
+        if projected_meta is None:
+            projected_meta = _projected_meta_for(int(player_card_id), side, conn)
+        if projected_war is None:
+            projected_war = compute_projected_war(int(player_card_id), side, conn)
+
+    snap_json: Optional[str] = None
+    if factor_snapshot is not None:
+        try:
+            snap_json = json.dumps(factor_snapshot, default=float)
+        except Exception:
+            snap_json = None
+
     cur = conn.execute(
         """
         INSERT INTO recommendation_log
             (source, rec_type, pos, player_name, player_card_id,
              from_player, from_card_id, expected_delta, cost_pp,
-             reasoning, league_id, data_version, verdict)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+             reasoning, league_id, data_version, verdict,
+             side, factor_snapshot_json, projected_meta, projected_war)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
         """,
         (source, rec_type, pos, player_name, player_card_id,
          from_player, from_card_id, expected_delta, cost_pp,
-         reasoning, league_id, data_version),
+         reasoning, league_id, data_version,
+         side, snap_json, projected_meta, projected_war),
     )
     conn.commit()
     return int(cur.lastrowid)
@@ -76,12 +373,20 @@ def log_recommendations(source: str, picks: Iterable[dict],
 
     ``picks`` is a list of dicts shaped like the AI Optimize All picks_data:
         {'pos', 'action', 'card_name', 'current_name', 'cost',
-         'reason', 'card_id', 'current_card_id', 'expected_delta'}
+         'reason', 'card_id', 'current_card_id', 'expected_delta',
+         'side', 'factor_snapshot', 'projected_meta', 'projected_war'}
 
     Only non-'Keep' actions are logged (Keeps aren't recommendations).
     Dedup window widened from 1h → 24h: the engine re-renders the same
     upgrade plan every page load, and anything meaningful hasn't shifted
     within a day. 1h was producing 60% duplicate rec rows.
+
+    The last four fields drive the residual reinforcement loop. Callers may
+    pre-compute ``factor_snapshot``/``projected_meta``/``projected_war`` per
+    pick, or pass only ``side`` + ``card_id`` and let the writer auto-fill
+    via :func:`extract_factor_snapshot` / :func:`compute_projected_war`.
+    Auto-fill never blocks the write — a snapshot failure just leaves the
+    column NULL.
     """
     from app.core.database import get_connection
     conn = get_connection()
@@ -146,19 +451,56 @@ def log_recommendations(source: str, picks: Iterable[dict],
         if dup:
             continue
 
+        # Factor capture — auto-fill from card_id + side when the caller
+        # didn't pre-compute. Side defaults from rec_type (hook/sell with no
+        # side hint usually mean batting context unless the pos says
+        # otherwise) but we only auto-derive when the pos clearly identifies
+        # the role; otherwise we leave side NULL and skip capture.
+        side = p.get('side')
+        if not side and pos:
+            side = 'pitching' if pos in ('SP', 'RP', 'CL') else 'batting'
+
+        factor_snapshot = p.get('factor_snapshot')
+        projected_meta = p.get('projected_meta')
+        projected_war = p.get('projected_war')
+
+        if side and player_card_id:
+            if factor_snapshot is None:
+                factor_snapshot = extract_factor_snapshot(
+                    int(player_card_id), side, conn,
+                )
+            if projected_meta is None:
+                projected_meta = _projected_meta_for(
+                    int(player_card_id), side, conn,
+                )
+            if projected_war is None:
+                projected_war = compute_projected_war(
+                    int(player_card_id), side, conn,
+                )
+
+        snap_json: Optional[str] = None
+        if factor_snapshot is not None:
+            try:
+                snap_json = json.dumps(factor_snapshot, default=float)
+            except Exception:
+                snap_json = None
+
         conn.execute(
             """
             INSERT INTO recommendation_log
                 (source, rec_type, pos, player_name, player_card_id,
                  from_player, from_card_id, expected_delta, cost_pp,
-                 reasoning, league_id, data_version, verdict)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                 reasoning, league_id, data_version, verdict,
+                 side, factor_snapshot_json, projected_meta, projected_war)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending',
+                    ?, ?, ?, ?)
             """,
-            (source, rec_type, pos, player_name, p.get('card_id'),
-             from_player, p.get('current_card_id'),
+            (source, rec_type, pos, player_name, player_card_id,
+             from_player, from_card_id,
              p.get('expected_delta'), p.get('cost'),
              p.get('reason') or p.get('reasoning'),
-             league_id, data_version),
+             league_id, data_version,
+             side, snap_json, projected_meta, projected_war),
         )
         logged += 1
     conn.commit()

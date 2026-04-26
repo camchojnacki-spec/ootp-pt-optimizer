@@ -143,18 +143,22 @@ def staleness_glance() -> None:
     else:
         st.error(f"{dot} **{report.overall_label}**")
 
-    # Top 3 groups that most need attention (worst first)
+    # Top 3 groups that most need attention (worst first). View-lag
+    # groups (intra-bucket spread — e.g. lineup default view stale while
+    # other lineup views are fresh) sort with the lagging groups so the
+    # user sees them even when the bucket's newest file looks fresh.
     ranked = sorted(
         [g for g in report.groups if g.priority == 1],
         key=lambda g: (
             {'missing':0,'stale':1,'aging':2,'fresh':3}[g.absolute_status],
-            0 if g.relative_status == 'lagging' else 1,
+            0 if (g.relative_status == 'lagging' or g.view_lag_h is not None) else 1,
             -(g.newest_age_h or 0),
         ),
     )
     bad = [g for g in ranked
            if g.absolute_status in ('stale', 'missing')
-              or g.relative_status == 'lagging']
+              or g.relative_status == 'lagging'
+              or g.view_lag_h is not None]
     if bad:
         lines = []
         for g in bad[:4]:
@@ -164,6 +168,18 @@ def staleness_glance() -> None:
             if g.relative_status == 'lagging' and g.relative_lag_h:
                 lag_str = f' · {g.relative_lag_h:.0f}h behind fresh exports'
             lines.append(f"- **{g.label}** ({age_str}{lag_str}) — *{g.hint}*")
+            # Inline view-lag detail: name the specific stale view file(s)
+            # so the user knows which OOTP view dropdown to switch to.
+            if g.view_lag_h is not None and g.stale_views:
+                top_stale = ', '.join(
+                    f"`{name}` ({age:.0f}h)" for name, age in g.stale_views[:2]
+                )
+                more = (f" (+{len(g.stale_views) - 2} more)"
+                        if len(g.stale_views) > 2 else '')
+                lines.append(
+                    f"  - 🔄 **View variant lag**: {top_stale}{more} — "
+                    "switch OOTP view dropdown and re-export"
+                )
         st.markdown('\n'.join(lines))
 
 
@@ -188,7 +204,7 @@ def staleness_reminder() -> None:
     rows = []
     for g in sorted(report.groups, key=lambda x: (
         {'missing':0,'stale':1,'aging':2,'fresh':3}[x.absolute_status],
-        0 if x.relative_status == 'lagging' else 1,
+        0 if (x.relative_status == 'lagging' or x.view_lag_h is not None) else 1,
         x.priority,
         x.label,
     )):
@@ -196,11 +212,15 @@ def staleness_reminder() -> None:
         lag_str = ''
         if g.relative_lag_h is not None and g.relative_lag_h > 0.1:
             lag_str = f'+{g.relative_lag_h:.1f}h'
+        view_str = '—'
+        if g.view_lag_h is not None:
+            view_str = f'⚠ {g.view_lag_h:.1f}h spread'
         rows.append({
             '': dot_map.get(g.absolute_status, '⚪'),
             'Export group': g.label,
             'Age': age_str,
             'Relative': lag_str if lag_str else '—',
+            'Views': view_str,
             'Present': f'{g.files_present}/{g.files_expected}',
             'Priority': g.priority,
             'Where in OOTP': g.hint,
@@ -215,12 +235,29 @@ def staleness_reminder() -> None:
                          help="How much older this group's newest file is compared to "
                               "the freshest export across ALL groups. A big number here "
                               "means you exported something recently but skipped this group."),
+                     'Views': st.column_config.TextColumn(width='small',
+                         help="Spread between the newest and oldest file inside this "
+                              "group. A big spread means you re-exported some OOTP view "
+                              "dropdowns but missed others (e.g. exported Lineups → "
+                              "Batting Ratings but not Lineups → Default)."),
                      'Present': st.column_config.TextColumn(width='small',
                          help="How many of the expected CSVs in this group are actually present."),
                      'Priority': st.column_config.NumberColumn(width='small',
                          help="1 = core export for roster analysis; 2 = supplemental league stats."),
                      'Where in OOTP': st.column_config.TextColumn(width='large'),
                  })
+
+    # If any group has stale views, list the specific files below the table
+    # so the user can see exactly which view to re-export.
+    view_lag_groups = [g for g in report.groups if g.stale_views]
+    if view_lag_groups:
+        st.markdown("**🔄 View variant lag** — files inside an export group "
+                    "that are older than other files in the same group. "
+                    "Switch the OOTP view dropdown and re-export each one.")
+        for g in view_lag_groups:
+            st.markdown(f"- **{g.label}** ({g.hint})")
+            for name, age in g.stale_views:
+                st.markdown(f"  - `{name}` — **{age:.0f}h old**")
 
     # HTML reports (box scores / game logs)
     html = check_html_staleness(save_dir) if save_dir else {}

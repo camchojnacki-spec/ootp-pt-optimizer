@@ -42,6 +42,84 @@ def get_db_path() -> str:
 # script runs but the same module object persists for the lifetime of the worker.
 _AUTO_META_SYNC_DONE = False
 
+# Process-level guard for the latest-snapshot views. ``init_db`` only fires
+# on the first call per process and pages may be loaded against a DB that
+# was created by an older build. This flag lets ``get_connection`` install
+# the views on demand without hammering the DDL on every connection.
+_LATEST_VIEWS_ENSURED = False
+
+
+def _ensure_latest_views(conn: sqlite3.Connection) -> None:
+    """Idempotently install ``batting_stats_latest`` / ``pitching_stats_latest``
+    plus the per-league meta cache table ``card_meta_by_league``.
+
+    These views encode the snapshot+jersey dedup that callers used to do
+    inline (or skip — UAT 2026-04-25 §5.4 found multiple consumers reading
+    raw stats and getting per-card row multiplication). Centralizing the
+    dedup keeps consumer queries single-line and prevents drift.
+
+    Called once per Python process from ``get_connection``. Safe to re-run
+    — the DDL itself uses ``CREATE VIEW IF NOT EXISTS`` semantics via
+    ``DROP VIEW IF EXISTS`` first.
+    """
+    global _LATEST_VIEWS_ENSURED
+    if _LATEST_VIEWS_ENSURED:
+        return
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS card_meta_by_league (
+                card_id INTEGER NOT NULL,
+                league_id TEXT NOT NULL,
+                side TEXT NOT NULL CHECK (side IN ('batting', 'pitching')),
+                meta_score REAL NOT NULL,
+                weight_source TEXT,
+                recalc_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (card_id, league_id, side),
+                FOREIGN KEY (card_id) REFERENCES cards(card_id)
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cmbl_card_league "
+            "ON card_meta_by_league(card_id, league_id)"
+        )
+        conn.executescript("""
+        DROP VIEW IF EXISTS batting_stats_latest;
+        CREATE VIEW batting_stats_latest AS
+            SELECT bs.* FROM batting_stats bs
+            INNER JOIN (
+                SELECT card_id, league_id, jersey_number,
+                       MAX(snapshot_date) AS max_date
+                FROM batting_stats
+                WHERE card_id IS NOT NULL
+                GROUP BY card_id, league_id, jersey_number
+            ) latest
+              ON bs.card_id = latest.card_id
+             AND IFNULL(bs.league_id, '') = IFNULL(latest.league_id, '')
+             AND IFNULL(bs.jersey_number, -1) = IFNULL(latest.jersey_number, -1)
+             AND bs.snapshot_date = latest.max_date;
+
+        DROP VIEW IF EXISTS pitching_stats_latest;
+        CREATE VIEW pitching_stats_latest AS
+            SELECT ps.* FROM pitching_stats ps
+            INNER JOIN (
+                SELECT card_id, league_id, jersey_number,
+                       MAX(snapshot_date) AS max_date
+                FROM pitching_stats
+                WHERE card_id IS NOT NULL
+                GROUP BY card_id, league_id, jersey_number
+            ) latest
+              ON ps.card_id = latest.card_id
+             AND IFNULL(ps.league_id, '') = IFNULL(latest.league_id, '')
+             AND IFNULL(ps.jersey_number, -1) = IFNULL(latest.jersey_number, -1)
+             AND ps.snapshot_date = latest.max_date;
+        """)
+        conn.commit()
+        _LATEST_VIEWS_ENSURED = True
+    except Exception:
+        # Worst case: views remain missing; consumers continue to use the
+        # base tables. Logged at the call site if needed.
+        pass
+
 
 def get_connection() -> sqlite3.Connection:
     """Return a sqlite3 connection with row_factory = sqlite3.Row.
@@ -73,6 +151,8 @@ def get_connection() -> sqlite3.Connection:
             sync_roster_meta_from_cards(conn)
         except Exception:
             pass  # Sync is best-effort; never block a page from loading.
+
+    _ensure_latest_views(conn)
 
     return conn
 
@@ -706,6 +786,50 @@ def init_db() -> None:
         pass  # Table may not exist yet on fresh install
 
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_alerts_active ON price_alerts(active, triggered)")
+
+    # Recommendation reinforcement loop (2026-04-25). The optimizer logs each
+    # rec with the *factor decomposition* that drove it — contact +X, power
+    # +Y, perf overlay +Z — so we can later regress (actual − projected)
+    # outcomes on those factors and learn which signals over- or under-
+    # predicted. ``side`` distinguishes batting vs pitching so the backtest
+    # picks the right game-log table; ``projected_meta`` / ``projected_war``
+    # are the engine's projection at rec time, used as the regression
+    # baseline. ``factor_snapshot_json`` is the canonical contract written
+    # by recommendation_tracker.extract_factor_snapshot.
+    try:
+        cols = [row[1] for row in cursor.execute("PRAGMA table_info(recommendation_log)").fetchall()]
+        if 'factor_snapshot_json' not in cols:
+            cursor.execute("ALTER TABLE recommendation_log ADD COLUMN factor_snapshot_json TEXT")
+        if 'projected_meta' not in cols:
+            cursor.execute("ALTER TABLE recommendation_log ADD COLUMN projected_meta REAL")
+        if 'projected_war' not in cols:
+            cursor.execute("ALTER TABLE recommendation_log ADD COLUMN projected_war REAL")
+        if 'side' not in cols:
+            cursor.execute("ALTER TABLE recommendation_log ADD COLUMN side TEXT")
+    except Exception:
+        pass  # Table may not exist yet on fresh install
+
+    # Residual learner output (Stream C). One row per learner run; the
+    # latest row per (league_id, side) is what the UI renders. Stored as
+    # JSON blobs so the schema doesn't need to evolve as we add factors
+    # or interaction-mining heuristics. ``shadow_mode`` is True when the
+    # multipliers are reported but NOT fed back into meta_calibration —
+    # flips to False once the user opts in or sample size clears the gate.
+    cursor.executescript("""
+    CREATE TABLE IF NOT EXISTS rec_residual_calibration (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        league_id TEXT,
+        side TEXT NOT NULL,
+        n_observations INTEGER NOT NULL,
+        factor_calibration_json TEXT,
+        interaction_warnings_json TEXT,
+        diagnostics_json TEXT,
+        shadow_mode INTEGER DEFAULT 1
+    );
+    CREATE INDEX IF NOT EXISTS idx_rec_residual_recent
+        ON rec_residual_calibration(side, league_id, created_at DESC);
+    """)
 
     # Card-lookup indexes. Ingestion does name-based LIKE / exact matches
     # thousands of times per CSV; without these the inner loop is an O(N*M)
@@ -1592,6 +1716,82 @@ def init_db() -> None:
         WHERE DATE(snapshot_date) = (
             SELECT MAX(DATE(snapshot_date)) FROM team_lineup
         );
+
+    -- Per-league meta surface (UAT 2026-04-25 §4 / Tier-2 #5).
+    -- ``cards.meta_score_pitching`` and ``cards.meta_score_batting`` are
+    -- single global values, computed under the active-league weights at
+    -- recalc time. With per-league calibration in ``meta_calibration``
+    -- (``pitching:lb122``, ``pitching:lb124``...) we now have weights
+    -- that differ across tiers — and therefore meta scores that should
+    -- differ. This table caches per-tier meta scores so the optimizer
+    -- can rank cards using the league/tier the user has selected.
+    --
+    -- Populated by ``meta_scoring.recalc_meta_scores_per_league(league_id)``
+    -- (one row per card per league per side). A card with no row in
+    -- this table for the chosen league falls back to ``cards.meta_score_*``
+    -- via ``meta_scoring.get_meta_for_league``.
+    CREATE TABLE IF NOT EXISTS card_meta_by_league (
+        card_id INTEGER NOT NULL,
+        league_id TEXT NOT NULL,
+        side TEXT NOT NULL CHECK (side IN ('batting', 'pitching')),
+        meta_score REAL NOT NULL,
+        weight_source TEXT,                  -- 'pitching:lb122' / 'batting' / etc.
+        recalc_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (card_id, league_id, side),
+        FOREIGN KEY (card_id) REFERENCES cards(card_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_cmbl_card_league
+        ON card_meta_by_league(card_id, league_id);
+
+    -- Snapshot-dedup views (UAT 2026-04-25 §5.4 / Tier-2 #10): each card_id
+    -- can have many rows in batting_stats / pitching_stats — one per
+    -- (league_id, jersey_number, snapshot_date). Naive joins fan that
+    -- multiplication out across dependent tables. These views project to
+    -- the latest snapshot per (card_id, league_id, jersey_number) — i.e.
+    -- the most recent stat-line for each (card, team-instance, league).
+    --
+    -- IMPORTANT: jersey# IS in the dedup key on purpose. Multiple teams
+    -- in the same league can own the same card (e.g. Aranda owned by
+    -- Vancouver, Toronto, and EyeBeez — three rows under one league at
+    -- the same snapshot, distinguished only by jersey#). Collapsing them
+    -- would discard real per-team data and bias the user's view toward
+    -- whichever team happened to have the highest PA/IP. Historical
+    -- snapshots are still preserved in the base table; this view just
+    -- picks the most recent one per team-instance.
+    --
+    -- Consumers that want the league-wide picture should aggregate across
+    -- jersey# explicitly (or sum). Consumers wanting "this card on this
+    -- team" should filter on jersey_number. The page's
+    -- ``_load_latest_perf_stats`` already does this for the user's team.
+    DROP VIEW IF EXISTS batting_stats_latest;
+    CREATE VIEW batting_stats_latest AS
+        SELECT bs.* FROM batting_stats bs
+        INNER JOIN (
+            SELECT card_id, league_id, jersey_number,
+                   MAX(snapshot_date) AS max_date
+            FROM batting_stats
+            WHERE card_id IS NOT NULL
+            GROUP BY card_id, league_id, jersey_number
+        ) latest
+          ON bs.card_id = latest.card_id
+         AND IFNULL(bs.league_id, '') = IFNULL(latest.league_id, '')
+         AND IFNULL(bs.jersey_number, -1) = IFNULL(latest.jersey_number, -1)
+         AND bs.snapshot_date = latest.max_date;
+
+    DROP VIEW IF EXISTS pitching_stats_latest;
+    CREATE VIEW pitching_stats_latest AS
+        SELECT ps.* FROM pitching_stats ps
+        INNER JOIN (
+            SELECT card_id, league_id, jersey_number,
+                   MAX(snapshot_date) AS max_date
+            FROM pitching_stats
+            WHERE card_id IS NOT NULL
+            GROUP BY card_id, league_id, jersey_number
+        ) latest
+          ON ps.card_id = latest.card_id
+         AND IFNULL(ps.league_id, '') = IFNULL(latest.league_id, '')
+         AND IFNULL(ps.jersey_number, -1) = IFNULL(latest.jersey_number, -1)
+         AND ps.snapshot_date = latest.max_date;
     """)
 
     conn.commit()

@@ -454,7 +454,7 @@ def _fetch_latest_pitching_stats(conn, league_id, min_ip=50, role_filter=None):
     rows = conn.execute("""
         SELECT c.card_id, c.pitcher_role_name, c.pitcher_role,
                c.stuff, c.movement, c.control, c.p_hr,
-               ps.ip, ps.war, ps.era_plus
+               ps.ip, ps.war, ps.era_plus, ps.fip
         FROM cards c
         INNER JOIN pitching_stats ps ON ps.card_id = c.card_id
         INNER JOIN (
@@ -522,6 +522,69 @@ def _pairs_pitching(rows):
     return pairs, weights
 
 
+def _pairs_pitching_ensemble(rows):
+    """Pitching ensemble target: z(WAR/200IP) - z(FIP).
+
+    UAT 2026-04-25 §4: Stuff dominates the WAR-only fit because WAR
+    rewards strikeouts, but run prevention at higher tiers is closer
+    to a FIP problem. This blended target standardizes both signals to
+    z-scores within the sample and combines them with equal weight,
+    so calibration must explain BOTH "ranks-by-WAR" and "suppresses-runs"
+    to earn weight. The result is a calibration that doesn't reward
+    pure-K stuff at the expense of command-and-control profiles.
+
+    Returns ``(pairs, weights, anchors)`` where anchors is the
+    per-target mean/std so the fit can be reported in a comparable
+    scale. Skips rows missing either WAR or FIP (FIP is universally
+    populated in this DB so the skip rate is essentially zero).
+    """
+    war_target = []
+    fip_target = []
+    rows_kept = []
+    weights_raw = []
+    for r in rows:
+        ip = float(r.get('ip') or 0)
+        war = r.get('war')
+        fip = r.get('fip')
+        if ip <= 0 or war is None or fip is None:
+            continue
+        try:
+            fip_f = float(fip)
+        except (ValueError, TypeError):
+            continue
+        if fip_f <= 0 or fip_f > 15:
+            continue  # implausible FIP — skip
+        war_target.append(float(war) * 200.0 / ip)
+        fip_target.append(fip_f)
+        rows_kept.append(r)
+        weights_raw.append(np.sqrt(ip))
+
+    if len(rows_kept) < 5:
+        return [], [], None
+
+    war_arr = np.asarray(war_target)
+    fip_arr = np.asarray(fip_target)
+
+    war_mean, war_std = float(war_arr.mean()), float(war_arr.std() or 1.0)
+    fip_mean, fip_std = float(fip_arr.mean()), float(fip_arr.std() or 1.0)
+    if war_std <= 1e-9 or fip_std <= 1e-9:
+        return [], [], None
+
+    # Equal-weight ensemble: WAR z-score minus FIP z-score (FIP is
+    # negative-direction — lower is better — so we subtract).
+    z_war = (war_arr - war_mean) / war_std
+    z_fip = (fip_arr - fip_mean) / fip_std
+    blended = (z_war - z_fip)
+
+    pairs = list(zip(rows_kept, blended.tolist()))
+    anchors = {
+        'war_mean': war_mean, 'war_std': war_std,
+        'fip_mean': fip_mean, 'fip_std': fip_std,
+        'target_kind': 'ensemble_z_war_minus_z_fip',
+    }
+    return pairs, weights_raw, anchors
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Category fits
 # ══════════════════════════════════════════════════════════════════════════
@@ -562,6 +625,66 @@ def calibrate_batting(conn, league_id=None, prior_weights=None):
 
     result['league_id'] = league_id
     result['target'] = 'WAR_per_600_PA'
+    return result
+
+
+def calibrate_pitching_ensemble(conn, league_id=None, role_filter=None,
+                                  prior_weights=None):
+    """Fit pitching weights against the WAR + FIP ensemble target.
+
+    Same loader and feature set as ``calibrate_pitching`` but the target
+    is z(WAR/200IP) - z(FIP) — see ``_pairs_pitching_ensemble`` for
+    rationale. Stored in ``meta_calibration`` under ``pitching_ensemble``
+    (combined) or ``pitching_ensemble:<league>`` (per-tier) so the
+    calibration loader can prefer this row over the WAR-only one when
+    the user wants run-prevention-aware weights.
+
+    Designed to be a strict superset of ``calibrate_pitching`` for
+    persistence: same role filter, same IP gates, same sanity clips.
+    """
+    league_id = league_id or _current_league_id()
+    if prior_weights is None:
+        try:
+            cfg = load_config()
+            prior_weights = cfg.get('pitching_weights', DEFAULT_PITCHING_WEIGHTS)
+        except Exception:
+            prior_weights = DEFAULT_PITCHING_WEIGHTS
+
+    if role_filter == 'RP':
+        min_ip = 40
+    elif role_filter == 'SP':
+        min_ip = 50
+    else:
+        min_ip = 30
+    rows = _fetch_latest_pitching_stats(conn, league_id, min_ip=min_ip,
+                                        role_filter=role_filter)
+    pairs, sample_weights, anchors = _pairs_pitching_ensemble(rows)
+    if not pairs or len(pairs) < MIN_PITCHING_N:
+        return {
+            'error': f'Only {len(pairs)} pitchers ({role_filter or "all"}) '
+                     f'with WAR+FIP+IP in {league_id} (need ≥{MIN_PITCHING_N}).',
+            'sample_size': len(pairs),
+            'league_id': league_id,
+            'role_filter': role_filter or 'all',
+        }
+
+    full_features = _full_feature_names(PITCHING_FEATURES, PITCHING_INTERACTIONS)
+    X, y, w = _build_design_matrix(pairs, PITCHING_FEATURES, PITCHING_INTERACTIONS,
+                                    weights=sample_weights)
+    result = _fit_weights(X, y, full_features, prior_weights, MIN_PITCHING_N,
+                          sample_weights=w)
+    if result is None:
+        return {
+            'error': 'Ridge/NNLS fit failed (ensemble)',
+            'sample_size': len(pairs),
+            'league_id': league_id,
+            'role_filter': role_filter or 'all',
+        }
+
+    result['league_id'] = league_id
+    result['target'] = anchors.get('target_kind', 'ensemble')
+    result['target_anchors'] = anchors
+    result['role_filter'] = role_filter or 'all'
     return result
 
 
@@ -743,6 +866,22 @@ def run_calibration(conn=None, league_id=None):
             _save_calibration(conn, 'pitching', combined_fit, events)
         summary['pitching'] = combined_fit
 
+        # ── Ensemble target (UAT 2026-04-25 §4 / Tier-2 #6) ──
+        # WAR rewards strikeouts → Stuff dominates the WAR-only fit.
+        # Adding -FIP as a co-target forces calibration to satisfy run
+        # prevention as well. The ensemble row is stored alongside the
+        # WAR-only row so callers can A/B them, and the calibration
+        # loader prefers ensemble when it clears the gate.
+        ensemble_fit = calibrate_pitching_ensemble(
+            conn, league_id=league_id, role_filter=None, prior_weights=prior_pit
+        )
+        if 'error' not in ensemble_fit:
+            clipped, events = _sanity_clip(ensemble_fit['weights'], prior_pit)
+            ensemble_fit['weights'] = clipped
+            ensemble_fit['sanity_clip_events'] = events
+            _save_calibration(conn, 'pitching_ensemble', ensemble_fit, events)
+        summary['pitching_ensemble'] = ensemble_fit
+
         # ══ Per-league fits (Epic G, 2026-04-24) ══
         # Cross-league residuals between lb124 and i76 are opposite-signed,
         # so pooled weights under-fit both leagues. We fit each qualifying
@@ -786,9 +925,36 @@ def run_calibration(conn=None, league_id=None):
                 per['pitching'] = lpf
             except Exception as _e:
                 per['pitching'] = {'error': str(_e)}
+            # Ensemble (WAR + FIP) per league — UAT 2026-04-25 Tier-2 #6.
+            try:
+                lpef = calibrate_pitching_ensemble(
+                    conn, league_id=lg, role_filter=None, prior_weights=prior_pit,
+                )
+                if 'error' not in lpef:
+                    clipped, events = _sanity_clip(lpef['weights'], prior_pit)
+                    lpef['weights'] = clipped
+                    lpef['sanity_clip_events'] = events
+                    _save_calibration(conn, f'pitching_ensemble:{lg}', lpef, events)
+                per['pitching_ensemble'] = lpef
+            except Exception as _e:
+                per['pitching_ensemble'] = {'error': str(_e)}
             summary['per_league'][lg] = per
 
         conn.commit()
+
+        # ── Residual learner (Stream C, shadow mode) ──
+        # Mines per-rec residuals from recommendation_log + backtest outcomes
+        # so the UI can show "factor X is over-predicting by Y σ per point".
+        # Strictly orthogonal to the WAR-vs-rating fit above; failure here
+        # MUST NOT break the calibration run. Output is reported only — it
+        # does not feed back into weights.
+        try:
+            from app.core.rec_residual_learner import run_residual_analysis_all
+            summary['residual_analysis'] = run_residual_analysis_all(conn)
+        except Exception as _res_err:
+            logger.warning("residual analysis failed (non-fatal): %s", _res_err)
+            summary['residual_analysis'] = {'error': str(_res_err)}
+
         summary['finished_at'] = datetime.now().isoformat()
         return summary
     finally:

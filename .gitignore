@@ -34,6 +34,12 @@ data/backups/
 # Local user notes (Word docs from planning sessions, etc.)
 *.docx
 
+# UAT report exports — the .md source lives in docs/, the PDF is a local copy
+UAT_*.pdf
+
+# Runtime snapshot dumps (large + user-specific)
+data/snapshots/
+
 # Config (contains API keys)
 config.yaml
 

@@ -9,10 +9,26 @@ Output slider positions are 0-100 to match OOTP's slider range:
   50  = neutral
   100 = hard-right label (e.g. "Frequently", "Slow", "Aggressive", "Prefer")
 
-The top 8 sliders with the highest-confidence recommendations are returned.
+UAT 2026-04-25 user feedback: cover EVERY slider OOTP exposes, not just
+the top 8 by impact. The user wants a 1:1 mapping with the in-game
+Strategy screen so they can mirror our recs directly.
+
+Coverage map (✓ = implemented):
+  Offensive:           Stealing Bases ✓, Base-Running ✓, Use Hit & Run ✓,
+                       Sacrifice Bunt ✓, Use Squeeze Bunt Play ✓,
+                       Bunt for Hit ✓
+  Pitching/Defensive:  Pitch Around ✓, Intentional Walk ✓, Hold Runners ✓,
+                       Play Infield In ✓, Play Corners In ✓, Guard Lines ✓,
+                       Use Infield Shifts ✓, Use Outfield Shifts ✓,
+                       Shift OF Depth ✓
+  Substitution:        Hook Starting Pitchers ✓, Hook Relievers ✓,
+                       L/R Pitching Matchups ✓, L/R Batting Matchups ✓,
+                       Pinch-Hit for Position Players ✓, Use Pinch Runners ✓
+
 Each recommendation includes:
   - key         slider id (matches OOTP label)
   - label       display label
+  - section     "Offensive" / "Pitching" / "Substitution"
   - position    0-100
   - bucket      "Never" / "Rarely" / "Normal" / "Frequently" / etc.
   - reason      one-line justification keyed to roster data
@@ -148,6 +164,54 @@ def recommend_strategy(
             'impact': abs(pos - 50) * 0.7,  # less impactful than stealing
         })
 
+    # 4b) Squeeze Bunt Play — same logic as sacrifice bunt but tied to
+    # team contact (need to lay it down) AND speed (runner from 3rd has
+    # to score). Low power + high contact + decent speed → use it.
+    if active_batters:
+        pwr = _avg([_safe(b.get('power')) for b in active_batters])
+        con = _avg([_safe(b.get('contact')) for b in active_batters])
+        spd = _avg([_safe(b.get('speed')) for b in active_batters])
+        # Low power AND high contact AND speed — small ball squeeze
+        if pwr < 65 and con > 70 and spd > 55:
+            pos = 70
+        elif pwr >= 75:
+            pos = 5  # power team — never squeeze
+        else:
+            pos = 30
+        recs.append({
+            'key': 'squeeze_bunt',
+            'label': 'Use Squeeze Bunt Play',
+            'section': 'Offensive',
+            'position': pos,
+            'bucket': _bucket_by_position(pos, OFFENSE_LABELS_5),
+            'reason': f"Team power {pwr:.0f}/contact {con:.0f}/speed {spd:.0f}",
+            'impact': abs(pos - 50) * 0.4,
+        })
+
+    # 4c) Bunt for Hit — speed + bunt-for-hit skill drives this. The
+    # per-player overrides handle individual cases; the team default
+    # leans toward "Often" only when the lineup has multiple speed +
+    # bunt-skill combos.
+    if active_batters:
+        spd = _avg([_safe(b.get('speed')) for b in active_batters])
+        bnh = _avg([_safe(b.get('bunt_for_hit')) for b in active_batters])
+        # spd 70+ AND bnh 65+ → Often (70). Otherwise Rarely.
+        if spd >= 70 and bnh >= 65:
+            pos = 70
+        elif spd <= 45:
+            pos = 10
+        else:
+            pos = 35
+        recs.append({
+            'key': 'bunt_for_hit',
+            'label': 'Bunt for Hit',
+            'section': 'Offensive',
+            'position': pos,
+            'bucket': _bucket_by_position(pos, OFFENSE_LABELS_5),
+            'reason': f"Team speed {spd:.0f}/bunt-for-hit {bnh:.0f}",
+            'impact': abs(pos - 50) * 0.4,
+        })
+
     # ────────────────────────────────────────────────────────────
     # PITCHING & DEFENSIVE STRATEGY
     # ────────────────────────────────────────────────────────────
@@ -156,19 +220,185 @@ def recommend_strategy(
     catchers = [b for b in active_batters if (b.get('position') or '').upper() == 'C']
     if catchers:
         arm = _avg([_safe(c.get('catcher_arm')) for c in catchers])
-        # High arm → less need to hold (runners already deterred by catcher)
-        # Low arm → Hold more to compensate
+        # arm 100 → pos 50 (Normal); arm 50 → pos 100 (Frequently); arm 130 → pos 20 (Rarely)
         pos = max(0, min(100, 110 - (arm - 40)))
+        if arm >= 95:
+            tail = "elite arm, let them run"
+        elif arm >= 75:
+            tail = "above-avg arm, normal hold"
+        elif arm >= 55:
+            tail = "average arm, hold more"
+        else:
+            tail = "weak arm, hold often"
         recs.append({
             'key': 'hold_runners',
             'label': 'Hold Runners',
             'section': 'Pitching',
             'position': pos,
             'bucket': _bucket_by_position(pos, OFFENSE_LABELS_5),
-            'reason': f"Catcher arm {arm:.0f} — "
-                      + ("weak arm, hold more" if pos > 50 else "strong arm, let them run"),
+            'reason': f"Catcher arm {arm:.0f} — {tail}",
             'impact': abs(pos - 50) * 0.6,
         })
+
+    # 5b) Pitch Around — only safe with high control. Recommend pitching
+    # around dangerous hitters more often when YOUR pitchers can hit
+    # spots without walking the next batter into trouble.
+    if active_pitchers:
+        ctrl = _avg([_safe(p.get('control')) for p in active_pitchers])
+        # ctrl 75+ → Often (70); ctrl 50- → Never (10); 50-75 linear.
+        pos = max(0, min(100, (ctrl - 50) / 30 * 70))
+        recs.append({
+            'key': 'pitch_around',
+            'label': 'Pitch Around',
+            'section': 'Pitching',
+            'position': pos,
+            'bucket': _bucket_by_position(pos, OFFENSE_LABELS_5),
+            'reason': f"Staff control {ctrl:.0f} — "
+                      + ("trust the command" if pos > 50
+                         else "can't afford the walk"),
+            'impact': abs(pos - 50) * 0.5,
+        })
+
+    # 5c) Intentional Walk — also control-driven but more conservative
+    # than Pitch Around. Default Normal unless control is very high or
+    # very low.
+    if active_pitchers:
+        ctrl = _avg([_safe(p.get('control')) for p in active_pitchers])
+        if ctrl >= 78:
+            pos = 60   # plus-command staff can spot the IBB
+        elif ctrl <= 50:
+            pos = 25   # poor command — walking on purpose costs runs
+        else:
+            pos = 45   # default Normal-ish
+        recs.append({
+            'key': 'intentional_walk',
+            'label': 'Intentional Walk',
+            'section': 'Pitching',
+            'position': pos,
+            'bucket': _bucket_by_position(pos, OFFENSE_LABELS_5),
+            'reason': f"Staff control {ctrl:.0f}",
+            'impact': abs(pos - 50) * 0.4,
+        })
+
+    # 5d) Play Infield In — situational defensive aggression. Helped by
+    # strong infield arm (throw runner out at home) and high range
+    # (recover from in-pulled position). Weak infield → don't risk it.
+    if active_batters:
+        infielders = [b for b in active_batters
+                       if (b.get('position') or '').upper() in ('1B', '2B', 'SS', '3B')]
+        if infielders:
+            inf_arm = _avg([_safe(b.get('infield_arm')) for b in infielders])
+            inf_rng = _avg([_safe(b.get('infield_range')) for b in infielders])
+            comp = (inf_arm + inf_rng) / 2
+            # comp 70+ → Frequently (75); 45- → Rarely (25)
+            pos = max(0, min(100, (comp - 45) / 30 * 60 + 25))
+            recs.append({
+                'key': 'play_infield_in',
+                'label': 'Play Infield In',
+                'section': 'Pitching',
+                'position': pos,
+                'bucket': _bucket_by_position(pos, OFFENSE_LABELS_5),
+                'reason': f"Infield arm {inf_arm:.0f}/range {inf_rng:.0f}",
+                'impact': abs(pos - 50) * 0.4,
+            })
+
+            # 5e) Play Corners In — same signal but only weighs 1B/3B arm.
+            corners = [b for b in active_batters
+                        if (b.get('position') or '').upper() in ('1B', '3B')]
+            if corners:
+                c_arm = _avg([_safe(b.get('infield_arm')) for b in corners])
+                pos = max(0, min(100, (c_arm - 45) / 30 * 60 + 25))
+                recs.append({
+                    'key': 'play_corners_in',
+                    'label': 'Play Corners In',
+                    'section': 'Pitching',
+                    'position': pos,
+                    'bucket': _bucket_by_position(pos, OFFENSE_LABELS_5),
+                    'reason': f"Corner-INF arm {c_arm:.0f}",
+                    'impact': abs(pos - 50) * 0.3,
+                })
+
+    # 5f) Guard Lines — usually situational; default Normal. Tilt
+    # toward "Frequently" only when corner infielders have weak range
+    # (can't recover from a line drive without help).
+    if active_batters:
+        corners = [b for b in active_batters
+                    if (b.get('position') or '').upper() in ('1B', '3B')]
+        if corners:
+            c_rng = _avg([_safe(b.get('infield_range')) for b in corners])
+            # rng 70+ → Rarely (30); rng 45- → Frequently (75)
+            pos = max(0, min(100, 110 - c_rng))
+            recs.append({
+                'key': 'guard_lines',
+                'label': 'Guard Lines',
+                'section': 'Pitching',
+                'position': pos,
+                'bucket': _bucket_by_position(pos, OFFENSE_LABELS_5),
+                'reason': f"Corner-INF range {c_rng:.0f}",
+                'impact': abs(pos - 50) * 0.25,
+            })
+
+    # 5g) Use Infield Shifts — modern analytics default Frequently.
+    # Tilt toward "Always" when infielders have the range to get back
+    # in time; pull back if range is poor (defensive-OOM risk).
+    if active_batters:
+        infielders = [b for b in active_batters
+                       if (b.get('position') or '').upper() in ('1B', '2B', 'SS', '3B')]
+        if infielders:
+            inf_rng = _avg([_safe(b.get('infield_range')) for b in infielders])
+            # rng 70+ → Frequently (85); 50- → Rarely (30)
+            pos = max(0, min(100, (inf_rng - 50) / 30 * 60 + 30))
+            recs.append({
+                'key': 'infield_shifts',
+                'label': 'Use Infield Shifts',
+                'section': 'Pitching',
+                'position': pos,
+                'bucket': _bucket_by_position(pos, OFFENSE_LABELS_5),
+                'reason': f"Infield range {inf_rng:.0f} — "
+                          + ("rangy fielders, shift away" if pos > 50
+                             else "limited range, stay home"),
+                'impact': abs(pos - 50) * 0.4,
+            })
+
+    # 5h) Use Outfield Shifts — same idea on OF range.
+    if active_batters:
+        outfielders = [b for b in active_batters
+                        if (b.get('position') or '').upper() in ('LF', 'CF', 'RF')]
+        if outfielders:
+            of_rng = _avg([_safe(b.get('of_range')) for b in outfielders])
+            pos = max(0, min(100, (of_rng - 50) / 30 * 60 + 30))
+            recs.append({
+                'key': 'outfield_shifts',
+                'label': 'Use Outfield Shifts',
+                'section': 'Pitching',
+                'position': pos,
+                'bucket': _bucket_by_position(pos, OFFENSE_LABELS_5),
+                'reason': f"OF range {of_rng:.0f}",
+                'impact': abs(pos - 50) * 0.3,
+            })
+
+            # 5i) Shift OF Depth — default Normal. Tilt deep when OF arm
+            # is weak (can't throw from shallow); shallow when OF range
+            # is great + opposing power is unknown (default to data).
+            of_arm = _avg([_safe(b.get('of_arm')) for b in outfielders])
+            if of_arm <= 50:
+                pos = 70   # shift deep — weak arm, want to keep balls in front
+                reason = f"OF arm {of_arm:.0f} — shift deeper to keep balls in front"
+            elif of_rng >= 75:
+                pos = 35   # play shallow — speed makes up for it
+                reason = f"OF range {of_rng:.0f} — play shallow, run things down"
+            else:
+                pos = 50
+                reason = f"OF range {of_rng:.0f}/arm {of_arm:.0f} — neutral"
+            recs.append({
+                'key': 'of_depth',
+                'label': 'Shift OF Depth',
+                'section': 'Pitching',
+                'position': pos,
+                'bucket': _bucket_by_position(pos, OFFENSE_LABELS_5),
+                'reason': reason,
+                'impact': abs(pos - 50) * 0.3,
+            })
 
     # ────────────────────────────────────────────────────────────
     # SUBSTITUTION STRATEGY
@@ -196,6 +426,34 @@ def recommend_strategy(
                          else "— balanced"),
             'impact': abs(pos - 50),
         })
+
+    # 6b) Hook Relievers — driven by bullpen depth. Many high-meta RPs
+    # → quick hook (always have a fresh arm). Thin bullpen → slow hook
+    # (can't afford to burn arms early).
+    if bullpen_pitchers:
+        bp_metas = sorted(
+            [_safe(p.get('meta_score_pitching') or p.get('meta_score'))
+             for p in bullpen_pitchers],
+            reverse=True,
+        )
+        # Top 3 RPs vs bottom RPs — wider gap means deeper pen
+        top3 = _avg(bp_metas[:3]) if len(bp_metas) >= 3 else _avg(bp_metas)
+        bot = _avg(bp_metas[-2:]) if len(bp_metas) >= 5 else top3
+        # gap > 100 → Quick (deep pen); gap < 30 → Slow (only 2-3 trusted arms)
+        if top3 > 0 and bot > 0:
+            gap = top3 - bot
+            pos = max(0, min(100, 80 - (gap - 30) * 0.7))
+            recs.append({
+                'key': 'hook_rp',
+                'label': 'Hook Relievers',
+                'section': 'Substitution',
+                'position': pos,
+                'bucket': _bucket_by_position(pos, HOOK_LABELS),
+                'reason': f"BP top-3 meta {top3:.0f} vs bottom {bot:.0f} — "
+                          + ("deep pen, quick hook" if pos < 50
+                             else "thin pen, ride starters"),
+                'impact': abs(pos - 50) * 0.6,
+            })
 
     # 7) L/R Pitching Matchups — if platoon split variance in bullpen is big
     if bullpen_pitchers and len(bullpen_pitchers) >= 3:
@@ -280,9 +538,12 @@ def recommend_strategy(
             'impact': abs(pos - 50) * 0.5,
         })
 
-    # Sort by impact descending and return top 8
-    recs.sort(key=lambda r: -r['impact'])
-    return recs[:8]
+    # Order by section first, then by impact within each section. Returns
+    # ALL recommendations — the user explicitly wants every OOTP slider
+    # surfaced so the in-game Strategy screen can be mirrored 1:1.
+    section_order = {'Offensive': 0, 'Pitching': 1, 'Substitution': 2}
+    recs.sort(key=lambda r: (section_order.get(r['section'], 99), -r['impact']))
+    return recs
 
 
 # ════════════════════════════════════════════════════════════════════

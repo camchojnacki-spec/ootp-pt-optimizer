@@ -118,15 +118,29 @@ def _do_refresh() -> dict:
             # didn't exist; each run was a full DELETE+INSERT cycle on
             # tables like batting_stats. With the filter, a "nothing new"
             # poll becomes a no-op.
+            # Per-file actionable filter (UAT 2026-04-25 user feedback).
+            # Compare each file's mtime against its OWN last_import
+            # (filename-keyed) instead of the type's aggregated
+            # last_import. Sibling files like _overview_default.csv vs
+            # _overview_batting_stats_1.csv share file_type=lineup_overview
+            # so the type-level filter falsely dedups them. Per-file
+            # comparison fixes "I re-saved _default.csv but it didn't
+            # re-ingest" by tracking each file independently.
+            def _file_is_fresh(d):
+                stamp = d.last_import_for_file or d.last_import
+                if stamp is None:
+                    return True  # never ingested
+                if not d.modified:
+                    return False
+                return d.modified > stamp
+
             actionable = [
                 d for d in plan.files
-                if d.file_type and not d.will_skip
-                and (d.last_import is None or (d.modified and d.modified > d.last_import))
+                if d.file_type and not d.will_skip and _file_is_fresh(d)
             ]
             skipped_unchanged = sum(
                 1 for d in plan.files
-                if d.file_type and not d.will_skip
-                and d.last_import is not None and d.modified and d.modified <= d.last_import
+                if d.file_type and not d.will_skip and not _file_is_fresh(d)
             )
             if skipped_unchanged:
                 logger.info("Worker skipped %d unchanged files", skipped_unchanged)
@@ -228,6 +242,32 @@ def _do_refresh() -> dict:
             logger.exception("derived_stats rebuild failed")
             err = f"derived rebuild: {e}"
             summary['error'] = err if not summary['error'] else summary['error'] + '; ' + err
+
+        # Per-league meta recalc (UAT 2026-04-25 #5). Refreshes
+        # ``card_meta_by_league`` for every active tier so the optimizer
+        # page doesn't have to wait for the user to click the recalc
+        # button after fresh data lands. Cheap (~0.2s per league on the
+        # current DB) so it's safe to run every refresh.
+        try:
+            _update_status(status='recalc', last_message='Per-league meta recalc…')
+            from app.core.database import get_connection as _gc_pl
+            from app.core.meta_scoring import recalc_meta_scores_per_league
+            _conn_pl = _gc_pl()
+            try:
+                _leagues = [r[0] for r in _conn_pl.execute(
+                    "SELECT DISTINCT league_id FROM batting_stats "
+                    "WHERE league_id IS NOT NULL"
+                ).fetchall() if r[0]]
+            finally:
+                _conn_pl.close()
+            for lg in _leagues:
+                try:
+                    recalc_meta_scores_per_league(lg, only_owned=False)
+                except Exception:
+                    logger.exception("per-league recalc failed for %s", lg)
+            logger.info("per-league meta recalc done for %d tiers", len(_leagues))
+        except Exception as e:
+            logger.exception("per-league meta recalc orchestration failed")
 
         # New-card intake — any owned cards not yet tracked get an intake
         # row + a pending recommendation_log entry, which the council

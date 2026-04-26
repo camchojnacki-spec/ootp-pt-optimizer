@@ -251,6 +251,188 @@ conn = get_connection()  # auto-syncs roster.meta_score from cards on first call
 config = load_config()
 budget = config.get('pp_budget', 500)
 
+# ── Per-page league override (UAT 2026-04-25 Tier-1 #1) ──────────────────
+# OOTP PT runs a tier-ladder: each league represents a difficulty level
+# (Bronze, Silver, Gold, Iron, Diamond...) and resets every offseason —
+# teams that win in lower tiers progress up, so the population of
+# opposing batters/pitchers in a given league is a function of how
+# rated talent has been distributed in that tier this season.
+#
+# Same roster can live in multiple tiers simultaneously (the UAT case:
+# TDK in BOTH lb124 Bronze AND lb122 — ERA jumps from 3.92 → 5.25
+# because lb122's population of opposing hitters is harder). The card's
+# raw rating profile is fixed but its real production curve depends on
+# tier: Stuff-heavy / Control-thin pitchers fade as tier difficulty
+# rises, Stuff-light / Control-elite cards hold up. Per-league
+# calibration weights (already stored in ``meta_calibration`` under
+# keys like ``pitching:lb122``) capture that.
+#
+# This block surfaces the tier selector at the top of the sidebar so
+# the entire page (perf overlays, calibration weights, recent-form,
+# regression scans, hot/cold panel, optimizer recommendations) follows
+# the user's choice of which league/tier to optimize for. Mechanism:
+# write the picked league into ``st.session_state``, then call
+# ``set_active_league_override`` on every rerun so meta_scoring's
+# calibration loader picks up the per-league weights row.
+# Falls back to the config.yaml value when the user hasn't overridden.
+try:
+    _league_rows = conn.execute(
+        "SELECT DISTINCT league_id FROM batting_stats "
+        "WHERE league_id IS NOT NULL "
+        "UNION SELECT DISTINCT league_id FROM pitching_stats "
+        "WHERE league_id IS NOT NULL "
+        "ORDER BY 1"
+    ).fetchall()
+    _available_leagues = [r[0] for r in _league_rows if r[0]]
+except Exception:
+    _available_leagues = []
+_config_league = config.get('active_league')
+if _config_league and _config_league not in _available_leagues:
+    _available_leagues = [_config_league] + _available_leagues
+if not _available_leagues:
+    _available_leagues = [_config_league] if _config_league else []
+
+with st.sidebar:
+    st.markdown("**Active league**")
+    _saved_league = st.session_state.get('_optimizer_league_override') or _config_league
+    if _saved_league not in _available_leagues and _available_leagues:
+        _saved_league = _available_leagues[0]
+    _league_choice = st.selectbox(
+        "League to optimize for",
+        options=_available_leagues or ['(none)'],
+        index=(_available_leagues.index(_saved_league)
+               if _saved_league in _available_leagues else 0),
+        key='_optimizer_league_override_select',
+        help=(
+            "Switches the entire page — meta calibration, recent-form, "
+            "hot/cold panels, and regression scans — to evaluate against "
+            "this league's stats. Calibrated weights stored under "
+            "`meta_calibration.calibration_type='pitching:<league>'` get "
+            "picked up automatically. Default reads from config.yaml."
+        ),
+    )
+    if _league_choice and _league_choice != '(none)':
+        st.session_state['_optimizer_league_override'] = _league_choice
+        if _league_choice != _config_league:
+            st.caption(
+                f"⚠️ Overriding config.yaml ({_config_league}) "
+                f"→ {_league_choice}. Selector overrides this session only."
+            )
+
+# Apply override to meta_scoring so calibration row lookups for THIS page
+# use the selected league. Set every rerun (Streamlit re-imports modules
+# but module globals persist within a worker — explicit set keeps it
+# correct across page swaps).
+try:
+    from app.core.meta_scoring import set_active_league_override
+    set_active_league_override(
+        st.session_state.get('_optimizer_league_override') or _config_league
+    )
+except Exception:
+    pass
+
+# ── Per-league meta cache (UAT 2026-04-25 Tier-2 #5) ────────────────────
+# Each tier (lb124, lb122, i76...) has its own calibrated weights, so the
+# meta score of a card differs from tier to tier. ``card_meta_by_league``
+# caches one (card_id, league_id, side) row per tier — populated on
+# demand by ``recalc_meta_scores_per_league``. The button surfaces a
+# manual recalc; the badge shows whether the cache is fresh for the
+# current tier.
+_selected_league = (
+    st.session_state.get('_optimizer_league_override') or _config_league
+)
+_per_league_status = {'rows': 0, 'last_recalc': None}
+try:
+    _r = conn.execute(
+        "SELECT COUNT(*) AS rows, MAX(recalc_at) AS last_recalc "
+        "FROM card_meta_by_league WHERE league_id = ?",
+        (_selected_league,),
+    ).fetchone()
+    if _r:
+        _per_league_status['rows'] = _r['rows'] or 0
+        _per_league_status['last_recalc'] = _r['last_recalc']
+except Exception:
+    pass
+
+# Auto-recalc trigger: if the user switched leagues and the cache is
+# either empty or older than the latest meta_calibration row, run a
+# silent recalc so the page renders against fresh per-tier weights
+# without waiting for the user to click. The recalc itself is fast
+# (~0.2s on the current DB) so the UX cost is negligible.
+_should_auto_recalc = False
+try:
+    if _selected_league:
+        _last_cal = conn.execute(
+            "SELECT MAX(created_at) FROM meta_calibration "
+            "WHERE calibration_type LIKE 'pitching%' OR calibration_type LIKE 'batting%'"
+        ).fetchone()[0]
+        _last_recalc = _per_league_status.get('last_recalc')
+        if _per_league_status['rows'] == 0:
+            _should_auto_recalc = True
+        elif _last_cal and (not _last_recalc or _last_cal > _last_recalc):
+            _should_auto_recalc = True
+        # Also recalc if the user just switched leagues this session
+        _last_seen = st.session_state.get('_per_league_recalc_for')
+        if _last_seen != _selected_league:
+            _should_auto_recalc = True
+except Exception:
+    pass
+
+if _should_auto_recalc:
+    try:
+        from app.core.meta_scoring import recalc_meta_scores_per_league
+        recalc_meta_scores_per_league(_selected_league, conn=conn)
+        st.session_state['_per_league_recalc_for'] = _selected_league
+        # Refresh status for the badge below
+        _r = conn.execute(
+            "SELECT COUNT(*) AS rows, MAX(recalc_at) AS last_recalc "
+            "FROM card_meta_by_league WHERE league_id = ?",
+            (_selected_league,),
+        ).fetchone()
+        if _r:
+            _per_league_status['rows'] = _r['rows'] or 0
+            _per_league_status['last_recalc'] = _r['last_recalc']
+    except Exception:
+        pass
+
+with st.sidebar:
+    if _per_league_status['rows'] == 0:
+        st.caption(
+            f"📊 Per-tier meta for **{_selected_league}**: not yet computed. "
+            "Click below to score every card under this tier's weights."
+        )
+    else:
+        _last = _per_league_status['last_recalc'] or '?'
+        st.caption(
+            f"📊 Per-tier meta for **{_selected_league}**: "
+            f"{_per_league_status['rows']:,} cards cached · last "
+            f"recalc {_last}"
+        )
+    if st.button(
+        f"🔁 Recalc meta for {_selected_league}",
+        help=(
+            "Rescores every card using this tier's calibrated weights. "
+            "Stored in card_meta_by_league. Auto-runs on league switch "
+            "and after fresh calibrations; this button forces a manual "
+            "rerun if you suspect the cache is stale."
+        ),
+    ):
+        try:
+            from app.core.meta_scoring import recalc_meta_scores_per_league
+            with st.spinner(f"Scoring cards under {_selected_league}..."):
+                _recalc = recalc_meta_scores_per_league(_selected_league, conn=conn)
+            st.success(
+                f"✅ Recalc complete · "
+                f"{_recalc['batters_scored']} batters + "
+                f"{_recalc['pitchers_scored']} pitchers · "
+                f"weights: bat={_recalc['weight_metadata']['batting_source']}, "
+                f"SP={_recalc['weight_metadata']['sp_source']}, "
+                f"RP={_recalc['weight_metadata']['rp_source']}"
+            )
+            st.rerun()
+        except Exception as _re:
+            st.error(f"Recalc failed: {_re}")
+
 # ── Archetype / fit layer (project_attribute_mix_2026_04_20) ──
 # `card_archetypes` is rebuilt by the BG worker after each ingest. We use it
 # to show a Fit column alongside Meta and to surface mix-aligned replacements
@@ -525,7 +707,14 @@ with st.sidebar:
 # averages for the outlook driver pull from the CURRENT league's partition
 # (``config.active_league``), falling back to NULL if the league partition
 # hasn't been populated yet.
-_active_league_id = config.get('active_league')
+#
+# UAT 2026-04-25 Tier-1 #1: prefer the per-page league selector when the
+# user has overridden it (sidebar at top of page). Falls back to
+# ``config.yaml:active_league`` for callers that haven't surfaced a selector.
+_active_league_id = (
+    st.session_state.get('_optimizer_league_override')
+    or config.get('active_league')
+)
 
 # ── Cross-team confidence map (card_id → confidence dict) ──
 # Pulls stats from every team's instance of each roster card (e.g. other teams
@@ -976,10 +1165,31 @@ def _format_league_rel_line(
 # the card's own meta (new). Whichever is more permissive wins, so a small
 # card with an absolute 30-point gap still registers while a big card
 # avoids getting flagged "cold" for a -80 point gap that's only -10%.
-_DRIVER_GAP = 50            # meta points — minimum absolute gap
-_DRIVER_GAP_PCT = 0.12      # 12% of card meta — minimum relative gap
+#
+# 2026-04-25 (post-UAT): tightened from 50/0.12 to 35/0.08 so mediocre
+# starters in harder tiers don't slip through. The WAR-positive override
+# inside _analyze_perf_driver still rescues genuinely WAR-on-track
+# pitchers, so this tightening surfaces the cases where rate stats AND
+# WAR rate are both soft.
+_DRIVER_GAP = 35            # meta points — minimum absolute gap
+_DRIVER_GAP_PCT = 0.08      # 8% of card meta — minimum relative gap
 _BAT_DRIVER_PA_MIN = 50     # informational thresholds are lower than the old lock
 _PIT_DRIVER_IP_MIN = 15     # the numbers are labeled "low sample" not suppressed
+
+# Rate-stat underperformance thresholds — used by the Owned/Market
+# columns' "Optimal vs Underperforming" decision INDEPENDENTLY of the
+# perf-driver's gap analysis. These catch the case where a card's WAR
+# is positive (rescuing it from the perf-driver Cold flag) but its raw
+# rate stat is still mediocre — e.g. a 620-meta SP with 4.55 ERA and
+# 0.5 WAR/200. WAR says "fine"; ERA says "you're giving up runs."
+# Setting these tier-relative so a 4.55 ERA in lb124 (lg avg ~4.06)
+# crosses the threshold but a 4.55 ERA in lb122 (lg avg ~4.26) is
+# treated more leniently.
+_RATE_UNDERPERF_ERA_MULT = 1.10   # ERA > league_avg * 1.10 → cold rate
+_RATE_UNDERPERF_ERA_HARD = 4.75   # absolute ERA cutoff (regardless of league)
+_RATE_UNDERPERF_OPS_FLOOR = 85    # OPS+ < 85 → cold rate (15% below league)
+_RATE_UNDERPERF_PA_MIN = 80       # need at least 80 PA to trust an OPS+ flag
+_RATE_UNDERPERF_IP_MIN = 20       # 20 IP minimum to trust an ERA flag
 
 
 # ── Perf→meta anchor rescale (2026-04-17) ──
@@ -2328,6 +2538,7 @@ def _build_slot(pos_label, current_name, current_ovr, current_meta, owned_ups, m
         'current_count_elite': cur_arch.get('count_elite'),
         # Owned upgrade (free)
         'owned_name': bo['card_title'] if bo else None,
+        'owned_card_id': bo.get('card_id') if bo else None,
         'owned_ovr': bo.get('card_value') if bo else None,
         'owned_meta': owned_meta,
         'owned_delta': owned_delta,
@@ -2337,6 +2548,7 @@ def _build_slot(pos_label, current_name, current_ovr, current_meta, owned_ups, m
         'owned_archetype': owned_arch.get('archetype_name'),
         # Market upgrade (paid)
         'market_name': bm['card_title'] if bm else None,
+        'market_card_id': bm.get('card_id') if bm else None,
         'market_ovr': bm.get('card_value') if bm else None,
         'market_meta': market_meta,
         'market_delta': market_delta,
@@ -2639,24 +2851,35 @@ try:
     from app.core.recommendation_tracker import log_recommendations
     _engine_picks = []
     for _u in upgrade_plan:
+        # ``side`` drives the residual reinforcement loop: tracker reads it
+        # to pick the right explainer + stats table when auto-filling the
+        # factor snapshot. Pitcher slots are the only case where side is
+        # unambiguously 'pitching'; everything else is batting (DH included).
+        _u_side = 'pitching' if _u.get('pos') in ('SP', 'RP', 'CL') else 'batting'
         if _u.get('owned_name') and (_u.get('owned_delta') or 0) > 0:
             _engine_picks.append({
                 'pos': _u.get('pos'),
                 'action': 'Promote',
                 'card_name': _u.get('owned_name'),
+                'card_id': _u.get('owned_card_id'),
                 'current_name': _u.get('current_name'),
+                'current_card_id': _u.get('current_card_id'),
                 'expected_delta': _u.get('owned_delta'),
                 'reason': _u.get('owned_action') or 'engine: owned promotion',
+                'side': _u_side,
             })
         if _u.get('market_name') and (_u.get('market_delta') or 0) > 0:
             _engine_picks.append({
                 'pos': _u.get('pos'),
                 'action': 'Buy',
                 'card_name': _u.get('market_name'),
+                'card_id': _u.get('market_card_id'),
                 'current_name': _u.get('current_name'),
+                'current_card_id': _u.get('current_card_id'),
                 'cost': _u.get('market_price'),
                 'expected_delta': _u.get('market_delta'),
                 'reason': f"engine: market upgrade ({_u.get('market_price','?')} PP)",
+                'side': _u_side,
             })
     if _engine_picks:
         try:
@@ -2979,6 +3202,28 @@ if top_priorities:
                         st.success(f"📦 {short_name(u['owned_name'])}  **+{u['owned_delta']}** meta  •  {u['owned_action']}")
                     if u['market_name']:
                         st.warning(f"🛒 {short_name(u['market_name'])}  **+{u['market_delta']}** meta  •  {price_tag(u['market_price'])}")
+
+# ════════════════════════════════════════════════════════════════
+# FREE BULLPEN ROLE SWAPS — UAT 2026-04-25 Tier-2 #8
+# Surfaces in-house reassignments (e.g. promote highest-meta RP to CL)
+# that the optimizer used to miss because it locked cards into their
+# current role. Zero PP cost, immediate ERA impact.
+# ════════════════════════════════════════════════════════════════
+try:
+    from app.core.optimizer import recommend_role_reassignments as _rec_role_swaps
+    _role_swaps = _rec_role_swaps(conn)
+except Exception:
+    _role_swaps = []
+
+if _role_swaps:
+    with st.container(border=True):
+        st.markdown("**🔁 Free in-house role swaps** — change in OOTP, no PP cost:")
+        for s in sorted(_role_swaps, key=lambda x: -x.get('meta_gain', 0)):
+            st.markdown(
+                f"• {s['note']}  ·  **+{s['meta_gain']:.0f}** meta  ·  "
+                f"target slot: {s['position']}  ·  current: "
+                f"{s['current_player']} ({s['current_meta']:.0f})"
+            )
 
 # ════════════════════════════════════════════════════════════════
 # ROSTER MISMATCHES — compact warning
@@ -3311,13 +3556,42 @@ def build_chain_rows(positions_list, show_bats=False, show_perf=False,
         # pitchers.
         _bo_val = _observed_bo_by_name.get(u.get('current_name') or '', '') \
             if pos in ('C','1B','2B','3B','SS','LF','CF','RF','DH') else ''
+
+        # Meta column: prefer per-league when override is active and we
+        # have a recalced row for this card. The user's tier choice
+        # should drive what the column reflects.
+        _meta_display = u.get('current_meta') or 0
+        _meta_global = _meta_display
+        _meta_per_league = None
+        try:
+            cid = u.get('current_card_id') or u.get('card_id')
+            if (cid and _selected_league and
+                    _selected_league != _config_league):
+                _is_pit_meta = _is_pitching_pos(pos)
+                _side = 'pitching' if _is_pit_meta else 'batting'
+                _r = conn.execute(
+                    "SELECT meta_score FROM card_meta_by_league "
+                    "WHERE card_id = ? AND league_id = ? AND side = ?",
+                    (cid, _selected_league, _side),
+                ).fetchone()
+                if _r and _r[0] is not None:
+                    _meta_per_league = float(_r[0])
+                    _meta_display = _meta_per_league
+        except Exception:
+            pass
+
         row = {
             "Pos": pos_display,
             "Current": current_display,
             "BO": f"#{_bo_val}" if _bo_val else '',
             "OVR": int(ovr) if ovr else 0,
-            "Meta": u['current_meta'],
+            "Meta": int(round(_meta_display)),
         }
+        # When per-league override is active, also surface the global
+        # meta inline so the user can see the tier delta — formatted as
+        # "ΔNN" (negative when this tier is harder than the global fit).
+        if _meta_per_league is not None and abs(_meta_per_league - _meta_global) >= 5:
+            row["Δtier"] = int(round(_meta_per_league - _meta_global))
 
         # ── Fit column (attribute-mix layer, from card_archetypes) ──
         # Compact format: "72 · Power+AvoidK" — fit_score (0-100) + short
@@ -3455,6 +3729,129 @@ def build_chain_rows(positions_list, show_bats=False, show_perf=False,
         elif _pa and _pa.get('direction') == 'hot':
             _optimal_suffix = " · \U0001f525 riding hot"
 
+        # ── Underperformance gate (UAT 2026-04-25 user feedback) ──
+        # Two independent signals can flip a slot from "Optimal" to
+        # "Underperforming":
+        #   1. Gap-based  — the perf-driver flagged direction=cold
+        #      with verdict skill/mixed/small_sample AND gap ≤ -75.
+        #   2. Rate-based — raw ERA/OPS+ is below the tier-relative
+        #      threshold, EVEN IF the perf-driver rescued the gap via
+        #      its WAR-positive override. Catches the "WAR fine, ERA
+        #      4.55, you're still giving up runs" case the user flagged.
+        _is_underperforming = False
+        _underperf_gap = 0
+        _underperf_reason = ''
+
+        # Signal 1: gap-based (perf_meta vs card meta)
+        if _pa and _pa.get('direction') == 'cold':
+            _verdict = _pa.get('verdict') or ''
+            _gap = _pa.get('gap') or 0
+            if _verdict in ('skill', 'mixed', 'small_sample') and _gap <= -75:
+                _is_underperforming = True
+                _underperf_gap = _gap
+                _underperf_reason = 'gap'
+
+        # Signal 2: raw rate-stat (independent of gap, fires even when
+        # the perf-driver's WAR-positive override has rescued the slot)
+        if not _is_underperforming:
+            _name = u.get('current_name') or ''
+            _is_pit = _is_pitching_pos(u.get('pos') or '')
+            if _is_pit:
+                _ps = _perf_pit.get(_name) or {}
+                _era = _ps.get('era')
+                _ip = float(_ps.get('ip') or 0)
+                _lg_era = (_lg_pit or {}).get('era') or 4.00
+                if (_era is not None and _ip >= _RATE_UNDERPERF_IP_MIN and
+                        (_era >= _lg_era * _RATE_UNDERPERF_ERA_MULT
+                         or _era >= _RATE_UNDERPERF_ERA_HARD)):
+                    _is_underperforming = True
+                    _underperf_gap = -int(round((_era - _lg_era) * 50))
+                    _underperf_reason = f'ERA {_era:.2f} vs lg {_lg_era:.2f}'
+            else:
+                _bs = _perf_bat.get(_name) or {}
+                _opsp = _bs.get('ops_plus')
+                _pa_n = int(_bs.get('pa') or 0)
+                if (_opsp is not None and _pa_n >= _RATE_UNDERPERF_PA_MIN and
+                        _opsp < _RATE_UNDERPERF_OPS_FLOOR):
+                    _is_underperforming = True
+                    _underperf_gap = int(round((_opsp - 100) * 4))
+                    _underperf_reason = f'OPS+ {_opsp:.0f}'
+
+        def _optimal_label(*, side: str = 'owned'):
+            """Return the right 'no upgrade' label for this row.
+
+            Default ('Optimal'): no upgrade was found within the user's
+            min_meta_improvement filter — that's a true no-action call.
+
+            Underperforming variant ('⚠ Underperforming'): when the
+            current starter is verifiably cold the 'Optimal' word is
+            misleading. We re-label AND, for the market column, we
+            attempt a sub-threshold fallback query: highest-meta
+            unowned card within the price ceiling that beats the
+            current starter's meta by ANY positive amount. Surfaces
+            the closest replacement so the user always has an option
+            to consider — they can decide whether the partial upgrade
+            is worth swapping.
+            """
+            if not _is_underperforming:
+                return "✅ Optimal" + _optimal_suffix
+
+            # Surface the reason so the user knows WHY: gap vs raw rate stat.
+            _why = (f" · {_underperf_reason}"
+                    if _underperf_reason and _underperf_reason != 'gap' else '')
+            base = (f"⚠ Underperforming ({_underperf_gap}){_why} "
+                    f"· no upgrade clears filter")
+            if side != 'market':
+                return base
+            # Market sub-threshold fallback. We accept any positive
+            # meta_delta — the user has been told the starter is bad,
+            # so even +5 meta is worth showing as "the best you can buy
+            # without raising your filter."
+            try:
+                slot = u.get('pos') or ''
+                cur_meta = float(u.get('current_meta') or 0)
+                _is_pit = _is_pitching_pos(slot)
+                role = slot.rstrip("0123456789").rstrip(" ⚠️") if _is_pit else slot
+                meta_col = "meta_score_pitching" if _is_pit else "meta_score_batting"
+                pos_col = "pitcher_role_name" if _is_pit else "position_name"
+                # Use per-league meta when override is active so the
+                # fallback ranking matches what the user sees in the
+                # main Meta column.
+                _side = 'pitching' if _is_pit else 'batting'
+                if _selected_league and _selected_league != _config_league:
+                    row = conn.execute(
+                        f"SELECT c.card_title, "
+                        f"COALESCE(cmbl.meta_score, c.{meta_col}) as m, "
+                        f"c.last_10_price "
+                        f"FROM cards c "
+                        f"LEFT JOIN card_meta_by_league cmbl "
+                        f"  ON cmbl.card_id = c.card_id "
+                        f" AND cmbl.league_id = ? AND cmbl.side = ? "
+                        f"WHERE c.{pos_col} = ? AND c.owned = 0 "
+                        f"AND c.last_10_price > 0 AND c.last_10_price <= ? "
+                        f"AND COALESCE(cmbl.meta_score, c.{meta_col}) > ? "
+                        f"ORDER BY COALESCE(cmbl.meta_score, c.{meta_col}) DESC LIMIT 1",
+                        (_selected_league, _side, role, max_spend, cur_meta),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        f"SELECT card_title, {meta_col} as m, last_10_price "
+                        f"FROM cards WHERE {pos_col} = ? AND owned = 0 "
+                        f"AND last_10_price > 0 AND last_10_price <= ? "
+                        f"AND {meta_col} > ? "
+                        f"ORDER BY {meta_col} DESC LIMIT 1",
+                        (role, max_spend, cur_meta),
+                    ).fetchone()
+                if row and row['m']:
+                    delta = int((row['m'] or 0) - cur_meta)
+                    title = short_name(row['card_title'], 22)
+                    cost = f"{row['last_10_price']:,}"
+                    return (f"{base} · best avail: +{delta} {title} "
+                            f"· {cost}PP")
+            except Exception:
+                pass
+            return base
+
         # ── Owned Promotion column ──
         owned_action = ""
         if ai_pick and ai_pick['action'] == 'Promote':
@@ -3499,14 +3896,14 @@ def build_chain_rows(positions_list, show_bats=False, show_perf=False,
             # Suppress when the swap is a net team loss — a "+68 gross /
             # -500 net" rec is worse than leaving the lineup as-is.
             if _d <= 0:
-                owned_action = "\u2705 Optimal" + _optimal_suffix
+                owned_action = _optimal_label()
             else:
                 _sign = '+' if _d >= 0 else ''
                 owned_action = (f"\U0001f4e6 {_sign}{_d} · "
                                 f"{short_name(u['owned_name'], 25)}"
                                 f"{_note_badge}{_displ_suffix}")
         else:
-            owned_action = "\u2705 Optimal" + _optimal_suffix
+            owned_action = _optimal_label()
 
         # ── Market Upgrade column ──
         market_action = ""
@@ -3520,7 +3917,7 @@ def build_chain_rows(positions_list, show_bats=False, show_perf=False,
         _market_total = _market_d + (u.get('owned_delta') or 0) if u.get('owned_name') else _market_d
 
         if _suppress_market:
-            market_action = "\u2705 Optimal" + _optimal_suffix
+            market_action = _optimal_label(side='market')
         elif ai_pick and ai_pick['action'] == 'Buy':
             emoji = ai_pick.get('emoji', '')
             card = short_name(ai_pick['card_name'], 25)
@@ -3594,9 +3991,9 @@ def build_chain_rows(positions_list, show_bats=False, show_perf=False,
                     delta_str = ""
                 market_action = f"\U0001f6d2 {delta_str}{short_name(u['market_name'], 25)} \u00b7 {cost}PP"
             else:
-                market_action = "\u2705 Optimal" + _optimal_suffix
+                market_action = _optimal_label(side='market')
         else:
-            market_action = "\u2705 Optimal" + _optimal_suffix
+            market_action = _optimal_label(side='market')
 
         # Single Status column — compact, packs three signals:
         #   1. Raw rate stat (ERA for pitchers, OPS for batters)
@@ -3641,9 +4038,9 @@ def build_chain_rows(positions_list, show_bats=False, show_perf=False,
         # info is surfaced without a separate "Why" column.
         if u.get('platoon_warning'):
             warn_text = u['platoon_warning']
-            if owned_action != "\u2705 Optimal":
+            if not (owned_action.startswith("\u2705 Optimal") or owned_action.startswith("\u26a0 Underperforming")):
                 owned_action = f"{owned_action} ⚠"
-            if market_action != "\u2705 Optimal":
+            if not (market_action.startswith("\u2705 Optimal") or market_action.startswith("\u26a0 Underperforming")):
                 market_action = f"{market_action} ⚠"
 
         row["Owned Promotion"] = owned_action
@@ -4855,6 +5252,149 @@ try:
                         st.caption(f"hit rate (positive verdict): {_hr*100:.0f}%")
                     if _avg_delta is not None:
                         st.caption(f"avg meta Δ: {_avg_delta:+.1f}")
+        # Projected-vs-actual backtest. Gated behind a checkbox because
+        # the SQL pre/post aggregation runs once per non-pending rec —
+        # cheap individually but adds up over 50 recs.
+        _bt_active_league = None
+        try:
+            _bt_active_league = (load_config() or {}).get('active_league')
+        except Exception:
+            pass
+        _show_bt = st.checkbox(
+            "Show projected vs actual outcomes (slow)",
+            value=False,
+            key="rec_outcomes_show_bt",
+            help="Runs a 14-day pre/post window over each non-pending rec.",
+        )
+        _bt_result = None
+        if _show_bt:
+            @st.cache_data(ttl=300, show_spinner=False)
+            def _cached_backtest_recs(league_id, window_days, max_recs):
+                from app.core.backtest_harness import backtest_recommendations
+                return backtest_recommendations(
+                    league_id=league_id,
+                    window_days=window_days,
+                    max_recs=max_recs,
+                )
+            try:
+                with st.spinner("Backtesting recommendations…"):
+                    _bt_result = _cached_backtest_recs(
+                        _bt_active_league, 14, 50,
+                    )
+            except Exception as _bt_err:
+                st.caption(f"Backtest unavailable: {_bt_err}")
+                _bt_result = None
+
+        # Build a lookup so the legacy "Recent recommendations" expander
+        # can fill in observed deltas without re-running the harness.
+        _bt_lookup: dict[int, dict] = {}
+        if _bt_result and isinstance(_bt_result.get('detail'), list):
+            for _row in _bt_result['detail']:
+                if _row.get('id') is not None:
+                    _bt_lookup[int(_row['id'])] = _row
+
+        if _bt_result and _bt_result.get('detail'):
+            with st.expander("Projected vs actual (last "
+                             f"{len(_bt_result['detail'])} non-pending recs)",
+                             expanded=False):
+                _icons_pa = {'positive': '\U0001f7e2', 'neutral': '\u26aa',
+                             'negative': '\U0001f534', 'pending': '\u23f3'}
+                _pa_rows = []
+                for _row in _bt_result['detail']:
+                    _bt = _row.get('bt') or {}
+                    _side = (_row.get('side') or 'batting').lower()
+                    if _side == 'batting':
+                        _obs = _bt.get('delta_ops')
+                        _obs_label = 'OPS'
+                    else:
+                        _obs = _bt.get('delta_era')
+                        _obs_label = 'ERA'
+                    _proj = _row.get('expected_delta')
+                    # Batting OPS: positive is good. Pitching ERA:
+                    # negative is good. Flip sign for pitching so the
+                    # same-sign check matches "moved the way we hoped".
+                    _color = ''
+                    if _obs is not None and _proj is not None and _proj != 0:
+                        _eff_obs = _obs if _side == 'batting' else -_obs
+                        _eff_proj = _proj
+                        _same_sign = ((_eff_obs >= 0 and _eff_proj >= 0)
+                                      or (_eff_obs <= 0 and _eff_proj <= 0))
+                        if _same_sign and abs(_eff_obs) >= 0.5 * abs(_eff_proj):
+                            _color = '\U0001f7e2 '
+                        elif _same_sign:
+                            _color = '\U0001f7e1 '
+                        else:
+                            _color = '\U0001f534 '
+                    _ver = _row.get('verdict') or '—'
+                    _pa_rows.append({
+                        'When': (_row.get('created_at') or '')[:16],
+                        'Source': (_row.get('source') or '').replace('_', ' '),
+                        'Pos': _row.get('pos') or '',
+                        'Target': (_row.get('player_name') or '')[:24],
+                        'Side': _side,
+                        'Followed?': _row.get('action_type') or '—',
+                        'ProjΔ': (f"{_proj:+.0f}" if _proj is not None else '—'),
+                        f'Obs Δ{_obs_label}': (
+                            f"{_color}{_obs:+.3f}" if _obs is not None else '—'
+                        ),
+                        'Verdict': f"{_icons_pa.get(_ver,'')} {_ver}".strip(),
+                    })
+                # Render batting and pitching as separate tables — OPS
+                # and ERA units never share a column.
+                _bat_rows = [r for r in _pa_rows if r['Side'] == 'batting']
+                _pit_rows = [r for r in _pa_rows if r['Side'] == 'pitching']
+                if _bat_rows:
+                    st.markdown("**Batting recs**")
+                    st.dataframe(
+                        pd.DataFrame(_bat_rows).drop(columns=['Side']),
+                        width='stretch', hide_index=True,
+                        height=min(35 * len(_bat_rows) + 40, 360),
+                    )
+                if _pit_rows:
+                    st.markdown("**Pitching recs**")
+                    st.dataframe(
+                        pd.DataFrame(_pit_rows).drop(columns=['Side']),
+                        width='stretch', hide_index=True,
+                        height=min(35 * len(_pit_rows) + 40, 360),
+                    )
+
+                # Side-aware roll-ups. Cameron sees at a glance whether a
+                # "positive" verdict actually correlates with positive
+                # observed performance.
+                _side_summary = _bt_result.get('summary_by_side') or {}
+                _bat_sum = _side_summary.get('batting') or {}
+                _pit_sum = _side_summary.get('pitching') or {}
+                if _bat_sum:
+                    st.markdown("**Batting summary by verdict**")
+                    _bs_rows = []
+                    for _v, _s in sorted(_bat_sum.items()):
+                        _bs_rows.append({
+                            'Verdict': _v,
+                            'N': _s.get('count'),
+                            'With Data': _s.get('count_with_data'),
+                            'Avg ProjΔ': (f"{_s.get('avg_projected_delta'):+.1f}"
+                                          if _s.get('avg_projected_delta') is not None else '—'),
+                            'Avg ObsΔOPS': (f"{_s.get('avg_delta_ops'):+.3f}"
+                                             if _s.get('avg_delta_ops') is not None else '—'),
+                            'Avg ObsΔwOBA': (f"{_s.get('avg_delta_woba'):+.3f}"
+                                              if _s.get('avg_delta_woba') is not None else '—'),
+                        })
+                    st.dataframe(pd.DataFrame(_bs_rows), width='stretch', hide_index=True)
+                if _pit_sum:
+                    st.markdown("**Pitching summary by verdict**")
+                    _ps_rows = []
+                    for _v, _s in sorted(_pit_sum.items()):
+                        _ps_rows.append({
+                            'Verdict': _v,
+                            'N': _s.get('count'),
+                            'With Data': _s.get('count_with_data'),
+                            'Avg ProjΔ': (f"{_s.get('avg_projected_delta'):+.1f}"
+                                          if _s.get('avg_projected_delta') is not None else '—'),
+                            'Avg ObsΔERA': (f"{_s.get('avg_delta_era'):+.2f}"
+                                             if _s.get('avg_delta_era') is not None else '—'),
+                        })
+                    st.dataframe(pd.DataFrame(_ps_rows), width='stretch', hide_index=True)
+
         if _recent:
             with st.expander("Recent recommendations (last 30)", expanded=False):
                 _rec_rows = []
@@ -4863,19 +5403,34 @@ try:
                     _icon = {'positive':'\U0001f7e2','neutral':'\u26aa',
                               'negative':'\U0001f534','pending':'\u23f3'}.get(_ver, '')
                     _acted = _r.get('action_type') or '—'
+                    _bt_match = _bt_lookup.get(int(_r['id'])) if _r.get('id') is not None else None
+                    _bt_obj = (_bt_match or {}).get('bt') if _bt_match else None
+                    _side_lbl = (_r.get('side') or
+                                 (_bt_match or {}).get('side') or '—')
+                    if _bt_obj and _side_lbl == 'batting':
+                        _obs_str = (f"{_bt_obj.get('delta_ops'):+.3f} OPS"
+                                    if _bt_obj.get('delta_ops') is not None else '')
+                    elif _bt_obj and _side_lbl == 'pitching':
+                        _obs_str = (f"{_bt_obj.get('delta_era'):+.2f} ERA"
+                                    if _bt_obj.get('delta_era') is not None else '')
+                    else:
+                        _obs_str = (
+                            f"{(_r.get('meta_after') or 0) - (_r.get('meta_before') or 0):+.0f}"
+                            if _r.get('meta_after') is not None and _r.get('meta_before') is not None else ''
+                        )
                     _rec_rows.append({
                         'When': (_r.get('created_at') or '')[:16],
                         'Source': (_r.get('source') or '').replace('_', ' '),
                         'Type': _r.get('rec_type') or '',
                         'Pos': _r.get('pos') or '',
+                        'Side': _side_lbl,
                         'Target': (_r.get('player_name') or '')[:28],
                         'Replacing': (_r.get('from_player') or '')[:24],
                         'Action': _acted,
                         'Verdict': f"{_icon} {_ver}".strip(),
                         'ExpΔ': (f"{_r.get('expected_delta'):+.0f}"
                                  if _r.get('expected_delta') is not None else ''),
-                        'ObsΔ': (f"{(_r.get('meta_after') or 0) - (_r.get('meta_before') or 0):+.0f}"
-                                 if _r.get('meta_after') is not None and _r.get('meta_before') is not None else ''),
+                        'ObsΔ': _obs_str,
                     })
                 st.dataframe(
                     pd.DataFrame(_rec_rows), width='stretch', hide_index=True,
@@ -4885,40 +5440,51 @@ except Exception as _rec_panel_err:
     st.caption(f"Rec outcomes unavailable: {_rec_panel_err}")
 
 # ════════════════════════════════════════════════════════════════
-# STRATEGY SLIDERS — mirrors OOTP's in-game strategy panel
-# Recommended positions derived from active roster composition.
-# Fires automatically after AI Optimize All finishes.
+# STRATEGY READOUT — team identity, sliders, and park recommendations
+# Builds a deterministic profile from active roster ratings, then layers:
+#   1. Team identity (e.g. "Power Mash + Elite Pitching") + directives
+#   2. OOTP strategy slider positions (recommend_strategy)
+#   3. Per-player strategy overrides
+#   4. Ballpark recommendations matched to the team profile
+# All sections re-fire whenever the active lineup changes — no AI call.
 # ════════════════════════════════════════════════════════════════
 try:
     from app.core.strategy_recommender import recommend_strategy
+    from app.core.team_identity import build_team_profile
+    from app.core.park_recommender import recommend_parks, tendency_label
 
-    # Pull rating data for active batters / pitchers by name via cards table.
-    # active_by_pos + starters + all_by_pos are already built earlier in the
-    # page. We enrich them with ratings needed by the recommender.
-    _bat_names = sorted({
-        p.get('player_name') or ''
+    # Pull rating data for active batters / pitchers via cards.card_id.
+    # The roster table stores plain player names ("Joey Bart") but cards.card_title
+    # is prefixed ("MLB 2026 Live C Joey Bart PIT") — so we cannot match by name.
+    # active_by_pos rows already carry the joined card_id from roster_rows.
+    # We additionally fetch bats/throws so the team-identity classifier can
+    # compute lineup handedness mix + pitcher staff handedness.
+    _bat_card_ids = sorted({
+        p.get('card_id')
         for _pos, _lst in active_by_pos.items()
         for p in _lst
         if _pos in ('C', '1B', '2B', '3B', 'SS', 'LF', 'CF', 'RF', 'DH')
+        and p.get('card_id')
     })
-    _pit_names = sorted({
-        p.get('player_name') or ''
+    _pit_card_ids = sorted({
+        p.get('card_id')
         for _pos, _lst in active_by_pos.items()
         for p in _lst
         if _pos in ('SP', 'RP', 'CL')
+        and p.get('card_id')
     })
     _strategy_bat: list[dict] = []
-    if _bat_names:
-        _placeholders = ','.join('?' * len(_bat_names))
+    if _bat_card_ids:
+        _placeholders = ','.join('?' * len(_bat_card_ids))
         for _row in conn.execute(f"""
-            SELECT card_title, contact, gap_power, power, eye, avoid_ks, babip,
+            SELECT card_id, card_title, contact, gap_power, power, eye, avoid_ks, babip,
                    speed, stealing, baserunning, bunt_for_hit,
                    contact_vl, contact_vr, power_vl, power_vr,
-                   catcher_arm, position
+                   catcher_arm, position, bats
             FROM cards
             WHERE owned = 1
-              AND card_title IN ({_placeholders})
-        """, _bat_names).fetchall():
+              AND card_id IN ({_placeholders})
+        """, _bat_card_ids).fetchall():
             d = dict(_row)
             d['player_name'] = d.get('card_title') or ''
             # Map position integer to label so the catcher filter works
@@ -4926,41 +5492,69 @@ try:
             d['position'] = {2: 'C', 3: '1B', 4: '2B', 5: '3B', 6: 'SS',
                              7: 'LF', 8: 'CF', 9: 'RF', 10: 'DH'}.get(
                 int(_pos_num) if _pos_num else 0, '')
+            # Map bats integer (1=R, 2=L, 3=S) to a single-char hand code
+            _bats_raw = d.get('bats')
+            try:
+                d['bats_hand'] = BATS_MAP.get(int(_bats_raw) if _bats_raw else 0, '')
+            except (TypeError, ValueError):
+                d['bats_hand'] = ''
             _strategy_bat.append(d)
     _strategy_pit: list[dict] = []
-    if _pit_names:
-        _placeholders = ','.join('?' * len(_pit_names))
+    if _pit_card_ids:
+        _placeholders = ','.join('?' * len(_pit_card_ids))
         for _row in conn.execute(f"""
-            SELECT card_title, stuff, movement, control, p_hr, stamina, hold,
-                   stuff_vl, stuff_vr, pitcher_role_name, meta_score_pitching
+            SELECT card_id, card_title, stuff, movement, control, p_hr, stamina, hold,
+                   stuff_vl, stuff_vr, pitcher_role_name, meta_score_pitching,
+                   throws
             FROM cards
             WHERE owned = 1
-              AND card_title IN ({_placeholders})
-        """, _pit_names).fetchall():
+              AND card_id IN ({_placeholders})
+        """, _pit_card_ids).fetchall():
             d = dict(_row)
             d['player_name'] = d.get('card_title') or ''
+            # OOTP throws codes: 1=R, 2=L (no switch pitchers in PT)
+            _throws_raw = d.get('throws')
+            try:
+                d['throws_hand'] = {1: 'R', 2: 'L'}.get(
+                    int(_throws_raw) if _throws_raw else 0, '')
+            except (TypeError, ValueError):
+                d['throws_hand'] = ''
             _strategy_pit.append(d)
 
     _sp_list = [p for p in _strategy_pit
                 if (p.get('pitcher_role_name') or '').upper() == 'SP']
     _bp_list = [p for p in _strategy_pit
                 if (p.get('pitcher_role_name') or '').upper() in ('RP', 'CL')]
-    # Bench batters: all owned batters NOT in the active lineup
-    _active_names = {p.get('player_name') for _lst in active_by_pos.values()
-                     for p in _lst}
+    # Bench batters: owned non-pitcher cards NOT already in the active lineup.
+    # Dedup by card_id (bat_card_ids holds the active starters' card_ids).
+    _active_card_ids = set(_bat_card_ids)
     _strategy_bench: list[dict] = []
     _bench_rows = conn.execute("""
-        SELECT card_title, contact, gap_power, power, eye, avoid_ks,
-               speed, stealing, baserunning, bunt_for_hit, position
+        SELECT card_id, card_title, contact, gap_power, power, eye, avoid_ks,
+               speed, stealing, baserunning, bunt_for_hit, position, bats
         FROM cards
-        WHERE owned = 1 AND position NOT IN (1, 0, NULL)
+        WHERE owned = 1 AND position IS NOT NULL AND position NOT IN (1, 0)
     """).fetchall()
     for _row in _bench_rows:
-        if (_row['card_title'] or '') in _active_names:
+        if (_row['card_id'] or 0) in _active_card_ids:
             continue
         d = dict(_row)
         d['player_name'] = d.get('card_title') or ''
+        _bats_raw = d.get('bats')
+        try:
+            d['bats_hand'] = BATS_MAP.get(int(_bats_raw) if _bats_raw else 0, '')
+        except (TypeError, ValueError):
+            d['bats_hand'] = ''
         _strategy_bench.append(d)
+
+    # ── Build the team profile (consumed by identity readout + park recs) ──
+    _team_profile = build_team_profile(
+        active_batters=_strategy_bat,
+        active_pitchers=_strategy_pit,
+        bench_batters=_strategy_bench,
+        starters=_sp_list,
+        bullpen=_bp_list,
+    )
 
     _strategy_recs = recommend_strategy(
         active_batters=_strategy_bat,
@@ -4970,35 +5564,129 @@ try:
         starters=_sp_list,
     )
 
-    if _strategy_recs:
+    # \u2500\u2500 1) TEAM IDENTITY READOUT \u2500\u2500
+    if _strategy_bat or _strategy_pit:
         st.divider()
-        st.markdown("### \U0001f39a\ufe0f Strategy Sliders")
+        st.markdown("### \U0001f3af Team Strategy Readout")
+        st.caption(
+            "Deterministic synthesis of your active roster's offensive and "
+            "pitching profile. Recomputes instantly when lineups change \u2014 "
+            "no AI call required."
+        )
+
+        # Identity headline + summary in a bordered container
+        with st.container(border=True):
+            _id_label = _team_profile.get('identity_label', '')
+            _id_summary = _team_profile.get('identity_summary', '')
+            st.markdown(f"**\U0001f9ec Identity:** {_id_label}")
+            if _id_summary:
+                st.caption(_id_summary)
+
+            # Composite-score badges in a metric row
+            _bat = _team_profile['batter']
+            _bh = _team_profile['bat_hand_pct']
+            _pt = _team_profile['pit_throw_pct']
+            _mc = st.columns(6)
+            _mc[0].metric("Power",     f"{_bat['power_composite']:.0f}",
+                          help="Weighted: 65% Power + 35% Gap Power")
+            _mc[1].metric("Contact",   f"{_bat['contact_composite']:.0f}",
+                          help="Weighted: 60% Contact + 25% AvoidK + 15% Eye")
+            _mc[2].metric("Speed",     f"{_bat['speed_composite']:.0f}",
+                          help="Weighted: 50% Speed + 25% Stealing + 25% Baserunning")
+            _mc[3].metric("Rotation",  f"{_team_profile['sp_quality']:.0f}",
+                          help="SP composite: 40% Stuff + 25% Movement + 25% Control + 10% HR-suppress")
+            _mc[4].metric("Bullpen",   f"{_team_profile['bp_quality']:.0f}",
+                          help="BP composite (same weighting as rotation)")
+            _mc[5].metric("Bat L/R/S",
+                          f"{_bh.get('L',0):.0f}/{_bh.get('R',0):.0f}/{_bh.get('S',0):.0f}",
+                          help=f"Lineup handedness \u2014 staff is "
+                               f"{_pt.get('L',0):.0f}% LHP / {_pt.get('R',0):.0f}% RHP")
+
+        # Strengths / Weaknesses / Directives in a 3-col layout
+        _strengths   = _team_profile.get('strengths', []) or []
+        _weaknesses  = _team_profile.get('weaknesses', []) or []
+        _directives  = _team_profile.get('directives', []) or []
+
+        if _strengths or _weaknesses or _directives:
+            _sw_cols = st.columns(3)
+            with _sw_cols[0]:
+                st.markdown("**\U0001f7e2 Strengths**")
+                if _strengths:
+                    for _s in _strengths:
+                        st.markdown(
+                            f"\u2022 **{_s['label']}** ({_s['value']:.0f})  \n"
+                            f"&nbsp;&nbsp;<span style='color:#888;font-size:0.85em'>{_s['note']}</span>",
+                            unsafe_allow_html=True,
+                        )
+                else:
+                    st.caption("(no rating cleared the strength threshold)")
+            with _sw_cols[1]:
+                st.markdown("**\U0001f534 Weaknesses**")
+                if _weaknesses:
+                    for _w in _weaknesses:
+                        st.markdown(
+                            f"\u2022 **{_w['label']}** ({_w['value']:.0f})  \n"
+                            f"&nbsp;&nbsp;<span style='color:#888;font-size:0.85em'>{_w['note']}</span>",
+                            unsafe_allow_html=True,
+                        )
+                else:
+                    st.caption("(no obvious gaps \u2014 well-rounded roster)")
+            with _sw_cols[2]:
+                st.markdown("**\U0001f4cb Tactical Directives**")
+                if _directives:
+                    for _d in _directives:
+                        st.markdown(
+                            f"{_d['icon']} **{_d['rule']}**  \n"
+                            f"&nbsp;&nbsp;<span style='color:#888;font-size:0.85em'>{_d['detail']}</span>",
+                            unsafe_allow_html=True,
+                        )
+                else:
+                    st.caption("(no roster-specific tactics recommended)")
+
+    # \u2500\u2500 2) STRATEGY SLIDERS \u2500\u2500
+    if _strategy_recs:
+        st.markdown("#### \U0001f39a\ufe0f Strategy Sliders")
         st.caption(
             "Recommended OOTP slider positions based on your active roster. "
-            "Mirror these in **Team \u2192 Strategy** to align in-game AI with "
-            "your lineup's strengths."
+            "Mirror these in **Team \u2192 Strategy** to align in-game AI "
+            "with your lineup's strengths. Grouped by OOTP's in-game section."
         )
-        # Two columns of sliders with labels on left and bucket on right
-        _cols = st.columns(2)
-        for _i, _rec in enumerate(_strategy_recs):
-            with _cols[_i % 2]:
-                # Section color accent
-                _accent = {
-                    'Offensive':    '\U0001f3c3',   # runner
-                    'Pitching':     '\u26be',        # ball
-                    'Substitution': '\U0001f501',    # swap
-                }.get(_rec['section'], '')
-                _pos = _rec['position']
-                _bucket = _rec['bucket']
-                _impact = _rec['impact']
-                # Visual slider: markdown-rendered bar
-                _bar_pos = int(_pos / 100 * 20)
-                _bar = '─' * _bar_pos + '●' + '─' * (20 - _bar_pos)
-                st.markdown(
-                    f"**{_accent} {_rec['label']}**  \n"
-                    f"`{_bar}` **{_bucket}**"
-                )
-                st.caption(f"\U0001f4a1 {_rec['reason']}")
+
+        _section_emoji = {
+            'Offensive':    '\U0001f3c3',
+            'Pitching':     '\u26be',
+            'Substitution': '\U0001f501',
+        }
+        _section_titles = {
+            'Offensive':    'Offensive Strategy',
+            'Pitching':     'Pitching & Defensive Strategy',
+            'Substitution': 'Substitution Strategy',
+        }
+
+        # Group by section so each block renders as its own subheader.
+        _by_section: dict[str, list[dict]] = {}
+        for _rec in _strategy_recs:
+            _by_section.setdefault(_rec['section'], []).append(_rec)
+
+        for _section in ('Offensive', 'Pitching', 'Substitution'):
+            _section_recs = _by_section.get(_section) or []
+            if not _section_recs:
+                continue
+            _emoji = _section_emoji.get(_section, '')
+            _title = _section_titles.get(_section, _section)
+            st.markdown(f"##### {_emoji} {_title}")
+            _cols = st.columns(2)
+            for _i, _rec in enumerate(_section_recs):
+                with _cols[_i % 2]:
+                    _pos = _rec['position']
+                    _bucket = _rec['bucket']
+                    _bar_pos = int(_pos / 100 * 20)
+                    _bar = '─' * _bar_pos + '●' + '─' * (20 - _bar_pos)
+                    st.markdown(
+                        f"**{_rec['label']}**  \n"
+                        f"`{_bar}` **{_bucket}**"
+                    )
+                    st.caption(f"\U0001f4a1 {_rec['reason']}")
 
     # ── Per-player strategy overrides ──
     # Surfaces OOTP's Player Strategy tab recommendations. We only flag a
@@ -5047,8 +5735,116 @@ try:
                 f"**{len(_rows)} total overrides**. All other players "
                 f"inherit the team strategy defaults above."
             )
+
+    # ── 4) PARK RECOMMENDATIONS ──
+    # Score the OOTP ballpark catalog against the team profile to find the
+    # ballparks that best amplify the roster's strengths and hide its gaps.
+    if _strategy_bat or _strategy_pit:
+        _park_result = recommend_parks(_team_profile, top_n=5,
+                                       accessible_only=True)
+        _top_parks   = _park_result.get('top', []) or []
+        _stretch     = _park_result.get('stretch', []) or []
+        _avoid       = _park_result.get('avoid', []) or []
+        _desired_hp  = _park_result.get('desired_hp', 0)
+        _desired_lr  = _park_result.get('desired_lr', 0)
+
+        st.markdown("#### \U0001f3df️ Ballpark Recommendations")
+        _ideal_label = tendency_label(_desired_hp, _desired_lr)
+        st.caption(
+            f"Apply in **Customize Team → Select Ballpark** at the start "
+            f"of next season. Ideal park profile for this roster: "
+            f"**{_ideal_label}** (hp={_desired_hp:+.2f}, lr={_desired_lr:+.2f}). "
+            "Score weighs hitter/pitcher tilt 55%, L/R tilt 30%, surface + roof 15%."
+        )
+
+        if _top_parks:
+            _park_rows = []
+            for _entry in _top_parks:
+                _p = _entry['park']
+                _park_rows.append({
+                    'Park': _p.name,
+                    'Team': _p.team,
+                    'Year': _p.year,
+                    'Tendency': _p.tendency,
+                    'Surface': _p.turf,
+                    'Roof': _p.park_type,
+                    'Tier': _p.required_level,
+                    'Fit': round(_entry['score'], 1),
+                    'Why': ' • '.join(_entry['reasons']) if _entry['reasons'] else '—',
+                })
+            st.dataframe(
+                pd.DataFrame(_park_rows),
+                width='stretch', hide_index=True,
+                height=min(35 * len(_park_rows) + 40, 280),
+                column_config={
+                    'Park':     st.column_config.TextColumn(width='medium'),
+                    'Team':     st.column_config.TextColumn(width='medium'),
+                    'Year':     st.column_config.NumberColumn(format='%d', width='small'),
+                    'Tendency': st.column_config.TextColumn(width='medium'),
+                    'Surface':  st.column_config.TextColumn(width='small'),
+                    'Roof':     st.column_config.TextColumn(width='small'),
+                    'Tier':     st.column_config.TextColumn(width='small'),
+                    'Fit':      st.column_config.ProgressColumn(
+                                    min_value=0, max_value=100, format='%.0f',
+                                    width='small',
+                                    help='Composite fit score, 0–100'),
+                    'Why':      st.column_config.TextColumn(width='large'),
+                },
+            )
+
+        # Stretch picks (parks user can't yet access)
+        if _stretch:
+            with st.expander(
+                f"✨ Stretch parks ({len(_stretch)}) — "
+                "higher-tier ballparks worth chasing for THIS roster",
+                expanded=False,
+            ):
+                _str_rows = []
+                for _entry in _stretch:
+                    _p = _entry['park']
+                    _str_rows.append({
+                        'Park': _p.name,
+                        'Tendency': _p.tendency,
+                        'Tier': _p.required_level,
+                        'Fit': round(_entry['score'], 1),
+                        'Why': ' • '.join(_entry['reasons']) if _entry['reasons'] else '—',
+                    })
+                st.dataframe(
+                    pd.DataFrame(_str_rows), width='stretch', hide_index=True,
+                    height=min(35 * len(_str_rows) + 40, 200),
+                    column_config={
+                        'Fit': st.column_config.ProgressColumn(
+                            min_value=0, max_value=100, format='%.0f', width='small'),
+                    },
+                )
+
+        # Parks to avoid (the worst fits)
+        if _avoid:
+            with st.expander(
+                f"⛔ Parks to avoid for this roster ({len(_avoid)})",
+                expanded=False,
+            ):
+                _av_rows = []
+                for _entry in _avoid:
+                    _p = _entry['park']
+                    _av_rows.append({
+                        'Park':     _p.name,
+                        'Tendency': _p.tendency,
+                        'Tier':     _p.required_level,
+                        'Fit':      round(_entry['score'], 1),
+                        'Why':      ' • '.join(_entry['reasons']) if _entry['reasons'] else '—',
+                    })
+                st.dataframe(
+                    pd.DataFrame(_av_rows), width='stretch', hide_index=True,
+                    height=min(35 * len(_av_rows) + 40, 160),
+                )
+                st.caption(
+                    "These parks would fight against the roster identity — "
+                    "either tilting the run environment the wrong way for your "
+                    "talent mix, or favoring the opposite-handed half of your lineup."
+                )
 except Exception as _strategy_err:
-    st.caption(f"Strategy sliders unavailable: {_strategy_err}")
+    st.caption(f"Strategy readout unavailable: {_strategy_err}")
 
 # ════════════════════════════════════════════════════════════════
 # PP-AWARE PURCHASE PLAN — fits the best engine buys into your budget
@@ -5423,6 +6219,127 @@ with st.expander("\U0001f50d Why this meta? (formula breakdown)", expanded=False
             _render_meta_explainer(_exp)
     else:
         st.caption("No upgrade candidates available to explain — load roster + market data first.")
+
+# ════════════════════════════════════════════════════════════════
+# PER-FACTOR RESIDUAL CALIBRATION (Stream C, shadow mode)
+# Mines closed-loop recs to surface which factors over- or under-
+# predict outcomes. Reported only — does NOT feed back into weights.
+# ════════════════════════════════════════════════════════════════
+try:
+    from app.core.rec_residual_learner import (
+        get_latest_residual_calibration, run_residual_analysis_all,
+    )
+    st.divider()
+    st.markdown("### \U0001f52c Per-Factor Residual Calibration (shadow mode)")
+    st.caption(
+        "Shadow mode — these residuals are NOT fed back into meta weights. "
+        "They surface where the engine over- or under-predicts so calibration "
+        "can be hand-tuned."
+    )
+
+    _run_resid = st.button(
+        "Run residual analysis", key="resid_analysis_run",
+        help="Mine closed-loop recs for per-factor over/under-prediction signals.",
+    )
+    if _run_resid:
+        with st.spinner("Analyzing residuals..."):
+            try:
+                run_residual_analysis_all(conn)
+            except Exception as _run_err:
+                st.error(f"Analysis failed: {_run_err}")
+
+    _bat_latest = get_latest_residual_calibration(side='batting', conn=conn)
+    _pit_latest = get_latest_residual_calibration(side='pitching', conn=conn)
+
+    def _render_residual_side(label: str, latest):
+        st.markdown(f"**{label}**")
+        if not latest:
+            st.caption(
+                "No residual analysis runs yet. Click **Run residual analysis** "
+                "to start — needs ≥20 closed-loop recs with factor snapshots."
+            )
+            return
+        diag = latest.get('diagnostics') or {}
+        n_obs = latest.get('n_observations') or 0
+        if n_obs < (diag.get('min_observations_threshold') or 20):
+            with_fact = diag.get('n_recs_with_factors') or 0
+            with_out = diag.get('n_recs_with_outcomes') or 0
+            st.caption(
+                f"Need ≥20 closed-loop recs with factor snapshots to run "
+                f"residual analysis. Currently: {with_out} with outcomes "
+                f"({with_fact} with factor snapshots, "
+                f"{diag.get('n_recs_examined') or 0} examined)."
+            )
+            return
+        fc = latest.get('factor_calibration') or {}
+        if fc:
+            _rows = []
+            for _factor, _info in sorted(
+                fc.items(),
+                key=lambda kv: abs((kv[1] or {}).get('avg_residual_per_unit') or 0.0),
+                reverse=True,
+            ):
+                _slope = (_info or {}).get('avg_residual_per_unit')
+                _se = (_info or {}).get('std_err')
+                _icon = {
+                    'over_predicted': '\U0001f534',
+                    'under_predicted': '\U0001f7e2',
+                    'calibrated': '⚪',
+                }.get((_info or {}).get('direction'), '')
+                _rows.append({
+                    'Factor': _factor,
+                    'n': (_info or {}).get('n'),
+                    'Avg residual / unit':
+                        f"{_slope:+.4f}" if _slope is not None else '—',
+                    'Std err':
+                        f"{_se:.4f}" if _se is not None else '—',
+                    'Direction': f"{_icon} {(_info or {}).get('direction', '')}".strip(),
+                })
+            st.dataframe(pd.DataFrame(_rows), width='stretch', hide_index=True,
+                         height=min(35 * len(_rows) + 40, 400))
+        else:
+            st.caption("(no per-factor signal at the current sample size)")
+
+    _resid_cols = st.columns(2)
+    with _resid_cols[0]:
+        _render_residual_side("Batting", _bat_latest)
+    with _resid_cols[1]:
+        _render_residual_side("Pitching", _pit_latest)
+
+    # Interaction warnings: render under their parent side as expandable cards.
+    for _label, _latest in (("Batting", _bat_latest), ("Pitching", _pit_latest)):
+        _warns = (_latest or {}).get('interaction_warnings') or []
+        if _warns:
+            st.markdown(f"**{_label} interaction warnings**")
+            for _w in _warns:
+                _factors = " × ".join(_w.get('factors') or [])
+                with st.expander(f"⚠️ {_factors} — n={_w.get('n')}"):
+                    st.markdown(_w.get('interpretation') or '')
+                    st.caption(
+                        f"Worst split: **{_w.get('split')}** → avg residual "
+                        f"{_w.get('avg_residual'):+.3f}; comparison split "
+                        f"**{_w.get('comparison_split')}** → "
+                        f"{_w.get('comparison_residual'):+.3f}"
+                    )
+
+    # Diagnostics: small triple-counter so the user can see how saturated
+    # each side is.
+    _diag_pairs = [("Batting", _bat_latest), ("Pitching", _pit_latest)]
+    if any(d for _, d in _diag_pairs):
+        _diag_cols = st.columns(2)
+        for _i, (_label, _latest) in enumerate(_diag_pairs):
+            _d = (_latest or {}).get('diagnostics') or {}
+            with _diag_cols[_i]:
+                if _latest:
+                    st.caption(
+                        f"{_label} — examined: **{_d.get('n_recs_examined') or 0}** · "
+                        f"with factors: **{_d.get('n_recs_with_factors') or 0}** · "
+                        f"with outcomes: **{_d.get('n_recs_with_outcomes') or 0}**"
+                    )
+                else:
+                    st.caption(f"{_label} — no run yet")
+except Exception as _resid_panel_err:
+    st.caption(f"Residual calibration panel unavailable: {_resid_panel_err}")
 
 # Deferred Manager's Eye auto-call has been REMOVED. The LLM is now a
 # verifier, not an auto-analyzer — page renders instantly with engine recs

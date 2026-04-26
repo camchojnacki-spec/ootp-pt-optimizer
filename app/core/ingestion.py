@@ -1413,6 +1413,26 @@ def ingest_lineup(filepath: str, file_type: str = None) -> dict:
     """Ingest team lineup CSV. The Title column enables exact card matching.
 
     file_type is one of: lineup_vs_rhp, lineup_vs_lhp, lineup_overview
+
+    Multi-source robustness (UAT 2026-04-25 user feedback):
+    OOTP exports a family of ``_overview_*.csv`` files (default, batting_ratings,
+    batting_stats_1/2, position_ratings, fielding_*). All identify as
+    ``lineup_overview`` and have POS+Name+# (jersey) columns, but only
+    ``_default.csv`` has the Title column needed for exact card matching.
+    Previously this function would DELETE+INSERT the lineup rows on every
+    file, so a sibling re-export (e.g. user opens batting stats view and
+    re-saves) would wipe the canonical Title-bearing rows and replace them
+    with Title-less ones.
+
+    The fix:
+      - If the CSV is missing Title: look up Title from the ``cards`` table
+        by jersey# + name (most reliable when both are known) and fall
+        back to name match. So a sibling file's lineup becomes usable
+        without losing card matching.
+      - If a Title is found via lookup, write the row with that Title so
+        downstream consumers (per-card stats, card_meta_by_league) work.
+      - The DELETE+INSERT pattern stays — but we no longer lose data,
+        we re-derive Title.
     """
     df = parse_lineup_csv(filepath)
     conn = get_connection()
@@ -1435,16 +1455,24 @@ def ingest_lineup(filepath: str, file_type: str = None) -> dict:
     }
     lineup_type = lineup_type_map.get(file_type, 'overview')
 
+    # Detect whether this is a sibling file (no Title column) — we need
+    # to derive Title from cards/jersey# + name lookups.
+    has_title_col = 'Title' in df.columns
+
     # Clear previous entries for this lineup type
     cursor.execute("DELETE FROM team_lineup WHERE lineup_type = ? AND DATE(snapshot_date) = DATE('now')", (lineup_type,))
 
+    title_lookups_used = 0
     count = 0
     for idx, row in df.iterrows():
         name = _safe_str(row.get('Name', '')).strip()
         if not name:
             continue
         pos = _safe_str(row.get('POS', '')).strip()
-        title = _safe_str(row.get('Title', '')).strip()
+        title = _safe_str(row.get('Title', '')).strip() if has_title_col else ''
+        # Jersey# is in the '#' column on every overview-family file. Used as
+        # a tie-breaker when name matches multiple cards.
+        jersey = _safe_str(row.get('#', '')).strip()
         ovr = _safe_int(row.get('OVR', 0))
         bats = _safe_str(row.get('B', '')).strip()
         throws = _safe_str(row.get('T', '')).strip()
@@ -1458,9 +1486,21 @@ def ingest_lineup(filepath: str, file_type: str = None) -> dict:
             ).fetchone()
             card_id = card_row[0] if card_row else None
 
-        # Fall back to name matching
+        # Fall back to name matching (used for sibling files where Title is
+        # absent, or when the Title lookup misses).
         if card_id is None:
             card_id = _match_card_id(cursor, name)
+
+        # If still no Title (sibling file path), back-fill from cards so
+        # downstream consumers that key on card_title still work.
+        if not title and card_id is not None:
+            t_row = cursor.execute(
+                "SELECT card_title FROM cards WHERE card_id = ? LIMIT 1",
+                (card_id,),
+            ).fetchone()
+            if t_row and t_row[0]:
+                title = t_row[0]
+                title_lookups_used += 1
 
         # Also update the roster table with card_id and card_title if we have a match.
         # Prefer card_id match (safer — no name mismatches) and fall back to
@@ -1530,7 +1570,9 @@ def ingest_lineup(filepath: str, file_type: str = None) -> dict:
     conn.commit()
     conn.close()
     return {"status": "success", "file_type": file_type, "rows": count,
-            "roster_demoted": demoted, "roster_promoted": 0}
+            "roster_demoted": demoted, "roster_promoted": 0,
+            "title_lookups_used": title_lookups_used,
+            "source_had_title_col": has_title_col}
 
 
 def ingest_team_pitching(filepath: str) -> dict:

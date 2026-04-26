@@ -59,13 +59,26 @@ def _diminished(value: float, threshold: float = DIMINISHING_RETURNS_THRESHOLD) 
     """Apply diminishing returns to stats above the threshold.
 
     Below threshold: linear (1:1).
-    Above threshold: sqrt-scaled so that extreme spikes don't dominate.
-    e.g. 150 -> 110 + sqrt(40)*4 ≈ 135 (effective), not raw 150.
+    Above threshold (110-130): sqrt-scaled with multiplier 4
+        e.g. 130 -> 110 + sqrt(20)*4 ≈ 127.9 effective.
+    Above 130: harder saturation, multiplier 1.5
+        e.g. 152 -> 110 + sqrt(20)*4 + sqrt(22)*1.5 ≈ 135.3 effective.
+
+    UAT 2026-04-26: tightened the upper-tier curve. Single ratings of
+    150+ (like Hal Woodeshick's p_hr=152) were contributing 230+ meta
+    on their own, dominating the score even when the rest of the
+    profile was mediocre. The two-stage curve saturates more
+    aggressively above 130 so extreme outliers can't carry a card.
     """
     if value <= threshold:
         return value
-    excess = value - threshold
-    return threshold + math.sqrt(excess) * 4
+    if value <= 130:
+        excess = value - threshold
+        return threshold + math.sqrt(excess) * 4
+    # Above 130: cap the 110-130 contribution + half-rate above
+    base = threshold + math.sqrt(130 - threshold) * 4   # ≈ 127.9
+    extra = math.sqrt(value - 130) * 1.5
+    return base + extra
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -114,6 +127,14 @@ def _apply_splits(row, overall, vl_key, vr_key, vs_r_weight=_BATTER_VS_RHP_WEIGH
     For batters ``vs_r_weight=0.60`` (face 60% RHP).
     For pitchers ``vs_r_weight=0.55`` (face 55% RHB).
     Falls back gracefully when split columns are absent from the row dict.
+
+    UAT 2026-04-26: when one hand-side is critically weak (< 50), the
+    averaging masks how unplayable the card is against that side. A
+    pitcher with vL=143 / vR=43 averaged at 0.55 weight produced
+    effective_stuff=88, INFLATED above his overall stuff of 73.
+    Solution: when min(vl, vr) is critically low, use the harmonic-style
+    pulled-toward-weak-side blend so the weak side dominates the result.
+    Critical threshold: 50 (anything below = "automatic-out tier").
     """
     vl = row.get(vl_key)
     vr = row.get(vr_key)
@@ -121,7 +142,15 @@ def _apply_splits(row, overall, vl_key, vr_key, vs_r_weight=_BATTER_VS_RHP_WEIGH
         try:
             vl_f, vr_f = float(vl), float(vr)
             if vl_f > 0 and vr_f > 0:
-                return vs_r_weight * vr_f + (1 - vs_r_weight) * vl_f
+                weighted = vs_r_weight * vr_f + (1 - vs_r_weight) * vl_f
+                weak = min(vl_f, vr_f)
+                if weak < 50:
+                    # Pull the effective rating toward the weak side
+                    # proportional to how far below 50 it is. weak=20 →
+                    # 70% pull to weak side; weak=49 → 5% pull.
+                    pull = max(0.0, min(0.7, (50 - weak) / 50.0))
+                    return weighted * (1 - pull) + weak * pull
+                return weighted
         except (ValueError, TypeError):
             pass
     return overall
@@ -163,19 +192,79 @@ def _calc_platoon_penalty_batting(row):
     return penalty
 
 
+def _calc_one_trick_penalty_pitching(row) -> float:
+    """Penalty for pitchers whose meta is dominated by a single elite rating.
+
+    UAT 2026-04-26: cards like Hal Woodeshick (Bronze SP, OVR 66) score
+    high because of one freakish rating (p_hr=152) while the rest of the
+    profile is mediocre (stuff 73, control 71, p_babip 39). In-game
+    these cards get punished — the elite rating doesn't compensate for
+    the gaps. The mix_score diagnostic captures this but isn't a formula
+    term, so the meta blew past what the card actually delivers.
+
+    This penalty fires when the top RAW rating exceeds the 3rd-best
+    rating by more than 50 points AND the top rating is itself elite
+    (>110). Scales linearly with the spread, capped at -50 meta so a
+    truly elite card with one bad rating doesn't get penalized into
+    oblivion.
+    """
+    keys = ('stuff', 'movement', 'control', 'p_hr')
+    vals = []
+    for k in keys:
+        v = row.get(k)
+        try:
+            vals.append(float(v) if v is not None else 0.0)
+        except (ValueError, TypeError):
+            vals.append(0.0)
+    if not vals or all(v <= 0 for v in vals):
+        return 0.0
+
+    sorted_desc = sorted(vals, reverse=True)
+    top = sorted_desc[0]
+    third = sorted_desc[2] if len(sorted_desc) >= 3 else sorted_desc[-1]
+    spread = top - third
+    # Only fire when top is genuinely elite AND the floor is mediocre.
+    if top < 110 or spread <= 50:
+        return 0.0
+    # Linear penalty: spread=51 → -1, spread=100 → -50 (cap)
+    penalty = -min(50, spread - 50)
+    # Add a small extra hit when min_top3 is below "playable" (60). A
+    # 152/120/55/55 profile is worse than 152/120/85/85 even though both
+    # have the same spread.
+    if third < 60:
+        penalty -= 10
+    return penalty
+
+
 def _calc_platoon_penalty_pitching(row):
     """Penalty for extreme pitching platoon splits.
 
     A pitcher with 40 stuff vs LHB gets torched by lefties ~45% of the time.
     Same principle as batting: below the critical threshold you're unplayable
     against that hand, and you can't avoid them in PT.
+
+    UAT 2026-04-26 calibration:
+    The original formula only triggered below the absolute threshold
+    (weak_side < 55) with a small linear coefficient. For a card like
+    Hal Woodeshick (stuff_vl=143, stuff_vr=43, gap=100) this produced
+    only -9 meta — completely failing to capture that he gets crushed
+    by RHB 55% of the time.
+
+    Two-component penalty:
+      A. **Gap penalty** — scales with the absolute split (|vl - vr|),
+         multiplied by exposure to the weak side. Captures the
+         "dominant vs one hand, helpless vs the other" archetype.
+      B. **Weak-side floor penalty** — original below-threshold linear,
+         kept so a 60/55 marginal split still flags an issue.
     """
     penalty = 0.0
+    # gap_coeff applied to |vl - vr|; small coefficients per rating
     splits = [
-        ('stuff', 'stuff_vl', 'stuff_vr', 1.2),
-        ('control', 'control_vl', 'control_vr', 0.8),
+        # (vl_key, vr_key, weak_floor_coeff, gap_coeff)
+        ('stuff_vl', 'stuff_vr', 1.2, 0.5),
+        ('control_vl', 'control_vr', 0.8, 0.3),
     ]
-    for _overall_key, vl_key, vr_key, coeff in splits:
+    for vl_key, vr_key, floor_coeff, gap_coeff in splits:
         vl_raw = row.get(vl_key)
         vr_raw = row.get(vr_key)
         if vl_raw is None or vr_raw is None:
@@ -188,9 +277,23 @@ def _calc_platoon_penalty_pitching(row):
         if vl <= 0 or vr <= 0:
             continue
         weak_side = min(vl, vr)
+        # Exposure = how often the pitcher faces the side they're weak vs
+        if vl < vr:
+            exposure = 1 - _PITCHER_VS_RHB_WEIGHT  # weak vs LHB → LHB exposure (0.45)
+        else:
+            exposure = _PITCHER_VS_RHB_WEIGHT      # weak vs RHB → RHB exposure (0.55)
+
+        # A) Gap penalty — scales with the platoon mismatch itself.
+        # Only fires when the gap is meaningful (≥30). Capped so an
+        # extreme one-side specialist (vL 150, vR 30) doesn't go to
+        # -200 meta on this term alone.
+        gap = abs(vl - vr)
+        if gap >= 30:
+            penalty -= min(gap, 100) * exposure * gap_coeff
+
+        # B) Below-threshold floor penalty (original logic, retained).
         if weak_side < _PLATOON_CRITICAL_PIT:
-            exposure = (1 - _PITCHER_VS_RHB_WEIGHT) if vl < vr else _PITCHER_VS_RHB_WEIGHT
-            penalty -= (_PLATOON_CRITICAL_PIT - weak_side) * exposure * coeff
+            penalty -= (_PLATOON_CRITICAL_PIT - weak_side) * exposure * floor_coeff
     return penalty
 
 
@@ -1488,8 +1591,34 @@ def _r2_gate_for(cal_type: str) -> float:
     return MIN_PITCHING_R2
 
 
+# Process-level override for the active league. Set by ``set_active_league_override``
+# from the Roster Optimizer page so the per-page selector (UAT 2026-04-25 Tier-1
+# #1) can reroute calibration lookups to a different league than ``config.yaml``
+# specifies — without rewriting the disk config file. ``None`` means "use config".
+_ACTIVE_LEAGUE_OVERRIDE: str | None = None
+
+
+def set_active_league_override(league_id: str | None) -> None:
+    """Override the active league for this Python process.
+
+    Called by the Roster Optimizer page on every Streamlit rerun so the
+    league selected in the sidebar drives calibration lookups, weight
+    selection, and per-league meta surfaces. Pass ``None`` to clear the
+    override and fall back to ``config.yaml:active_league``.
+    """
+    global _ACTIVE_LEAGUE_OVERRIDE
+    _ACTIVE_LEAGUE_OVERRIDE = league_id or None
+
+
 def _active_league_id() -> str | None:
-    """Return the active league from config, or None if unreadable."""
+    """Return the active league: process override > config.yaml > None.
+
+    The override is set by the Roster Optimizer page via
+    ``set_active_league_override`` so the calibration loader (and every
+    downstream weight call) follows the user's per-page league choice.
+    """
+    if _ACTIVE_LEAGUE_OVERRIDE:
+        return _ACTIVE_LEAGUE_OVERRIDE
     try:
         from app.core.database import load_config
         return load_config().get('active_league')
@@ -1523,6 +1652,15 @@ def _load_calibration_row(cal_type: str):
     # right chip even after a league fallback.
     active = _active_league_id()
     lookup_types = []
+    # UAT 2026-04-25 §4 / Tier-2 #6: prefer the WAR+FIP ensemble fit for
+    # ``pitching`` (combined-role) lookups. The ensemble pulls the meta
+    # away from pure-strikeout-Stuff and toward run-prevention skill,
+    # which is what wins at higher tiers. Fall through to the WAR-only
+    # row if the ensemble row is missing or below threshold.
+    if cal_type == 'pitching':
+        if active:
+            lookup_types.append(f"pitching_ensemble:{active}")
+        lookup_types.append("pitching_ensemble")
     if active:
         lookup_types.append(f"{cal_type}:{active}")
     lookup_types.append(cal_type)
@@ -2132,6 +2270,12 @@ def calc_pitching_meta(row: dict, weights: dict = None) -> float:
         # ── Platoon penalty ──
         meta += _calc_platoon_penalty_pitching(row)
 
+        # ── One-trick penalty (UAT 2026-04-26) ──
+        # Cards with one elite rating + mediocre supporting cast are
+        # systematically over-rated. e.g. Hal Woodeshick p_hr=152 but
+        # stuff 73 / ctrl 71 / p_babip 39 — gets lit up at higher tiers.
+        meta += _calc_one_trick_penalty_pitching(row)
+
         # Balance penalty — key ratings below floor get penalized.
         floor = PITCHING_STAT_FLOOR
         for stat in [stu, mov, ctrl]:
@@ -2664,6 +2808,29 @@ def explain_pitching_meta(row: dict, weights: dict = None) -> dict:
             sh_points = (sh_avg / sh_count) * sh_weight
             bonuses.append({"label": f"Stamina/Hold ({sh_avg / sh_count:.0f})", "points": round(sh_points, 1)})
 
+    # One-trick pony penalty
+    one_trick_pen = _calc_one_trick_penalty_pitching(row)
+    if one_trick_pen < -0.5:
+        # Build a friendly label showing top vs 3rd
+        keys = ('stuff', 'movement', 'control', 'p_hr')
+        labels = {'stuff': 'Stuff', 'movement': 'Movement',
+                  'control': 'Control', 'p_hr': 'HR-supp'}
+        items = []
+        for k in keys:
+            v = row.get(k)
+            try:
+                items.append((labels[k], float(v) if v is not None else 0.0))
+            except (ValueError, TypeError):
+                items.append((labels[k], 0.0))
+        items.sort(key=lambda x: -x[1])
+        top_lbl, top_v = items[0]
+        third_lbl, third_v = items[2]
+        penalties.append({
+            "label": (f"One-trick profile ({top_lbl} {top_v:.0f} vs "
+                      f"{third_lbl} {third_v:.0f}, spread {top_v - third_v:.0f})"),
+            "points": round(one_trick_pen, 1),
+        })
+
     # Platoon penalty
     platoon_pen = _calc_platoon_penalty_pitching(row)
     if platoon_pen < -0.5:
@@ -2811,3 +2978,335 @@ def explain_meta(card: dict, is_pitcher: bool = None, weights: dict = None) -> d
     if is_pitcher:
         return explain_pitching_meta(card, weights)
     return explain_batting_meta(card, weights)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Per-league meta scoring (UAT 2026-04-25 §4 / Tier-2 #5)
+#
+# Each OOTP PT league represents a difficulty tier (Bronze, Silver, Gold,
+# Iron, Diamond...) that resets every offseason — teams that win in lower
+# tiers progress up, so the population of opposing batters/pitchers in a
+# given league is a function of how rated talent has been distributed in
+# that tier this season. The same rated card produces different outcomes
+# at different tiers because contact quality, command, and BABIP all
+# shift with tier difficulty (UAT case: Stuff-light/Control-elite cards
+# hold up at higher tiers; Stuff-heavy/Control-thin cards fade).
+#
+# ``meta_calibration`` already stores per-league weight rows (typed as
+# ``pitching:lb122`` / ``batting:lb124`` etc.). This block exposes those
+# tier-specific weights as per-league meta scores so the optimizer can
+# rank cards under the tier the user has selected, instead of a single
+# global meta that's calibrated against whichever league is in
+# config.yaml.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _load_league_calibration_row(cal_type: str, league_id: str | None) -> dict | None:
+    """Load weights for a SPECIFIC league, ignoring the active-league override.
+
+    ``_load_calibration_row`` already does league-aware lookup, but it
+    derives the league from ``_active_league_id()`` (process override
+    or config). This helper takes an explicit league so the caller can
+    score the same card under multiple tiers without flipping the
+    process-wide override on each call. Falls back to the pooled
+    ``{cal_type}`` row when the per-league row is missing or below
+    threshold — exactly like the active-league path, but parameterized.
+    """
+    import sqlite3 as _sqlite3
+    from app.core.database import get_db_path
+
+    lookup_types = []
+    # Mirror the active-league loader: prefer the WAR+FIP ensemble row
+    # for combined-role pitching lookups so callers using the explicit
+    # league API see the same calibration that the live page uses.
+    if cal_type == 'pitching':
+        if league_id:
+            lookup_types.append(f"pitching_ensemble:{league_id}")
+        lookup_types.append("pitching_ensemble")
+    if league_id:
+        lookup_types.append(f"{cal_type}:{league_id}")
+    lookup_types.append(cal_type)
+
+    try:
+        conn = _sqlite3.connect(get_db_path(), timeout=30.0)
+        try:
+            conn.execute("PRAGMA busy_timeout=10000")
+        except Exception:
+            pass
+        try:
+            for lt in lookup_types:
+                row = conn.execute(
+                    "SELECT weights_json, r_squared, correlation, sample_size "
+                    "FROM meta_calibration WHERE calibration_type = ? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (lt,),
+                ).fetchone()
+                if row and row[0]:
+                    threshold = _r2_gate_for(cal_type)
+                    r2_ok = row[1] is not None and row[1] >= threshold
+                    corr_ok = row[2] is not None and row[2] >= MIN_CALIBRATION_CORR
+                    if r2_ok or corr_ok:
+                        try:
+                            return {
+                                'weights': json.loads(row[0]),
+                                'source_type': lt,
+                                'r_squared': row[1],
+                                'correlation': row[2],
+                                'sample_size': row[3],
+                            }
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    return None
+
+
+def get_league_weights(league_id: str | None) -> tuple[dict, dict, dict, dict, dict]:
+    """Return a bundle of weight dicts for one tier.
+
+    Returns ``(batting_weights, pitching_weights, sp_weights, rp_weights,
+    metadata)`` where each weight dict is the calibrated row for that
+    tier with pooled / config / default fallbacks. ``metadata`` carries
+    the source_type for each slot so the UI can show "lb122-specific
+    batting weights" vs "pooled pitching weights (lb122-specific row
+    failed gate)".
+
+    Resolution order (most-specific → least):
+        SP: pitching_sp:<league> → pitching_ensemble:<league>
+            → pitching:<league> → pitching_sp → DEFAULT
+        RP: pitching_rp:<league> → pitching_ensemble:<league>
+            → pitching:<league> → pitching_rp → DEFAULT
+
+    The previous order skipped the league-specific combined row in
+    favor of the pooled per-role row, which produced identical meta
+    across leagues for any card whose per-role per-league fit was
+    missing — defeating the purpose of per-tier scoring.
+    """
+    bat_row = _load_league_calibration_row('batting', league_id)
+    # ``pitching`` already prefers pitching_ensemble:<lg> internally
+    # (see _load_league_calibration_row), so this single lookup covers
+    # both the WAR and ensemble paths.
+    pit_row = _load_league_calibration_row('pitching', league_id)
+
+    # Per-role per-league rows — only present when the calibrator has
+    # explicitly fit pitching_sp:<lg> / pitching_rp:<lg>. We try this
+    # path first; if it fails the gate we walk down to the league
+    # combined row (which IS league-specific) before giving up to the
+    # pooled per-role row.
+    def _per_role_with_league_fallback(role_key: str) -> tuple[dict | None, str | None]:
+        """Return ``(weights, source_label)`` for SP or RP at ``league_id``."""
+        # 1. Per-league per-role
+        if league_id:
+            row = _load_league_calibration_row(role_key, league_id)
+            if row and row.get('source_type') == f'{role_key}:{league_id}':
+                return row.get('weights'), row.get('source_type')
+        # 2. League-specific combined (ensemble/WAR) — same as pit_row
+        if pit_row and league_id and pit_row.get('source_type'):
+            stype = pit_row['source_type']
+            if league_id in stype:
+                return pit_row.get('weights'), stype + ' (combined)'
+        # 3. Pooled per-role
+        row = _load_league_calibration_row(role_key, None)
+        if row:
+            return row.get('weights'), row.get('source_type')
+        return None, None
+
+    sp_weights, sp_src = _per_role_with_league_fallback('pitching_sp')
+    rp_weights, rp_src = _per_role_with_league_fallback('pitching_rp')
+
+    try:
+        cfg = load_config()
+        cfg_bw = cfg.get('batting_weights', DEFAULT_BATTING_WEIGHTS)
+        cfg_pw = cfg.get('pitching_weights', DEFAULT_PITCHING_WEIGHTS)
+    except Exception:
+        cfg_bw = DEFAULT_BATTING_WEIGHTS
+        cfg_pw = DEFAULT_PITCHING_WEIGHTS
+
+    bw = (bat_row or {}).get('weights') or cfg_bw or DEFAULT_BATTING_WEIGHTS
+    pw = (pit_row or {}).get('weights') or cfg_pw or DEFAULT_PITCHING_WEIGHTS
+    sp_w = sp_weights or pw or DEFAULT_PITCHING_WEIGHTS_SP
+    rp_w = rp_weights or pw or DEFAULT_PITCHING_WEIGHTS_RP
+
+    metadata = {
+        'league_id': league_id,
+        'batting_source': (bat_row or {}).get('source_type') or 'config_or_default',
+        'pitching_source': (pit_row or {}).get('source_type') or 'config_or_default',
+        'sp_source': sp_src or 'config_or_default',
+        'rp_source': rp_src or 'config_or_default',
+    }
+    return bw, pw, sp_w, rp_w, metadata
+
+
+def _pick_pitching_weights_for_role_dict(
+    row: dict, sp_weights: dict, rp_weights: dict, combined_weights: dict
+) -> dict:
+    """Like ``get_pitching_weights_for`` but takes pre-loaded weight dicts.
+
+    The standard ``get_pitching_weights_for`` re-reads the calibration
+    row via the active-league override, which is what we DON'T want
+    when batch-scoring under an explicit league. This helper picks
+    SP vs RP from the supplied weights — calling code has already
+    loaded them via ``get_league_weights(league_id)``.
+    """
+    is_sp = _is_starting_pitcher(row)
+    if is_sp:
+        return sp_weights or combined_weights or DEFAULT_PITCHING_WEIGHTS_SP
+    return rp_weights or combined_weights or DEFAULT_PITCHING_WEIGHTS_RP
+
+
+def recalc_meta_scores_per_league(league_id: str, conn=None,
+                                    only_owned: bool = False) -> dict:
+    """Compute per-tier meta scores for every card and persist them.
+
+    Walks the ``cards`` table, scores each card under ``league_id``'s
+    calibrated weights (with pooled / config fallbacks), and upserts
+    one row into ``card_meta_by_league`` per (card_id, league_id, side).
+
+    The fast path: this re-uses the existing ``calc_batting_meta`` /
+    ``calc_pitching_meta`` functions but with weights pinned to one
+    tier instead of letting them load from the active-league override.
+    All overlay inputs (game-log, recent-form, ISO-gap...) come from
+    ``cards`` columns directly — they're computed at recalc time by
+    ingestion.py and don't depend on the league weights.
+
+    ``only_owned`` — if True, restrict to ``owned = 1`` cards. Useful
+    for the optimizer page which only needs scores for the user's
+    roster + the market candidates it surfaces, not every card in the
+    DB. Defaults to False (full recalc).
+
+    Returns ``{batters_scored, pitchers_scored, league_id, weight_metadata}``.
+    """
+    close_conn = False
+    if conn is None:
+        from app.core.database import get_connection
+        conn = get_connection()
+        close_conn = True
+
+    bw, pw, sp_w, rp_w, meta_md = get_league_weights(league_id)
+    cursor = conn.cursor()
+
+    bat_count = 0
+    pit_count = 0
+
+    try:
+        # ── Batters ──
+        owned_clause = " AND owned = 1" if only_owned else ""
+        batters = cursor.execute(f"""
+            SELECT * FROM cards
+            WHERE position IS NOT NULL
+              AND position != 1
+              AND contact IS NOT NULL
+              AND contact > 0
+              {owned_clause}
+        """).fetchall()
+        for row in batters:
+            d = dict(row)
+            try:
+                meta_val = calc_batting_meta(d, weights=bw)
+            except Exception:
+                continue
+            if meta_val is None or meta_val <= 0:
+                continue
+            cursor.execute("""
+                INSERT INTO card_meta_by_league
+                    (card_id, league_id, side, meta_score, weight_source, recalc_at)
+                VALUES (?, ?, 'batting', ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(card_id, league_id, side) DO UPDATE SET
+                    meta_score = excluded.meta_score,
+                    weight_source = excluded.weight_source,
+                    recalc_at = CURRENT_TIMESTAMP
+            """, (d['card_id'], league_id, meta_val, meta_md.get('batting_source')))
+            bat_count += 1
+            if bat_count % 250 == 0:
+                conn.commit()
+
+        # ── Pitchers ──
+        pitchers = cursor.execute(f"""
+            SELECT * FROM cards
+            WHERE pitcher_role IS NOT NULL
+              AND stuff IS NOT NULL
+              AND stuff > 0
+              {owned_clause}
+        """).fetchall()
+        for row in pitchers:
+            d = dict(row)
+            role_w = _pick_pitching_weights_for_role_dict(d, sp_w, rp_w, pw)
+            try:
+                meta_val = calc_pitching_meta(d, weights=role_w)
+            except Exception:
+                continue
+            if meta_val is None or meta_val <= 0:
+                continue
+            is_sp = _is_starting_pitcher(d)
+            wsrc = (meta_md.get('sp_source') if is_sp
+                    else meta_md.get('rp_source'))
+            cursor.execute("""
+                INSERT INTO card_meta_by_league
+                    (card_id, league_id, side, meta_score, weight_source, recalc_at)
+                VALUES (?, ?, 'pitching', ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(card_id, league_id, side) DO UPDATE SET
+                    meta_score = excluded.meta_score,
+                    weight_source = excluded.weight_source,
+                    recalc_at = CURRENT_TIMESTAMP
+            """, (d['card_id'], league_id, meta_val, wsrc))
+            pit_count += 1
+            if pit_count % 250 == 0:
+                conn.commit()
+
+        conn.commit()
+    finally:
+        if close_conn:
+            conn.close()
+
+    return {
+        'batters_scored': bat_count,
+        'pitchers_scored': pit_count,
+        'league_id': league_id,
+        'weight_metadata': meta_md,
+    }
+
+
+def get_meta_for_league(card_id: int, league_id: str | None, side: str,
+                         conn=None) -> tuple[float | None, str]:
+    """Return the per-tier meta score for a card, or fall back to the global.
+
+    Returns ``(meta_score, source)`` where source is one of:
+        ``'per_league'`` — pulled from ``card_meta_by_league`` for this league
+        ``'global'``     — fell back to ``cards.meta_score_*`` (no per-league row yet)
+        ``'missing'``    — no score available
+
+    Callers can use ``source`` to badge "per-league recalc available"
+    vs "showing global meta".
+    """
+    if not card_id:
+        return None, 'missing'
+
+    close_conn = False
+    if conn is None:
+        from app.core.database import get_connection
+        conn = get_connection()
+        close_conn = True
+
+    try:
+        if league_id:
+            row = conn.execute(
+                "SELECT meta_score FROM card_meta_by_league "
+                "WHERE card_id = ? AND league_id = ? AND side = ?",
+                (card_id, league_id, side),
+            ).fetchone()
+            if row and row[0] is not None:
+                return float(row[0]), 'per_league'
+
+        col = 'meta_score_batting' if side == 'batting' else 'meta_score_pitching'
+        row = conn.execute(
+            f"SELECT {col} FROM cards WHERE card_id = ?", (card_id,)
+        ).fetchone()
+        if row and row[0] is not None:
+            return float(row[0]), 'global'
+    finally:
+        if close_conn:
+            conn.close()
+
+    return None, 'missing'
